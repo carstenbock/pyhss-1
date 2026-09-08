@@ -67,7 +67,7 @@
                 </SPT>
             </TriggerPoint>
             <ApplicationServer>
-                <ServerName>sip:smsc.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org:5060</ServerName>
+                <ServerName>sip:smsc.ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
                 <DefaultHandling>0</DefaultHandling>
                 <Extension>
                     <IncludeRegisterRequest/>
@@ -103,7 +103,7 @@
                 </SPT>
             </TriggerPoint>
             <ApplicationServer>
-                <ServerName>sip:smsc.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org:5060</ServerName>
+                <ServerName>sip:smsc.ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</ServerName>
                 <DefaultHandling>0</DefaultHandling>
             </ApplicationServer>
         </InitialFilterCriteria>
