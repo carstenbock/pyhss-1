@@ -13,6 +13,8 @@ Example ENUM mapping:
   NAPTR Record: 10 10 "u" "E2U+sip" "!^.*$!sip:+491721234567@ims.mnc001.mcc001.3gppnetwork.org!" .
 """
 
+import time
+
 import requests
 from typing import List, Dict, Optional, Tuple, Any
 
@@ -51,6 +53,7 @@ class ENUMClient:
         self.naptr_preference = self.enum_config.get('naptr_preference', 10)
         self.naptr_ttl = self.enum_config.get('naptr_ttl', 3600)
         self.endpoints = self.enum_config.get('endpoints', [])
+        self.sms_enabled = self.enum_config.get('sms_enabled', False)
 
     def _log(self, level: str, message: str):
         """Log a message if log_tool is available."""
@@ -61,6 +64,33 @@ class ENUMClient:
                 message=message,
                 redisClient=self.redis_messaging
             )
+
+    def _metric(self, name: str, value: float, help_text: str, metric_type: str = 'gauge'):
+        """Publish a metric if redis_messaging is available.
+
+        Gauges, not counters: what an operator needs from a reconciliation is its
+        current state -- when it last ran and what it found -- and a counter that
+        only ever grows cannot answer "is the zone right now consistent with the
+        database". A monotonic total would also make a restart look like the
+        problem went away.
+        """
+        if not self.redis_messaging:
+            return
+
+        try:
+            self.redis_messaging.sendMetric(
+                serviceName='enum',
+                metricName=name,
+                metricType=metric_type,
+                metricAction='set' if metric_type == 'gauge' else 'inc',
+                metricValue=float(value),
+                metricHelp=help_text,
+                metricExpiry=None
+            )
+        except Exception as e:
+            # A reconciliation that worked must not be reported as failed because
+            # its metric could not be published.
+            self._log('warning', f"could not publish ENUM metric {name}: {str(e)}")
 
     @staticmethod
     def msisdn_to_enum_name(msisdn: str, domain: str) -> str:
@@ -105,6 +135,58 @@ class ENUMClient:
             f'{self.naptr_order} {self.naptr_preference} "u" "E2U+sip" '
             f'"!^.*$!sip:+{clean_msisdn}@{sip_domain}!" .'
         )
+
+    def generate_sms_naptr_content(self, msisdn: str) -> str:
+        """
+        Generate the SMS reachability NAPTR content for an MSISDN (RFC 4355).
+
+        This record says the number can receive SMS, and nothing about where to
+        send it: IANA registers the "sms" Enumservice with the subtypes "tel" and
+        "mailto" only, so its URI is a tel: URI. Where an SMS is delivered comes
+        from the E2U+sip record, as it does for a call.
+
+        Writing it separately is what makes SMS steerable on its own -- an
+        operator can withdraw SMS for a subscriber without touching voice, and a
+        message centre can tell "not our subscriber" from "ours, but no SMS".
+
+        Args:
+            msisdn: The MSISDN (digits only, no '+')
+
+        Returns:
+            The NAPTR record content string
+        """
+        clean_msisdn = ''.join(filter(str.isdigit, msisdn))
+
+        return (
+            f'{self.naptr_order} {self.naptr_preference} "u" "E2U+sms:tel" '
+            f'"!^.*$!tel:+{clean_msisdn}!" .'
+        )
+
+    def naptr_records_for(self, msisdn: str, sip_domain: str) -> List[dict]:
+        """
+        The NAPTR records a single MSISDN should have.
+
+        One rrset per name carries every record for that name, because PowerDNS
+        REPLACE is per rrset: sending only the SIP record would delete the SMS one
+        alongside it.
+
+        Args:
+            msisdn: The MSISDN (digits only, no '+')
+            sip_domain: The SIP domain for the URI
+
+        Returns:
+            List of PowerDNS record dictionaries
+        """
+        records = [
+            {'content': self.generate_naptr_content(msisdn, sip_domain), 'disabled': False}
+        ]
+
+        if self.sms_enabled:
+            records.append(
+                {'content': self.generate_sms_naptr_content(msisdn), 'disabled': False}
+            )
+
+        return records
 
     def _parse_msisdn_list(self, msisdn: Optional[str], msisdn_list: Optional[str]) -> List[str]:
         """
@@ -166,6 +248,62 @@ class ENUMClient:
         except requests.exceptions.RequestException as e:
             return False, f"PowerDNS request failed: {str(e)}"
 
+    def _zone_enum_msisdns(
+        self,
+        endpoint: dict,
+        zone: str
+    ) -> Tuple[Optional[set], Optional[str]]:
+        """
+        The MSISDNs that currently have NAPTR records in a zone.
+
+        Reads the zone back rather than trusting that what was written is what is
+        there, which is the only way to find entries the database no longer
+        accounts for. An ENUM entry for a deleted subscriber is worse than a
+        missing one: a message centre reads presence as "ours" and keeps trying to
+        deliver to a subscriber who is gone, instead of routing the message out to
+        the network that now owns the number.
+
+        Args:
+            endpoint: PowerDNS endpoint configuration
+            zone: The DNS zone to read
+
+        Returns:
+            Tuple of (set of MSISDNs without '+', error_message). The set is None
+            when the zone could not be read, which is not the same as an empty one.
+        """
+        url = f"{endpoint['url']}/api/v1/servers/localhost/zones/{zone}"
+        headers = {'X-API-Key': endpoint['api_key']}
+
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code != 200:
+                return None, f"PowerDNS API error: {response.status_code} - {response.text}"
+            zone_data = response.json()
+        except requests.exceptions.RequestException as e:
+            return None, f"PowerDNS request failed: {str(e)}"
+        except ValueError as e:
+            return None, f"PowerDNS returned unreadable JSON: {str(e)}"
+
+        suffix = '.' + zone.rstrip('.') + '.'
+        msisdns = set()
+
+        for rrset in zone_data.get('rrsets', []):
+            if rrset.get('type') != 'NAPTR':
+                continue
+
+            name = rrset.get('name', '')
+            if not name.endswith(suffix):
+                continue
+
+            # "1.0.0.0.9.9.9.0.7.1.9.4." -> "491709990001"
+            labels = name[:-len(suffix)].split('.')
+            if not all(len(label) == 1 and label.isdigit() for label in labels):
+                continue
+
+            msisdns.add(''.join(reversed(labels)))
+
+        return msisdns, None
+
     def create_enum_entries(
         self,
         msisdn: Optional[str],
@@ -207,14 +345,13 @@ class ENUMClient:
                 
                 for m in all_msisdns:
                     enum_name = self.msisdn_to_enum_name(m, domain)
-                    naptr_content = self.generate_naptr_content(m, sip_domain)
                     
                     rrsets.append({
                         'name': enum_name + '.',  # PowerDNS requires trailing dot
                         'type': 'NAPTR',
                         'ttl': self.naptr_ttl,
                         'changetype': 'REPLACE',
-                        'records': [{'content': naptr_content, 'disabled': False}]
+                        'records': self.naptr_records_for(m, sip_domain)
                     })
                 
                 success, error = self._make_pdns_request(endpoint, domain, rrsets)
@@ -391,7 +528,12 @@ class ENUMClient:
         Reconcile all ENUM entries from the database.
         
         Iterates through all IMS subscribers in the database and ensures
-        their ENUM entries exist in all configured PowerDNS servers.
+        their ENUM entries exist in all configured PowerDNS servers, then reads
+        each zone back to find entries the database no longer accounts for.
+        
+        Results are published as metrics as well as returned, because the thing
+        worth alerting on -- the zone and the database disagreeing -- is only
+        visible from here.
         
         Args:
             database_client: Database client instance to query IMS subscribers
@@ -411,8 +553,11 @@ class ENUMClient:
             'succeeded': 0,
             'failed': 0,
             'errors': [],
-            'subscribers': []
+            'subscribers': [],
+            'orphaned': []
         }
+        
+        provisioned_msisdns = set()
         
         try:
             # Import IMS_SUBSCRIBER model from database module
@@ -437,6 +582,9 @@ class ENUMClient:
                     msisdn = sub.get('msisdn')
                     msisdn_list = sub.get('msisdn_list')
                     sub_id = sub.get('ims_subscriber_id')
+                    provisioned_msisdns.update(
+                        self._parse_msisdn_list(msisdn, msisdn_list)
+                    )
                     
                     try:
                         # Create/update ENUM entries for this subscriber
@@ -479,11 +627,77 @@ class ENUMClient:
             results['errors'].append(f"Reconciliation failed: {str(e)}")
             self._log('error', f"ENUM reconciliation failed: {str(e)}")
         
+        # Only look for orphans once the database side is known to be complete.
+        # A half-read subscriber list would make every unread subscriber's entry
+        # look orphaned, and reporting a healthy zone as inconsistent is worse
+        # than reporting nothing.
+        if results['status'] != 'error':
+            results['orphaned'] = self._find_orphans(provisioned_msisdns, results)
+        
         if results['failed'] > 0:
             results['status'] = 'partial'
         
         self._log('info', f"ENUM reconciliation complete: {results['processed']} processed, "
-                         f"{results['succeeded']} succeeded, {results['failed']} failed")
+                         f"{results['succeeded']} succeeded, {results['failed']} failed, "
+                         f"{len(results['orphaned'])} orphaned")
+        
+        self._metric('prom_enum_reconcile_timestamp_seconds', time.time(),
+                     'Unix time of the last completed ENUM reconciliation')
+        self._metric('prom_enum_reconcile_corrected', results['succeeded'],
+                     'IMS subscribers whose ENUM entries were written on the last reconciliation')
+        self._metric('prom_enum_reconcile_failed', results['failed'],
+                     'IMS subscribers whose ENUM entries could not be written')
+        self._metric('prom_enum_reconcile_orphaned', len(results['orphaned']),
+                     'ENUM entries present in DNS with no IMS subscriber behind them')
         
         return results
+
+    def _find_orphans(
+        self,
+        provisioned_msisdns: set,
+        results: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        ENUM entries in DNS that no IMS subscriber accounts for.
+
+        Reported rather than deleted. An orphan is as likely to mean the database
+        lost a subscriber as that DNS kept a stale one, and deleting on that guess
+        would make a database problem permanent -- the number would stop being
+        reachable rather than merely be reachable when it should not be. An
+        operator can act on the number once they know it.
+
+        Args:
+            provisioned_msisdns: MSISDNs found in the database, digits only
+            results: Reconciliation results, appended to on read failure
+
+        Returns:
+            List of orphan descriptions
+        """
+        orphans = []
+
+        for endpoint in self.endpoints:
+            endpoint_name = endpoint.get('name', endpoint.get('url', 'unknown'))
+
+            for domain in endpoint.get('domains', []):
+                in_dns, error = self._zone_enum_msisdns(endpoint, domain)
+
+                if in_dns is None:
+                    # Unread, not empty. Saying "no orphans" here would be a claim
+                    # we have not checked.
+                    detail = f"{endpoint_name}/{domain}: {error}"
+                    results['errors'].append(f"orphan check skipped - {detail}")
+                    self._log('warning', f"ENUM orphan check skipped - {detail}")
+                    continue
+
+                for msisdn in sorted(in_dns - provisioned_msisdns):
+                    orphans.append({
+                        'msisdn': msisdn,
+                        'endpoint': endpoint_name,
+                        'domain': domain
+                    })
+                    self._log('warning',
+                              f"ENUM entry for +{msisdn} on {endpoint_name}/{domain} "
+                              f"has no IMS subscriber behind it")
+
+        return orphans
 
