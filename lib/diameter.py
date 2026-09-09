@@ -107,6 +107,7 @@ class Diameter:
                 # Gy PCEF/OCS
                 {"commandCode": 306, "applicationId": 16777217, "responseMethod": self.Answer_16777217_306, "failureResultCode": 5001 ,"requestAcronym": "UDR", "responseAcronym": "UDA", "requestName": "User Data Request", "responseName": "User Data Answer"},
                 {"commandCode": 307, "applicationId": 16777217, "responseMethod": self.Answer_16777217_307, "failureResultCode": 5001 ,"requestAcronym": "PRUR", "responseAcronym": "PRUA", "requestName": "Profile Update Request", "responseName": "Profile Update Answer"},
+                {"commandCode": 308, "applicationId": 16777217, "responseMethod": self.Answer_16777217_308, "failureResultCode": 5001 ,"requestAcronym": "SNR", "responseAcronym": "SNA", "requestName": "Subscribe Notifications Request", "responseName": "Subscribe Notifications Answer"},
 
                 # Rx PCEF/P-CSCF
                 {"commandCode": 265, "applicationId": 16777236, "responseMethod": self.Answer_16777236_265, "failureResultCode": 4100 ,"requestAcronym": "AAR", "responseAcronym": "AAA", "requestName": "AA Request", "responseName": "AA Answer"},
@@ -141,7 +142,10 @@ class Diameter:
                 # S6a MME
                 {"commandCode": 317, "applicationId": 16777251, "requestMethod": self.Request_16777251_317, "failureResultCode": 5012 ,"requestAcronym": "CLR", "responseAcronym": "CLA", "requestName": "Cancel Location Request", "responseName": "Cancel Location Answer"},
                 {"commandCode": 319, "applicationId": 16777251, "requestMethod": self.Request_16777251_319, "failureResultCode": 5012 ,"requestAcronym": "ISD", "responseAcronym": "ISA", "requestName": "Insert Subscriber Data Request", "responseName": "Insert Subscriber Data Answer"},
-                {"commandCode": 320, "applicationId": 16777251, "requestMethod": self.Request_16777251_320, "failureResultCode": 5012 ,"requestAcronym": "DSR", "responseAcronym": "DSR", "requestName": "Delete Subscriber Data Request", "responseName": "Delete Subscriber Data Answer"}
+                {"commandCode": 320, "applicationId": 16777251, "requestMethod": self.Request_16777251_320, "failureResultCode": 5012 ,"requestAcronym": "DSR", "responseAcronym": "DSR", "requestName": "Delete Subscriber Data Request", "responseName": "Delete Subscriber Data Answer"},
+
+                # Sh AS (TS 29.328)
+                {"commandCode": 309, "applicationId": 16777217, "requestMethod": self.Request_16777217_309, "failureResultCode": 5012 ,"requestAcronym": "PNR", "responseAcronym": "PNA", "requestName": "Push Notification Request", "responseName": "Push Notification Answer"},
 
         ]
 
@@ -4004,11 +4008,180 @@ class Diameter:
             self.database.handleGeored({"imsi": str(subscriber_ims_details.get('imsi')), "xcap_profile": sh_user_data})
         except Exception:
             self.logTool.log(service='HSS', level='warning', message=f"[Sh] [PUR] Geored of xcap_profile failed: {traceback.format_exc()}", redisClient=self.redisMessaging)
+        try:
+            self.notify_sh_profile_subscribers(subscriber_ims_details)
+        except Exception:
+            self.logTool.log(service='HSS', level='warning', message=f"[Sh] [PUR] Local PNR after PUR failed: {traceback.format_exc()}", redisClient=self.redisMessaging)
 
         avp += self.generate_avp(268, 40, "000007d1")                        
 
         response = self.generate_diameter_packet("01", "40", 307, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
         return response
+
+    ################################
+    ####  Sh Subscriptions      ####
+    ####  (TS 29.328 6.1.3/4)   ####
+    ################################
+
+    # Subs-Req-Type enum (TS 29.329 section 6.3.6)
+    SH_SUBS_REQ_TYPE_SUBSCRIBE = 0
+    SH_SUBS_REQ_TYPE_UNSUBSCRIBE = 1
+
+    # Send-Data-Indication enum (TS 29.329 section 6.3.17)
+    SH_SEND_DATA_INDICATION_USER_DATA_REQUESTED = 1
+
+    def _sh_subscription_key(self, ims_subscriber_id):
+        # Deliberately unprefixed: subscriptions are subscriber-scoped state
+        # written by whichever diameter node handles the SNR and read by the
+        # API service when a profile changes, so all PyHSS services sharing
+        # this Redis must see the same key.
+        return f"sh_subscriptions:{ims_subscriber_id}"
+
+    def sh_store_subscription(self, ims_subscriber_id, origin_host, origin_realm, service_indications):
+        """Record an AS subscription to Sh notifications for a subscriber."""
+        value = json.dumps({
+            "originRealm": origin_realm,
+            "serviceIndications": service_indications,
+            "timestamp": int(time.time()),
+        })
+        self.redisMessaging.setHashValue(name=self._sh_subscription_key(ims_subscriber_id),
+                                         key=origin_host, value=value)
+
+    def sh_remove_subscription(self, ims_subscriber_id, origin_host):
+        self.redisMessaging.deleteHashKey(name=self._sh_subscription_key(ims_subscriber_id),
+                                          key=origin_host)
+
+    def sh_get_subscriptions(self, ims_subscriber_id):
+        """Return {origin_host: {originRealm, serviceIndications, timestamp}} for a subscriber."""
+        subscriptions = self.redisMessaging.getAllHashData(name=self._sh_subscription_key(ims_subscriber_id))
+        if not isinstance(subscriptions, dict):
+            return {}
+        return subscriptions
+
+    def sh_build_notification_user_data(self, subscriber_details, service_indication=None):
+        """Build the Sh-Data User-Data XML carried in PNR / SNA (TS 29.328 section 7.6)."""
+        repository_data = self._sh_repository_data(subscriber_details, service_indication or 'MMTEL-Services')
+        if not repository_data:
+            return '<?xml version="1.0" encoding="UTF-8"?>\n<Sh-Data />'
+        return '<?xml version="1.0" encoding="UTF-8"?>\n<Sh-Data>\n' + repository_data + '\n</Sh-Data>'
+
+    def notify_sh_profile_subscribers(self, ims_subscriber_data):
+        """Send Sh PNR (TS 29.328 §6.1.4) to ASs whose SNR is in this node's Redis.
+
+        Does not relay to other PyHSS nodes; geored of xcap_profile covers that
+        so each Diameter peer can PNR the subscriptions it holds locally.
+        """
+        ims_subscriber_id = ims_subscriber_data.get('ims_subscriber_id')
+        subscriptions = self.sh_get_subscriptions(ims_subscriber_id)
+        if not subscriptions:
+            return
+        msisdn = ims_subscriber_data.get('msisdn')
+        public_identity = None
+        if msisdn:
+            mnc = self.MNC.zfill(3)
+            mcc = self.MCC.zfill(3)
+            public_identity = f"sip:+{msisdn}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org"
+        for origin_host, subscription in subscriptions.items():
+            if not isinstance(subscription, dict):
+                subscription = {}
+            service_indications = subscription.get('serviceIndications') or [None]
+            user_data = self.sh_build_notification_user_data(ims_subscriber_data, service_indications[0])
+            sent = self.sendDiameterRequest(
+                requestType='PNR',
+                hostname=origin_host,
+                destinationHost=origin_host,
+                destinationRealm=subscription.get('originRealm'),
+                msisdn=msisdn,
+                publicIdentity=public_identity,
+                userData=user_data,
+            )
+            if sent:
+                self.logTool.log(service='HSS', level='info', message=f"[Sh] [PUR] Sent PNR to {origin_host} for ims_subscriber {ims_subscriber_id}", redisClient=self.redisMessaging)
+            else:
+                self.logTool.log(service='HSS', level='warning', message=f"[Sh] [PUR] PNR to {origin_host} for ims_subscriber {ims_subscriber_id} was not sent: AS peer not connected and no DRA route available", redisClient=self.redisMessaging)
+
+    #3GPP Sh Subscribe-Notifications Answer (TS 29.328 section 6.1.3)
+    def Answer_16777217_308(self, packet_vars, avps):
+        avp = ''
+        session_id = self.get_avp_data(avps, 263)[0]
+        avp += self.generate_avp(263, 40, session_id)
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (No state maintained)
+        avp += self.generate_avp(260, 40, "0000010a4000000c000028af000001024000000c01000001")             #Vendor-Specific-Application-ID (Sh)
+
+        def _error(result_code):
+            error_avp = avp
+            avp_experimental_result = ''
+            avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')
+            avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))
+            error_avp += self.generate_avp(297, 40, avp_experimental_result)
+            return self.generate_diameter_packet("01", "40", 308, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], error_avp)
+
+        # Origin of the subscribing AS
+        try:
+            as_origin_host = binascii.unhexlify(self.get_avp_data(avps, 264)[0]).decode('utf-8')
+            as_origin_realm = binascii.unhexlify(self.get_avp_data(avps, 296)[0]).decode('utf-8')
+        except Exception as e:
+            self.logTool.log(service='HSS', level='error', message=f"[Sh] [SNR] Missing Origin-Host/Realm: {e}", redisClient=self.redisMessaging)
+            return _error(5001)
+
+        # Subs-Req-Type AVP (code 705, vendor 10415): 0=Subscribe, 1=Unsubscribe
+        subs_req_type = self.SH_SUBS_REQ_TYPE_SUBSCRIBE
+        try:
+            subs_req_type = int(self.get_avp_data(avps, 705)[0], 16)
+        except Exception:
+            pass
+
+        # Service-Indication AVP(s) (code 704, vendor 10415)
+        service_indications = []
+        try:
+            for si_hex in self.get_avp_data(avps, 704):
+                service_indications.append(binascii.unhexlify(si_hex).decode('utf-8'))
+        except Exception:
+            pass
+
+        # Send-Data-Indication AVP (code 710, vendor 10415)
+        send_data_indication = None
+        try:
+            send_data_indication = int(self.get_avp_data(avps, 710)[0], 16)
+        except Exception:
+            pass
+
+        # Resolve subscriber identity
+        try:
+            subscriber_details, subscriber_ims_details = self._sh_resolve_subscriber(avps)
+        except Exception as e:
+            self.logTool.log(service='HSS', level='error', message=f"[Sh] [SNR] Subscriber lookup failed: {e}", redisClient=self.redisMessaging)
+            return _error(5001)
+        if subscriber_ims_details is None:
+            self.logTool.log(service='HSS', level='error', message="[Sh] [SNR] No IMS subscriber found", redisClient=self.redisMessaging)
+            return _error(5001)
+
+        ims_subscriber_id = subscriber_ims_details['ims_subscriber_id']
+        try:
+            if subs_req_type == self.SH_SUBS_REQ_TYPE_UNSUBSCRIBE:
+                self.sh_remove_subscription(ims_subscriber_id, as_origin_host)
+                self.logTool.log(service='HSS', level='debug', message=f"[Sh] [SNR] Removed subscription of {as_origin_host} for ims_subscriber {ims_subscriber_id}", redisClient=self.redisMessaging)
+            else:
+                self.sh_store_subscription(ims_subscriber_id, as_origin_host, as_origin_realm, service_indications)
+                self.logTool.log(service='HSS', level='debug', message=f"[Sh] [SNR] Stored subscription of {as_origin_host} for ims_subscriber {ims_subscriber_id} ({service_indications})", redisClient=self.redisMessaging)
+        except Exception as e:
+            self.logTool.log(service='HSS', level='error', message=f"[Sh] [SNR] Failed to update subscription store: {traceback.format_exc()}", redisClient=self.redisMessaging)
+            return _error(5012)
+
+        # Optional User-Data in the SNA when requested (TS 29.328 section 6.1.3)
+        if send_data_indication == self.SH_SEND_DATA_INDICATION_USER_DATA_REQUESTED and subs_req_type == self.SH_SUBS_REQ_TYPE_SUBSCRIBE:
+            try:
+                merged_details = {**(subscriber_details or {}), **subscriber_ims_details}
+                service_indication = service_indications[0] if service_indications else None
+                xmlbody = self.sh_build_notification_user_data(merged_details, service_indication)
+                avp += self.generate_vendor_avp(702, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))
+            except Exception as e:
+                self.logTool.log(service='HSS', level='error', message=f"[Sh] [SNR] Failed to attach User-Data: {e}", redisClient=self.redisMessaging)
+
+        avp += self.generate_avp(268, 40, "000007d1")                                                   #DIAMETER_SUCCESS
+        return self.generate_diameter_packet("01", "40", 308, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
 
     ################################
     ####        3GPP RX         ####
@@ -5350,6 +5523,38 @@ class Diameter:
 
         response = self.generate_diameter_packet("01", "c0", 306, 16777217, self.generate_id(4), self.generate_id(4), avp)
 
+        return response
+
+    #3GPP Sh Push-Notification Request (PNR, TS 29.328 section 6.1.4)
+    def Request_16777217_309(self, **kwargs):
+        avp = ''
+        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_sh'
+        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777217),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (Sh)
+        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (Not maintained)
+
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+
+        destinationHost = kwargs['destinationHost']
+        destinationRealm = kwargs['destinationRealm']
+        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))                          #Destination-Realm
+        avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))                           #Destination-Host
+
+        # User-Identity (700): Public-Identity and/or MSISDN of the affected subscriber
+        user_identity_avp = ''
+        if kwargs.get('publicIdentity'):
+            user_identity_avp += self.generate_vendor_avp(601, 'c0', 10415, self.string_to_hex(kwargs['publicIdentity']))
+        if kwargs.get('msisdn'):
+            msisdn = str(kwargs['msisdn']).replace('+', '')
+            user_identity_avp += self.generate_vendor_avp(701, 'c0', 10415, self.TBCD_encode(msisdn))
+        avp += self.generate_vendor_avp(700, "c0", 10415, user_identity_avp)
+
+        # User-Data (702): the changed Sh-Data
+        user_data = kwargs['userData']
+        avp += self.generate_vendor_avp(702, "c0", 10415, str(binascii.hexlify(str.encode(user_data)),'ascii'))
+
+        response = self.generate_diameter_packet("01", "c0", 309, 16777217, self.generate_id(4), self.generate_id(4), avp)
         return response
 
     #3GPP S13 - ME-Identity-Check Request

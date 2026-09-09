@@ -21,6 +21,7 @@ import requests
 import traceback
 import sqlalchemy
 import socket
+from urllib.parse import urlparse
 from logtool import LogTool
 from diameter import Diameter
 from messaging import RedisMessaging
@@ -66,6 +67,73 @@ diameterClient = Diameter(
 databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging, main_service=True)
 
 enumClient = ENUMClient(config=config, log_tool=logTool, redis_messaging=redisMessaging)
+
+def send_pnr_for_local_subscriptions(ims_subscriber_data):
+    """Send an Sh Push-Notification-Request (PNR, TS 29.328 section 6.1.4)
+    with the updated repository data to every AS whose SNR subscription is
+    stored in this node's Redis."""
+    ims_subscriber_id = ims_subscriber_data.get('ims_subscriber_id')
+    subscriptions = diameterClient.sh_get_subscriptions(ims_subscriber_id)
+    if not subscriptions:
+        return
+    msisdn = ims_subscriber_data.get('msisdn')
+    public_identity = None
+    if msisdn:
+        mnc = diameterClient.MNC.zfill(3)
+        mcc = diameterClient.MCC.zfill(3)
+        public_identity = f"sip:+{msisdn}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org"
+    for origin_host, subscription in subscriptions.items():
+        if not isinstance(subscription, dict):
+            subscription = {}
+        service_indications = subscription.get('serviceIndications') or [None]
+        user_data = diameterClient.sh_build_notification_user_data(ims_subscriber_data, service_indications[0])
+        sent = diameterClient.sendDiameterRequest(
+            requestType='PNR',
+            hostname=origin_host,
+            destinationHost=origin_host,
+            destinationRealm=subscription.get('originRealm'),
+            msisdn=msisdn,
+            publicIdentity=public_identity,
+            userData=user_data,
+        )
+        if sent:
+            logTool.log(service='API', level='info', message=f"[API] Sent Sh PNR to {origin_host} for ims_subscriber {ims_subscriber_id}", redisClient=redisMessaging)
+        else:
+            logTool.log(service='API', level='warning', message=f"[API] Sh PNR to {origin_host} for ims_subscriber {ims_subscriber_id} was not sent: AS peer not connected and no DRA route available", redisClient=redisMessaging)
+
+
+def relay_sh_profile_update(ims_subscriber_data):
+    """Relay an Sh profile change to remote PyHSS nodes over their REST API.
+
+    In split deployments the provisioning API and the Diameter front ends run
+    in separate pods with separate Redis instances, so SNR subscriptions are
+    only visible on the Diameter nodes. Each endpoint hostname is resolved to
+    all of its A/AAAA records so a single Kubernetes headless-service URL fans
+    out to every node; nodes without a subscription treat the call as a no-op.
+    """
+    endpoints = config.get('hss', {}).get('sh_notify_endpoints', []) or []
+    if not endpoints:
+        return
+    ims_subscriber_id = ims_subscriber_data.get('ims_subscriber_id')
+    for endpoint in endpoints:
+        parsed = urlparse(endpoint)
+        host = parsed.hostname
+        port = parsed.port or 8080
+        try:
+            addresses = sorted({addrinfo[4][0] for addrinfo in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+        except Exception as e:
+            logTool.log(service='API', level='warning', message=f"[API] Sh notify relay: failed to resolve {host}: {e}", redisClient=redisMessaging)
+            continue
+        for address in addresses:
+            urlHost = f"[{address}]" if ':' in address else address
+            url = f"{parsed.scheme}://{urlHost}:{port}/geored/sh_profile_updated"
+            try:
+                requests.post(url, json={'ims_subscriber_id': ims_subscriber_id}, timeout=2)
+                logTool.log(service='API', level='debug', message=f"[API] Sh notify relay sent to {url} for ims_subscriber {ims_subscriber_id}", redisClient=redisMessaging)
+            except Exception as e:
+                logTool.log(service='API', level='warning', message=f"[API] Sh notify relay to {url} failed: {e}", redisClient=redisMessaging)
+
+
 
 
 apiService = Flask(__name__)
@@ -2132,6 +2200,24 @@ class PyHSS_ALL_EMERGENCY_SUBSCRIBER(Resource):
             print(E)
             return handle_exception(E)
 
+@ns_geored.route('/sh_profile_updated')
+class PyHSS_Geored_Sh_Profile_Updated(Resource):
+    @ns_geored.doc('Receive notification that an IMS subscriber Sh profile changed')
+    @no_auth_required
+    def post(self):
+        '''Send Sh PNR to ASs with subscriptions held on this node for the given ims_subscriber_id'''
+        try:
+            json_data = request.get_json(force=True)
+            ims_subscriber_id = json_data.get('ims_subscriber_id')
+            if ims_subscriber_id is None:
+                return {'error': 'ims_subscriber_id is required'}, 400
+            data = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
+            send_pnr_for_local_subscriptions(data)
+            return {'result': 'OK'}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
 @ns_geored.route('/')
 class PyHSS_Geored(Resource):
     @ns_geored.doc('Receive GeoRed data')
@@ -2157,6 +2243,7 @@ class PyHSS_Geored(Resource):
                                     usePrefix=True, 
                                     prefixHostname=originHostname, 
                                     prefixServiceName='metric')
+
             if 'last_seen_mcc' in json_data:
                 print("Updating Subscriber Location")
                 response_data.append(databaseClient.update_subscriber_location(imsi=str(json_data['imsi']),
