@@ -137,6 +137,8 @@ CREATE TABLE ims_subscriber (
 	scscf_timestamp DATETIME,
 	sh_profile TEXT,
 	sh_template_path VARCHAR(512),
+	stn_sr VARCHAR(64),
+	ue_srvcc_capability INTEGER,
 	xcap_profile TEXT,
 	PRIMARY KEY (ims_subscriber_id),
 	UNIQUE (msisdn)

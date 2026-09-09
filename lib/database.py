@@ -204,6 +204,8 @@ class IMS_SUBSCRIBER(Base):
     scscf_realm = Column(String(512), doc='Realm of SCSCF')
     scscf_peer = Column(String(512), doc='Diameter peer used to reach SCSCF')
     sh_template_path = Column(String(512), doc='Path to template file for the Sh Profile')
+    stn_sr = Column(String(64), doc='Session Transfer Number for SRVCC (TS 23.003)', nullable=True)
+    ue_srvcc_capability = Column(Integer, doc='UE SRVCC Capability (TS 29.328 7.6.17): 0=not-supported, 1=supported', nullable=True)
     last_modified = Column(String(100), default=datetime.datetime.now(tz=timezone.utc), doc='Timestamp of last modification')
     operation_logs = relationship("IMS_SUBSCRIBER_OPERATION_LOG", back_populates="ims_subscriber")
 

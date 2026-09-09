@@ -233,6 +233,7 @@ GeoRed_model = api.model('GeoRed', {
     'scscf_realm' : fields.String(description=IMS_SUBSCRIBER.scscf_realm.doc),
     'scscf_peer' : fields.String(description=IMS_SUBSCRIBER.scscf_peer.doc),
     'scscf_timestamp' : fields.String(description=IMS_SUBSCRIBER.scscf_timestamp.doc),
+    'xcap_profile' : fields.String(description=IMS_SUBSCRIBER.xcap_profile.doc),
     'imei' : fields.String(description=EIR.imei.doc),
     'match_response_code' : fields.String(description=EIR.match_response_code.doc),
     'emergency_subscriber_id': fields.String(description=EMERGENCY_SUBSCRIBER.emergency_subscriber_id.doc),
@@ -2286,6 +2287,32 @@ class PyHSS_Geored(Resource):
                                     metricExpiry=60,
                                     usePrefix=True, 
                                     prefixHostname=originHostname, 
+                                    prefixServiceName='metric')
+            if 'xcap_profile' in json_data:
+                print("Updating Sh xcap_profile")
+                ims_data = databaseClient.Get_IMS_Subscriber(imsi=str(json_data['imsi']))
+                response_data.append(databaseClient.UpdateObj(
+                    IMS_SUBSCRIBER,
+                    {'xcap_profile': json_data['xcap_profile'], 'sh_profile': None},
+                    ims_data['ims_subscriber_id'],
+                ))
+                ims_data['xcap_profile'] = json_data['xcap_profile']
+                ims_data['sh_profile'] = None
+                # Local PNR only. The originating Diameter node already notified
+                # its own SNR subscribers; this receiver notifies any SNR stored
+                # in this node's Redis. Do not call relay_sh_profile_update
+                # (that would loop through SH_NOTIFY_ENDPOINTS).
+                send_pnr_for_local_subscriptions(ims_data)
+                redisMessaging.sendMetric(serviceName='api', metricName='prom_flask_http_geored_endpoints',
+                                    metricType='counter', metricAction='inc',
+                                    metricValue=1.0, metricHelp='Number of Geored Pushes Received',
+                                    metricLabels={
+                                        "endpoint": "SH",
+                                        "geored_host": request.remote_addr,
+                                    },
+                                    metricExpiry=60,
+                                    usePrefix=True,
+                                    prefixHostname=originHostname,
                                     prefixServiceName='metric')
             if 'auc_id' in json_data:
                 print("Updating AuC")

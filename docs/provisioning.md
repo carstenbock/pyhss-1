@@ -84,7 +84,7 @@ This defines a subscriber for access to the IMS, referencing the
 
 Multiple MSISDNs can be defined as comma separated values in `msisdn_list` as required.
 
-The Sh profile will need to be updated with a valid Sh profile for the sub.
+The XCAP/Sh profile will need to be updated with a valid profile for the sub.
 ```shell
 curl -X 'PUT' \
   'http://10.97.0.36:8080/ims_subscriber/' \

@@ -3537,100 +3537,436 @@ class Diameter:
         response = self.generate_diameter_packet("01", "40", 304, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
         return response
 
+    def _sh_repository_data(self, subscriber_details, service_indication=None):
+        """TS 29.328 section 7.6.1 - RepositoryData (Data-Reference 0)"""
+        profile_xml = subscriber_details.get('sh_profile', '') or subscriber_details.get('xcap_profile', '') or ''
+        if not profile_xml or not profile_xml.strip():
+            if service_indication:
+                return f'<RepositoryData><ServiceIndication>{service_indication}</ServiceIndication><SequenceNumber>0</SequenceNumber></RepositoryData>'
+            return ''
+
+        try:
+            root = ET.fromstring(profile_xml)
+            found_blocks = []
+            for repo in root.findall('RepositoryData'):
+                si_elem = repo.find('ServiceIndication')
+                if si_elem is None:
+                    continue
+                if service_indication is None or si_elem.text == service_indication:
+                    found_blocks.append(ET.tostring(repo, encoding='unicode', method='xml'))
+
+            if found_blocks:
+                return '\n'.join(found_blocks)
+            if service_indication:
+                return f'<RepositoryData><ServiceIndication>{service_indication}</ServiceIndication><SequenceNumber>0</SequenceNumber></RepositoryData>'
+            return ''
+        except Exception as e:
+            self.logTool.log(service='HSS', level='debug', message=f"[Sh] Error parsing RepositoryData: {e}", redisClient=self.redisMessaging)
+            return ''
+
+    def _sh_ims_user_state(self, subscriber_details):
+        """TS 29.328 section 7.6.4 - IMSUserState (Data-Reference 11)"""
+        scscf = subscriber_details.get('scscf', None)
+        if scscf is not None:
+            return '<IMSUserState>REGISTERED</IMSUserState>'
+        return '<IMSUserState>NOT_REGISTERED</IMSUserState>'
+
+    def _sh_scscf_name(self, subscriber_details):
+        """TS 29.328 section 7.6.5 - S-CSCFName (Data-Reference 12)"""
+        scscf = subscriber_details.get('scscf', None)
+        if scscf:
+            return f'<SCSCFName>{scscf}</SCSCFName>'
+        return ''
+
+    def _sh_ims_public_identity(self, subscriber_details):
+        """TS 29.328 section 7.6.2 - IMSPublicIdentity (Data-Reference 10)"""
+        mnc = self.MNC.zfill(3)
+        mcc = self.MCC.zfill(3)
+        msisdn = subscriber_details.get('msisdn', '')
+        imsi = subscriber_details.get('imsi', '')
+        parts = ['<PublicIdentifiers>']
+        if msisdn:
+            parts.append(f'<IMSPublicIdentity>sip:{msisdn}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org</IMSPublicIdentity>')
+            parts.append(f'<IMSPublicIdentity>tel:+{msisdn}</IMSPublicIdentity>')
+        if imsi:
+            parts.append(f'<IMSPublicIdentity>sip:{imsi}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org</IMSPublicIdentity>')
+        if msisdn:
+            parts.append(f'<MSISDN>{msisdn}</MSISDN>')
+        parts.append('</PublicIdentifiers>')
+        return '\n'.join(parts)
+
+    def _sh_msisdn(self, subscriber_details):
+        """TS 29.328 section 7.6.12 - MSISDN (Data-Reference 17)"""
+        msisdn = subscriber_details.get('msisdn', '')
+        if msisdn:
+            return f'<MSISDN>{msisdn}</MSISDN>'
+        return ''
+
+    def _sh_location_information(self, subscriber_details, requested_domain=None):
+        """TS 29.328 sections 7.6.6.1-7.6.6.3 - LocationInformation (Data-Reference 14)
+        SPEC-DEVIATION: TS 29.328 6.1.1 - Active location retrieval via S6a/MAP not supported;
+        last known location from database is returned regardless of Current-Location AVP."""
+        parts = []
+
+        include_cs = requested_domain is None or requested_domain == self.SH_REQUESTED_DOMAIN_CS
+        include_ps = requested_domain is None or requested_domain == self.SH_REQUESTED_DOMAIN_PS
+
+        if include_cs:
+            msc = subscriber_details.get('serving_msc', None)
+            vlr = subscriber_details.get('serving_vlr', None)
+            if msc or vlr:
+                cs_parts = ['<CSLocationInformation>']
+                if msc:
+                    cs_parts.append(f'<MSCNumber>{msc}</MSCNumber>')
+                if vlr:
+                    cs_parts.append(f'<VLRNumber>{vlr}</VLRNumber>')
+                cs_parts.append('</CSLocationInformation>')
+                parts.append('\n'.join(cs_parts))
+            else:
+                parts.append('<CSLocationInformation />')
+
+        if include_ps:
+            sgsn = subscriber_details.get('serving_sgsn', None)
+            if sgsn:
+                parts.append(f'<PSLocationInformation><SGSNNumber>{sgsn}</SGSNNumber></PSLocationInformation>')
+            else:
+                parts.append('<PSLocationInformation />')
+
+            mme = subscriber_details.get('serving_mme', None)
+            eci = subscriber_details.get('last_seen_eci', None)
+            tac = subscriber_details.get('last_seen_tac', None)
+            mme_ts = subscriber_details.get('serving_mme_timestamp', None)
+            if mme or eci or tac:
+                eps_parts = ['<EPSLocationInformation>']
+                if eci:
+                    eps_parts.append(f'<E-UTRANCellGlobalId>{eci}</E-UTRANCellGlobalId>')
+                if tac:
+                    eps_parts.append(f'<TrackingAreaId>{tac}</TrackingAreaId>')
+                if mme:
+                    eps_parts.append(f'<MMEName>{mme}</MMEName>')
+                if mme_ts:
+                    eps_parts.append(f'<AgeOfLocationInformation>0</AgeOfLocationInformation>')
+                visited_mcc = subscriber_details.get('last_seen_mcc', '')
+                visited_mnc = subscriber_details.get('last_seen_mnc', '')
+                if visited_mcc and visited_mnc:
+                    eps_parts.append(f'<VisitedPLMNID>{visited_mcc}{visited_mnc}</VisitedPLMNID>')
+                eps_parts.append('</EPSLocationInformation>')
+                parts.append('\n'.join(eps_parts))
+            else:
+                parts.append('<EPSLocationInformation />')
+
+        return '\n'.join(parts)
+
+    def _sh_tads_information(self, subscriber_details):
+        """TS 29.328 section 7.6.18 / Annex E - TADSInformation (Data-Reference 26).
+        Assembled from current registration/location state."""
+        mme = subscriber_details.get('serving_mme', None)
+        msc = subscriber_details.get('serving_msc', None)
+        scscf = subscriber_details.get('scscf', None)
+        ue_srvcc = subscriber_details.get('ue_srvcc_capability', None)
+
+        ps_registered = mme is not None
+        cs_registered = msc is not None
+        voice_over_ps = ps_registered and scscf is not None
+
+        last_activity = subscriber_details.get('serving_mme_timestamp', None) or subscriber_details.get('last_location_update_timestamp', None)
+
+        parts = ['<TADS-Information>']
+        parts.append(f'<VoiceOverPS-SessionSupported>{"true" if voice_over_ps else "false"}</VoiceOverPS-SessionSupported>')
+        if last_activity:
+            if isinstance(last_activity, str):
+                parts.append(f'<LastUEActivityTime>{last_activity}</LastUEActivityTime>')
+            else:
+                parts.append(f'<LastUEActivityTime>{last_activity.isoformat()}Z</LastUEActivityTime>')
+        parts.append(f'<PS-Domain-Registered>{"true" if ps_registered else "false"}</PS-Domain-Registered>')
+        parts.append(f'<CS-Domain-Registered>{"true" if cs_registered else "false"}</CS-Domain-Registered>')
+        if ue_srvcc is not None:
+            cap_str = 'UE-SRVCC-supported' if int(ue_srvcc) == 1 else 'UE-SRVCC-not-supported'
+            parts.append(f'<UE-SRVCC-Capability>{cap_str}</UE-SRVCC-Capability>')
+        parts.append('</TADS-Information>')
+        return '\n'.join(parts)
+
+    def _sh_stn_sr(self, subscriber_details):
+        """TS 29.328 section 7.6.16 - STN-SR (Data-Reference 27)"""
+        stn_sr = subscriber_details.get('stn_sr', None)
+        if stn_sr:
+            return f'<STN-SR>{stn_sr}</STN-SR>'
+        return ''
+
+    def _sh_ue_srvcc_capability(self, subscriber_details):
+        """TS 29.328 section 7.6.17 - UE-SRVCC-Capability (Data-Reference 28)"""
+        ue_srvcc = subscriber_details.get('ue_srvcc_capability', None)
+        if ue_srvcc is not None:
+            cap_str = 'UE-SRVCC-supported' if int(ue_srvcc) == 1 else 'UE-SRVCC-not-supported'
+            return f'<UE-SRVCC-Capability>{cap_str}</UE-SRVCC-Capability>'
+        return ''
+
+    def _sh_assemble_xml(self, subscriber_details, data_refs, service_indication=None, requested_domain=None):
+        """Assemble Sh-Data XML from requested Data-Reference values."""
+        xml_parts = []
+        for data_ref in data_refs:
+            fragment = ''
+            if data_ref == self.SH_DATA_REF_REPOSITORY_DATA:
+                fragment = self._sh_repository_data(subscriber_details, service_indication)
+            elif data_ref == self.SH_DATA_REF_IMS_PUBLIC_IDENTITY:
+                fragment = self._sh_ims_public_identity(subscriber_details)
+            elif data_ref == self.SH_DATA_REF_IMS_USER_STATE:
+                fragment = self._sh_ims_user_state(subscriber_details)
+            elif data_ref == self.SH_DATA_REF_SCSCF_NAME:
+                fragment = self._sh_scscf_name(subscriber_details)
+            elif data_ref == self.SH_DATA_REF_LOCATION_INFORMATION:
+                fragment = self._sh_location_information(subscriber_details, requested_domain)
+            elif data_ref == self.SH_DATA_REF_MSISDN:
+                fragment = self._sh_msisdn(subscriber_details)
+            elif data_ref == self.SH_DATA_REF_TADS_INFORMATION:
+                fragment = self._sh_tads_information(subscriber_details)
+            elif data_ref == self.SH_DATA_REF_STN_SR:
+                fragment = self._sh_stn_sr(subscriber_details)
+            elif data_ref == self.SH_DATA_REF_UE_SRVCC_CAPABILITY:
+                fragment = self._sh_ue_srvcc_capability(subscriber_details)
+            else:
+                self.logTool.log(service='HSS', level='debug', message=f"[Sh] Unsupported Data-Reference: {data_ref}", redisClient=self.redisMessaging)
+
+            if fragment:
+                xml_parts.append(fragment)
+
+        if not xml_parts:
+            return '<Sh-Data />'
+        return '<?xml version="1.0" encoding="UTF-8"?>\n<Sh-Data>\n' + '\n'.join(xml_parts) + '\n</Sh-Data>'
+
+    def _sh_resolve_subscriber(self, avps):
+        """Resolve subscriber from Sh User-Identity AVP, supporting MSISDN, sip: and tel: URIs.
+        Returns (subscriber_details, subscriber_ims_details) or raises ValueError."""
+        user_identity_avp = self.get_avp_data(avps, 700)[0]
+
+        # Try MSISDN (AVP 701) inside User-Identity
+        try:
+            msisdn_hex = self.get_avp_data(user_identity_avp, 701)[0]
+            msisdn = self.TBCD_decode(msisdn_hex)
+            self.logTool.log(service='HSS', level='debug', message=f"[Sh] Resolved MSISDN: {msisdn}", redisClient=self.redisMessaging)
+            return self.database.Get_Subscriber(msisdn=msisdn), self.database.Get_IMS_Subscriber(msisdn=msisdn)
+        except Exception:
+            pass
+
+        # Try Public-Identity (AVP 601) inside User-Identity
+        public_identity = self.get_avp_data(user_identity_avp, 601)[0]
+        public_identity = binascii.unhexlify(public_identity).decode('utf-8')
+        self.logTool.log(service='HSS', level='debug', message=f"[Sh] Public-Identity: {public_identity}", redisClient=self.redisMessaging)
+
+        # Strip URI scheme
+        identity = public_identity
+        if identity.startswith('sip:'):
+            identity = identity[4:]
+        elif identity.startswith('tel:'):
+            identity = identity[4:]
+
+        # Strip leading + from tel URIs
+        if identity.startswith('+'):
+            identity = identity[1:]
+
+        # Strip domain part
+        if '@' in identity:
+            identity = identity.split('@')[0]
+
+        # Determine if this is an IMSI (15 digits) or MSISDN
+        if len(identity) == 15 and identity.isdigit():
+            self.logTool.log(service='HSS', level='debug', message=f"[Sh] Resolved IMSI: {identity}", redisClient=self.redisMessaging)
+            return self.database.Get_Subscriber(imsi=identity), self.database.Get_IMS_Subscriber(imsi=identity)
+        else:
+            self.logTool.log(service='HSS', level='debug', message=f"[Sh] Resolved MSISDN from Public-Identity: {identity}", redisClient=self.redisMessaging)
+            return self.database.Get_Subscriber(msisdn=identity), self.database.Get_IMS_Subscriber(msisdn=identity)
+
+    def _sh_generate_error_response(self, packet_vars, avp_prefix, result_code):
+        """Generate a UDA error response."""
+        avp = avp_prefix
+        avp_experimental_result = ''
+        avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')
+        avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))
+        avp += self.generate_avp(297, 40, avp_experimental_result)
+        return self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+
     #3GPP Sh User-Data Answer
     def Answer_16777217_306(self, packet_vars, avps):
-        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
+        avp = ''
 
+        session_id = self.get_avp_data(avps, 263)[0]
+        avp += self.generate_avp(263, 40, session_id)
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (No state maintained)
+        avp += self.generate_avp(260, 40, "0000010a4000000c000028af000001024000000c01000001")             #Vendor-Specific-Application-ID (Sh)
+
+        # Parse Data-Reference AVP(s) (code 703, vendor 10415)
+        data_refs = []
+        try:
+            data_ref_avps = self.get_avp_data(avps, 703)
+            for dr_hex in data_ref_avps:
+                data_refs.append(int(dr_hex, 16))
+            self.logTool.log(service='HSS', level='debug', message=f"[Sh] [UDR] Data-Reference values: {data_refs}", redisClient=self.redisMessaging)
+        except Exception:
+            pass
+
+        # Parse Service-Indication (code 704, vendor 10415)
+        service_indication = None
+        try:
+            si_hex = self.get_avp_data(avps, 704)[0]
+            service_indication = binascii.unhexlify(si_hex).decode('utf-8')
+            self.logTool.log(service='HSS', level='debug', message=f"[Sh] [UDR] Service-Indication: {service_indication}", redisClient=self.redisMessaging)
+        except Exception:
+            pass
+
+        # Parse Requested-Domain (code 706, vendor 10415)
+        requested_domain = None
+        try:
+            rd_hex = self.get_avp_data(avps, 706)[0]
+            requested_domain = int(rd_hex, 16)
+            self.logTool.log(service='HSS', level='debug', message=f"[Sh] [UDR] Requested-Domain: {requested_domain}", redisClient=self.redisMessaging)
+        except Exception:
+            pass
+
+        # Resolve subscriber identity
+        subscriber_details = None
+        subscriber_ims_details = None
+        try:
+            subscriber_details, subscriber_ims_details = self._sh_resolve_subscriber(avps)
+        except Exception as e:
+            self.logTool.log(service='HSS', level='error', message=f"[Sh] [UDR] Subscriber lookup failed: {e}", redisClient=self.redisMessaging)
+            return self._sh_generate_error_response(packet_vars, avp, 5001)
+
+        if subscriber_ims_details is None:
+            self.logTool.log(service='HSS', level='error', message="[Sh] [UDR] No IMS subscriber found", redisClient=self.redisMessaging)
+            return self._sh_generate_error_response(packet_vars, avp, 5001)
+
+        # Merge subscriber + IMS subscriber data
+        try:
+            subscriber_details = {**subscriber_details, **subscriber_ims_details}
+        except Exception as e:
+            self.logTool.log(service='HSS', level='error', message=f"[Sh] [UDR] Failed to merge subscriber data: {e}", redisClient=self.redisMessaging)
+            return self._sh_generate_error_response(packet_vars, avp, 5001)
+
+        # If Data-Reference AVPs present: use per-reference dispatch (spec-compliant path)
+        if data_refs:
+            xmlbody = self._sh_assemble_xml(subscriber_details, data_refs, service_indication, requested_domain)
+            self.logTool.log(service='HSS', level='debug', message=f"[Sh] [UDR] Assembled Sh-Data XML ({len(xmlbody)} bytes)", redisClient=self.redisMessaging)
+        else:
+            # Fallback: no Data-Reference AVPs -> use legacy Jinja2 template (backward compat)
+            self.logTool.log(service='HSS', level='debug', message="[Sh] [UDR] No Data-Reference AVPs, using legacy template", redisClient=self.redisMessaging)
+            xmlbody = self._sh_render_legacy_template(subscriber_details)
+
+        avp += self.generate_vendor_avp(702, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))
+        avp += self.generate_avp(268, 40, "000007d1")                                                   #DIAMETER_SUCCESS
+
+        return self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+
+    def _sh_render_legacy_template(self, subscriber_details):
+        """Backward-compatible Jinja2 template rendering for UDR without Data-Reference AVPs."""
+        sh_userdata_template = config['hss']['Default_Sh_UserData']
+        self.logTool.log(service='HSS', level='debug', message=f"[Sh] Using legacy template: {sh_userdata_template}", redisClient=self.redisMessaging)
+        template = self.templateEnv.get_template(sh_userdata_template)
+
+        subscriber_details['mnc'] = self.MNC.zfill(3)
+        subscriber_details['mcc'] = self.MCC.zfill(3)
+
+        scscf = subscriber_details.get('scscf', None)
+        subscriber_details['imsUserState'] = 1 if scscf is not None else 0
+
+        subscriberShProfile = subscriber_details.get('sh_profile', '') or subscriber_details.get('xcap_profile', '') or ''
+
+        subscriber_details['inboundCommunicationBarred'] = False
+        subscriber_details['outboundCommunicationBarred'] = False
+        subscriber_details['callForwarding'] = {'enabled': True, 'unconditional': False, 'notRegistered': False, 'noAnswer': False, 'busy': False, 'notReachable': False, 'noReplyTimer': 20}
+
+        subscriber_details['repository_data'] = None
+        if subscriberShProfile and subscriberShProfile.strip():
+            try:
+                subscriberShXml = ET.fromstring(subscriberShProfile)
+                namespaces = {
+                    'default': 'http://uri.etsi.org/ngn/params/xml/simservs/xcap',
+                    'cp': 'urn:ietf:params:xml:ns:common-policy'
+                }
+                data = {}
+                try:
+                    for repository_data in subscriberShXml.findall('RepositoryData', namespaces):
+                        si = repository_data.find('ServiceIndication', namespaces)
+                        data[si.text] = repository_data
+                except Exception as e:
+                    self.logTool.log(service='HSS', level='debug', message=f"Error parsing ServiceIndication in RepositoryData: {e}", redisClient=self.redisMessaging)
+
+                repo_xml = ''
+                for service, repository_data in data.items():
+                    repo_xml += ET.tostring(repository_data, encoding='unicode', method='xml')
+                if repo_xml:
+                    subscriber_details['repository_data'] = repo_xml
+
+                incomingCommunicationBarringRuleActive, incomingCommunicationBarringAllowed = self.get_sh_profile_call_barring_rules('incoming-communication-barring', subscriberShXml, namespaces)
+                outgoingCommunicationBarringRuleActive, outgoingCommunicationBarringAllowed = self.get_sh_profile_call_barring_rules('outgoing-communication-barring', subscriberShXml, namespaces)
+                call_forwarding_active, call_forwarding_rules = self.get_sh_profile_call_forwarding_rules('communication-diversion', subscriberShXml, namespaces)
+
+                if incomingCommunicationBarringRuleActive and not incomingCommunicationBarringAllowed:
+                    subscriber_details['inboundCommunicationBarred'] = True
+                if outgoingCommunicationBarringRuleActive and not outgoingCommunicationBarringAllowed:
+                    subscriber_details['outboundCommunicationBarred'] = True
+
+                try:
+                    if call_forwarding_active:
+                        subscriber_details['callForwarding']['notRegistered'] = call_forwarding_rules['not-registered']['target']
+                except Exception:
+                    pass
+                try:
+                    if call_forwarding_active:
+                        subscriber_details['callForwarding']['notReachable'] = call_forwarding_rules['not-reachable']['target']
+                except Exception:
+                    pass
+                try:
+                    if call_forwarding_active:
+                        subscriber_details['callForwarding']['unconditional'] = call_forwarding_rules['forward-unconditional']['target']
+                except Exception:
+                    pass
+                try:
+                    if call_forwarding_active:
+                        subscriber_details['callForwarding']['noReplyTimer'] = int(call_forwarding_rules['NoReplyTimer'])
+                except Exception:
+                    pass
+
+            except Exception as e:
+                self.logTool.log(service='HSS', level='debug', message=f"Unable to parse Sh Profile XML: {traceback.format_exc()}", redisClient=self.redisMessaging)
+
+        return template.render(Sh_template_vars=subscriber_details)
+
+    #3GPP Sh Profile-Update Answer
+    def Answer_16777217_307(self, packet_vars, avps):
         #Define values so we can check if they've been changed
         msisdn = None
         imsi = None
-        scscf = None
-        subscriberIsBarred = False
-        username = None
         subscriber_ims_details = None
-        try:
-            user_identity_avp = self.get_avp_data(avps, 700)[0]
-            
-            #Try to get MSISDN
-            try:
-                msisdn = self.get_avp_data(user_identity_avp, 701)[0]                                                         #Get MSISDN from AVP in request
-                self.logTool.log(service='HSS', level='debug', message="Got raw MSISDN with value " + str(msisdn), redisClient=self.redisMessaging)
-                msisdn = self.TBCD_decode(msisdn)
-                self.logTool.log(service='HSS', level='debug', message="Got MSISDN with value " + str(msisdn), redisClient=self.redisMessaging)            
-                subscriber_ims_details = self.database.Get_IMS_Subscriber(msisdn=msisdn)
-                subscriber_details = self.database.Get_Subscriber(msisdn=msisdn)
-            except:
-            #Try to get the IMSI from the Public Identity
-                public_identity = self.get_avp_data(avps, 601)[0]
-                public_identity = binascii.unhexlify(public_identity).decode('utf-8')
-                self.logTool.log(service='HSS', level='debug', message="Got public_identity : " + str(public_identity), redisClient=self.redisMessaging)
-                if "sip:" in public_identity:
-                    public_identity = public_identity.replace("sip:", "")
-                
-                if "@" in public_identity:
-                    imsi = public_identity.split('@')[0]   #Strip Domain
-                    domain = public_identity.split('@')[1] #Get Domain Part
-                    public_identity = imsi
-                
-                if len(public_identity) == 15:
-                    imsi = public_identity
-                    self.logTool.log(service='HSS', level='debug', message="Got IMSI: " + str(imsi), redisClient=self.redisMessaging)                                                              
-                    subscriber_ims_details = self.database.Get_IMS_Subscriber(imsi=imsi)
-                    subscriber_details = self.database.Get_Subscriber(imsi=imsi)
-                else:
-                    msisdn = public_identity
-                    self.logTool.log(service='HSS', level='debug', message="Got msisdn : " + str(msisdn), redisClient=self.redisMessaging)
-                    subscriber_ims_details = self.database.Get_IMS_Subscriber(msisdn=msisdn)
-                    subscriber_details = self.database.Get_Subscriber(msisdn=msisdn)
-        except:
-            self.logTool.log(service='HSS', level='debug', message="No User Identity present - This request is invalid", redisClient=self.redisMessaging)
-
+        
+        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
         session_id = self.get_avp_data(avps, 263)[0]                                                     #Get Session-ID
         avp += self.generate_avp(263, 40, session_id)                                                    #Set session ID to received session ID
         avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin Host
         avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
         avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (No state maintained)
-        
-        avp += self.generate_avp(260, 40, "0000010a4000000c000028af000001024000000c01000001")            #Vendor-Specific-Application-ID for Cx
+        #AVP: Vendor-Specific-Application-Id(260) l=32 f=-M-
+        VendorSpecificApplicationId = ''
+        VendorSpecificApplicationId += self.generate_vendor_avp(266, 40, 10415, '')                     #AVP Vendor ID
+        VendorSpecificApplicationId += self.generate_avp(258, 40, format(int(16777217),"x").zfill(8))   #Auth-Application-ID Sh
+        avp += self.generate_avp(260, 40, VendorSpecificApplicationId) 
+        try:
+            # Optional User-Name (IMSI) — not sent by MMTel Ut PUR
+            imsi = self.get_avp_data(avps, 1)[0]
+            imsi = binascii.unhexlify(imsi).decode('utf-8')
+            subscriber_ims_details = self.database.Get_IMS_Subscriber(imsi=imsi)
+        except Exception:
+            subscriber_ims_details = None
 
-        if subscriber_ims_details is not None:
-                try:
-                    self.logTool.log(service='HSS', level='debug', message="Got subscriber IMS details: " + str(subscriber_ims_details), redisClient=self.redisMessaging)
-                    imsi = subscriber_details.get('imsi', None)
-                    scscf = subscriber_ims_details.get('scscf', None)
-                    if scscf is not None:
-                        imsUserState = 1
-                    else:
-                        imsUserState = 0
-                    self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(subscriber_details), redisClient=self.redisMessaging)
-                    subscriber_details = {**subscriber_details, **subscriber_ims_details, 'imsUserState': imsUserState}
-                    self.logTool.log(service='HSS', level='debug', message="Merged subscriber details: " + str(subscriber_details), redisClient=self.redisMessaging)
-                except Exception as e:
-                    self.logTool.log(service='HSS', level='debug', message=f"No subscriber found for MSISDN {msisdn}", redisClient=self.redisMessaging)
-                    result_code = 5001
-                    #Experimental Result AVP
-                    avp_experimental_result = ''
-                    avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
-                    avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
-                    avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
-                    response = self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-                    return response
-        else:
-            self.logTool.log(service='HSS', level='error', message="No MSISDN or IMSI matched from Sh User-Data-Answer input", redisClient=self.redisMessaging)
-            if username is not None:
-                self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
-                                                metricType='counter', metricAction='inc', 
-                                                metricValue=1.0, 
-                                                metricLabels={
-                                                            "diameter_application_id": 16777216,
-                                                            "diameter_cmd_code": 306,
-                                                            "event": "Unknown User",
-                                                            "imsi_prefix": str(username[0:6])},
-                                                metricHelp='Diameter Authentication related Counters',
-                                                metricExpiry=60,
-                                                usePrefix=True, 
-                                                prefixHostname=self.hostname, 
-                                                prefixServiceName='metric')
+        if not subscriber_ims_details:
+            try:
+                _epc, subscriber_ims_details = self._sh_resolve_subscriber(avps)
+            except Exception:
+                subscriber_ims_details = None
+
+        if not subscriber_ims_details:
+            self.logTool.log(service='HSS', level='debug', message="No User Identity present - This request is invalid", redisClient=self.redisMessaging)
             result_code = 5001
             #Experimental Result AVP
             avp_experimental_result = ''
@@ -3640,128 +3976,37 @@ class Diameter:
             response = self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
             return response
 
-        #Sh-User-Data (XML)
-        #This loads a Jinja XML template containing the Sh-User-Data
-        sh_userdata_template = config['hss']['Default_Sh_UserData']
-        self.logTool.log(service='HSS', level='debug', message="Using template " + str(sh_userdata_template) + " for SH user data", redisClient=self.redisMessaging)
-        template = self.templateEnv.get_template(sh_userdata_template)
-        #These variables are passed to the template for use
-        subscriber_details['mnc'] = self.MNC.zfill(3)
-        subscriber_details['mcc'] = self.MCC.zfill(3)
-        subscriberShProfile = subscriber_details.get('sh_profile', '')
-        if not subscriberShProfile:
-            subscriberShProfile = subscriber_details.get('xcap_profile', '')
-
-        subscriber_details['inboundCommunicationBarred'] = False
-        subscriber_details['outboundCommunicationBarred'] = False
-        subscriber_details['callForwarding'] = {'enabled': True, 'unconditional': False, 'notRegistered': False, 'noAnswer': False, 'busy': False, 'notReachable': False, 'noReplyTimer': 20}
-
-        try:
-            subscriberShXml = ET.fromstring(subscriberShProfile)
-            namespaces = {
-                'default': 'http://uri.etsi.org/ngn/params/xml/simservs/xcap',
-                'cp': 'urn:ietf:params:xml:ns:common-policy'
-            }
-            incomingCommunicationBarringRuleActive, incomingCommunicationBarringAllowed = self.get_sh_profile_call_barring_rules('incoming-communication-barring', subscriberShXml, namespaces)
-            outgoingCommunicationBarringRuleActive, outgoingCommunicationBarringAllowed = self.get_sh_profile_call_barring_rules('outgoing-communication-barring', subscriberShXml, namespaces)
-
-            call_forwarding_active, call_forwarding_rules = self.get_sh_profile_call_forwarding_rules('communication-diversion', subscriberShXml, namespaces)
-            self.logTool.log(service='HSS', level='debug', message=f"Call forwarding rules enabled: {call_forwarding_active}", redisClient=self.redisMessaging)
-            self.logTool.log(service='HSS', level='debug', message=f"Call forwarding rules: {call_forwarding_rules}", redisClient=self.redisMessaging)
-
-            if incomingCommunicationBarringRuleActive:
-                if not incomingCommunicationBarringAllowed:
-                    subscriber_details['inboundCommunicationBarred'] = True
-
-            if outgoingCommunicationBarringRuleActive:
-                if not outgoingCommunicationBarringAllowed:
-                    subscriber_details['outboundCommunicationBarred'] = True
-            
-            try:
-                if call_forwarding_active:
-                    subscriber_details['callForwarding']['notRegistered'] = call_forwarding_rules['not-registered']['target']
-            except:
-                pass
-
-            try:
-                if call_forwarding_active:
-                    subscriber_details['callForwarding']['noAnswer'] = call_forwarding_rules['no-answer']['target']
-            except:
-                pass
-
-            try:
-                if call_forwarding_active:
-                    subscriber_details['callForwarding']['busy'] = call_forwarding_rules['busy']['target']
-            except:
-                pass
-
-            try:
-                if call_forwarding_active:
-                    subscriber_details['callForwarding']['notReachable'] = call_forwarding_rules['not-reachable']['target']
-            except:
-                pass
-
-            try:
-                if call_forwarding_active:
-                    subscriber_details['callForwarding']['unconditional'] = call_forwarding_rules['forward-unconditional']['target']
-            except:
-                pass
-
-            try:
-                if call_forwarding_active:
-                    subscriber_details['callForwarding']['noReplyTimer'] = int(call_forwarding_rules['NoReplyTimer'])
-            except:
-                pass
-
-
-        except Exception as e:
-            self.logTool.log(service='HSS', level='debug', message="Unable to parse Sh Profile XML for subscriber: " + str(subscriber_details), redisClient=self.redisMessaging)
-            self.logTool.log(service='HSS', level='debug', message=f"{traceback.format_exc()}", redisClient=self.redisMessaging)
-
-        self.logTool.log(service='HSS', level='debug', message="Rendering template with values: " + str(subscriber_details), redisClient=self.redisMessaging)
-        xmlbody = template.render(Sh_template_vars=subscriber_details)
-
-        self.logTool.log(service='HSS', level='debug', message=f"Template: {template}", redisClient=self.redisMessaging)
-
-        avp += self.generate_vendor_avp(702, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))
-        
-        avp += self.generate_avp(268, 40, "000007d1")                                                   #DIAMETER_SUCCESS
-
-        response = self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-        
-        return response
-
-    #3GPP Sh Profile-Update Answer
-    def Answer_16777217_307(self, packet_vars, avps):
-        
-
-        #Get IMSI
-        imsi = self.get_avp_data(avps, 1)[0]                                                        #Get IMSI from User-Name AVP in request
-        imsi = binascii.unhexlify(imsi).decode('utf-8')
-
         #Get Sh User Data
         sh_user_data = self.get_avp_data(avps, 702)[0]                                                        #Get IMSI from User-Name AVP in request
         sh_user_data = binascii.unhexlify(sh_user_data).decode('utf-8')
-
         self.logTool.log(service='HSS', level='debug', message="Got Sh User data: " + str(sh_user_data), redisClient=self.redisMessaging)
 
-        #Push updated User Data into IMS Backend
-        #Start with the Current User Data
-        subscriber_ims_details = self.database.Get_IMS_Subscriber(imsi=imsi)
-        self.database.UpdateObj(IMS_SUBSCRIBER, {'xcap_profile': sh_user_data}, subscriber_ims_details['ims_subscriber_id'])
+        # Persist as xcap_profile (the column the GUI/API and UDR fallback use)
+        # and clear the deprecated sh_profile so it cannot shadow on the next UDR.
+        try:
+            self.database.UpdateObj(IMS_SUBSCRIBER, {'xcap_profile': sh_user_data, 'sh_profile': None}, subscriber_ims_details['ims_subscriber_id'])
+            self.logTool.log(service='HSS', level='debug', message="Updated IMS Subscriber with new xcap_profile from Sh PUR", redisClient=self.redisMessaging)
+        except Exception as e:
+            self.logTool.log(service='HSS', level='error', message="Failed to update IMS Subscriber with new Sh Profile", redisClient=self.redisMessaging)
+            self.logTool.log(service='HSS', level='error', message=f"{traceback.format_exc()}", redisClient=self.redisMessaging)
+            result_code = 5001
+            #Experimental Result AVP
+            avp_experimental_result = ''
+            avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
+            avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
+            avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
+            response = self.generate_diameter_packet("01", "40", 306, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
+            return response
 
-        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
-        session_id = self.get_avp_data(avps, 263)[0]                                                     #Get Session-ID
-        avp += self.generate_avp(263, 40, session_id)                                                    #Set session ID to received session ID
-        avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
-        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (No state maintained)
-        avp += self.generate_avp(268, 40, "000007d1")                                                    #Result-Code (2001 SUCCESS)
-        #AVP: Vendor-Specific-Application-Id(260) l=32 f=-M-
-        VendorSpecificApplicationId = ''
-        VendorSpecificApplicationId += self.generate_vendor_avp(266, 40, 10415, '')                     #AVP Vendor ID
-        VendorSpecificApplicationId += self.generate_avp(258, 40, format(int(16777217),"x").zfill(8))   #Auth-Application-ID Sh
-        avp += self.generate_avp(260, 40, VendorSpecificApplicationId) 
+        subscriber_ims_details['xcap_profile'] = sh_user_data
+        subscriber_ims_details['sh_profile'] = None
+        try:
+            self.database.handleGeored({"imsi": str(subscriber_ims_details.get('imsi')), "xcap_profile": sh_user_data})
+        except Exception:
+            self.logTool.log(service='HSS', level='warning', message=f"[Sh] [PUR] Geored of xcap_profile failed: {traceback.format_exc()}", redisClient=self.redisMessaging)
+
+        avp += self.generate_avp(268, 40, "000007d1")                        
+
         response = self.generate_diameter_packet("01", "40", 307, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
         return response
 
@@ -5055,36 +5300,55 @@ class Diameter:
 
     #3GPP Sh User-Data Request (UDR)
     def Request_16777217_306(self, **kwargs):
-        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
-        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_sh'                           #Session state generate
-        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))          #Session ID AVP
+        avp = ''
+        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_sh'
+        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))
         avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777217),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (Sh)
-        
-        avp += self.generate_avp(264, 40, self.OriginHost)                                                    #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)                                                   #Origin Realm
 
-        avp += self.generate_avp(283, 40, str(binascii.hexlify(b'localdomain'),'ascii'))                 #Destination Realm
-        avp += self.generate_avp(293, 40, str(binascii.hexlify(b'hss.localdomain'),'ascii'))                 #Destination Host
-        
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+
+        avp += self.generate_avp(283, 40, str(binascii.hexlify(b'localdomain'),'ascii'))
+        avp += self.generate_avp(293, 40, str(binascii.hexlify(b'hss.localdomain'),'ascii'))
+
         avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (Not maintained)
-        
+
         avp += self.generate_vendor_avp(602, "c0", 10415, self.ProductName)                         #Server-Name
 
-        #* [ Route-Record ]
         avp += self.generate_avp(282, "40", str(binascii.hexlify(b'localdomain'),'ascii'))
         
         if kwargs.get("msisdn"):
             msisdn = str(kwargs['msisdn'])
             msisdn = msisdn.replace('+', '')
-            msisdn_avp = self.generate_vendor_avp(701, 'c0', 10415, self.TBCD_encode(str(msisdn)))                                             #MSISDN
-            avp += self.generate_vendor_avp(700, "c0", 10415, msisdn_avp)                         #User-Identity
-            avp += self.generate_vendor_avp(701, 'c0', 10415, self.TBCD_encode(str(msisdn))) 
+            msisdn_avp = self.generate_vendor_avp(701, 'c0', 10415, self.TBCD_encode(str(msisdn)))
+            avp += self.generate_vendor_avp(700, "c0", 10415, msisdn_avp)
+            avp += self.generate_vendor_avp(701, 'c0', 10415, self.TBCD_encode(str(msisdn)))
         elif "imsi" in kwargs:
             imsi = kwargs['imsi']
-            public_identity_avp = self.generate_vendor_avp(601, 'c0', 10415, self.string_to_hex(imsi))                                             #MSISDN
-            avp += self.generate_vendor_avp(700, "c0", 10415, public_identity_avp)                                          #Username (IMSI)
+            public_identity_avp = self.generate_vendor_avp(601, 'c0', 10415, self.string_to_hex(imsi))
+            avp += self.generate_vendor_avp(700, "c0", 10415, public_identity_avp)
 
-        response = self.generate_diameter_packet("01", "c0", 306, 16777217, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
+        # Data-Reference AVP(s) (code 703, vendor 10415, type Enumerated)
+        data_references = kwargs.get('data_references', [])
+        for dr in data_references:
+            avp += self.generate_vendor_avp(703, "c0", 10415, self.int_to_hex(int(dr), 4))
+
+        # Service-Indication AVP (code 704, vendor 10415, type OctetString)
+        service_indication = kwargs.get('service_indication', None)
+        if service_indication:
+            avp += self.generate_vendor_avp(704, "c0", 10415, self.string_to_hex(service_indication))
+
+        # Requested-Domain AVP (code 706, vendor 10415, type Enumerated)
+        requested_domain = kwargs.get('requested_domain', None)
+        if requested_domain is not None:
+            avp += self.generate_vendor_avp(706, "c0", 10415, self.int_to_hex(int(requested_domain), 4))
+
+        # Current-Location AVP (code 707, vendor 10415, type Enumerated)
+        current_location = kwargs.get('current_location', None)
+        if current_location is not None:
+            avp += self.generate_vendor_avp(707, "c0", 10415, self.int_to_hex(int(current_location), 4))
+
+        response = self.generate_diameter_packet("01", "c0", 306, 16777217, self.generate_id(4), self.generate_id(4), avp)
 
         return response
 
@@ -5330,7 +5594,7 @@ class Diameter:
 
         #Sh-User-Data (XML)
         #This loads a Jinja XML template containing the Sh-User-Data
-        templateLoader = jinja2.FileSystemLoader(searchpath="./")
+        templateLoader = jinja2.FileSystemLoader(searchpath=["/templates/", "../", "./"])
         templateEnv = jinja2.Environment(loader=templateLoader)
         sh_userdata_template = config['hss']['Default_Sh_UserData']
         self.logTool.log(service='HSS', level='debug', message="Using template " + str(sh_userdata_template) + " for SH user data", redisClient=self.redisMessaging)

@@ -740,6 +740,22 @@ class GeoRed_IMS(unittest.TestCase):
         payload['scscf_timestamp'] = self.__class__.ims_template_data['scscf_timestamp']
         self.assertEqual(self.__class__.ims_template_data, payload, "JSON body should match input")
 
+    def test_G_2b_GeoRed_IMS_Update_Xcap_Profile(self):
+        """Geored xcap_profile must land on this node's DB (write-back to master)."""
+        headers = {"Content-Type": "application/json"}
+        xcap = '<?xml version="1.0"?><Sh-Data><RepositoryData><ServiceIndication>MMTEL-Services</ServiceIndication></RepositoryData></Sh-Data>'
+        r = requests.patch(str(base_url) + '/geored/', data=json.dumps({
+            "imsi": str(self.__class__.ims_template_data['imsi']),
+            "xcap_profile": xcap,
+        }), headers=headers)
+        self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
+        r = requests.get(str(base_url) + '/ims_subscriber/' + str(self.__class__.ims_subscriber_id))
+        payload = r.json()
+        self.assertEqual(payload.get('xcap_profile'), xcap, "xcap_profile should match the geored PUR payload")
+        self.assertTrue(payload.get('sh_profile') in (None, ''), "sh_profile must be cleared so it cannot shadow xcap_profile")
+        self.__class__.ims_template_data['xcap_profile'] = xcap
+        self.__class__.ims_template_data['sh_profile'] = payload.get('sh_profile')
+
     def test_G_3_GeoRed_IMS_Clear_SCCSF_Sub(self):
         headers = {"Content-Type": "application/json"}
         r = requests.patch(str(base_url) + '/geored/', data=json.dumps({
