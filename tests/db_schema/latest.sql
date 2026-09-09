@@ -202,6 +202,7 @@ CREATE TABLE roaming_rule (
 	FOREIGN KEY(roaming_network_id) REFERENCES roaming_network (roaming_network_id) ON DELETE CASCADE
 );
 CREATE TABLE serving_apn (
+	af_subscriptions VARCHAR(1024),
 	apn INTEGER,
 	ip_version INTEGER,
 	last_modified VARCHAR(100),

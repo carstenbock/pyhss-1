@@ -173,6 +173,7 @@ class SERVING_APN(Base):
     serving_pgw_timestamp = Column(DateTime, doc='Timestamp of attach to PGW')
     serving_pgw_realm = Column(String(512), doc='Realm of serving PGW')
     serving_pgw_peer = Column(String(512), doc='Diameter peer used to reach PGW')
+    af_subscriptions = Column(String(1024), doc='Information about AF subscriptions for this session')
     last_modified = Column(String(100), default=datetime.datetime.now(tz=timezone.utc), doc='Timestamp of last modification')
     operation_logs = relationship("SERVING_APN_OPERATION_LOG", back_populates="serving_apn")
 
@@ -2324,6 +2325,10 @@ class Database:
         
         self.safe_close(session)
         return result   
+
+    # Rx AF (signalling-bearer) subscriptions are stored in Redis by the
+    # Diameter class (rx_store/remove/get_af_subscription); the legacy
+    # serving_apn.af_subscriptions column is retained but unused.
 
     def Get_Charging_Rule(self, charging_rule_id):
         self.logTool.log(service='Database', level='debug', message="Called Get_Charging_Rule() for  charging_rule_id " + str(charging_rule_id), redisClient=self.redisMessaging)

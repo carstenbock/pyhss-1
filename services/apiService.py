@@ -297,6 +297,7 @@ GeoRed_model = api.model('GeoRed', {
     'serving_pgw_realm' : fields.String(description=Serving_APN.serving_pgw_realm.doc),
     'serving_pgw_peer' : fields.String(description=Serving_APN.serving_pgw_peer.doc),
     'serving_pgw_timestamp' : fields.String(description=Serving_APN.serving_pgw_timestamp.doc),
+    'af_subscriptions' : fields.String(description=Serving_APN.af_subscriptions.doc),
     'scscf' : fields.String(description=IMS_SUBSCRIBER.scscf.doc),
     'scscf_realm' : fields.String(description=IMS_SUBSCRIBER.scscf_realm.doc),
     'scscf_peer' : fields.String(description=IMS_SUBSCRIBER.scscf_peer.doc),
@@ -2213,6 +2214,24 @@ class PyHSS_Geored_Sh_Profile_Updated(Resource):
                 return {'error': 'ims_subscriber_id is required'}, 400
             data = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
             send_pnr_for_local_subscriptions(data)
+            return {'result': 'OK'}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_geored.route('/rx_terminate_af_subscriptions')
+class PyHSS_Geored_Rx_Terminate_Af_Subscriptions(Resource):
+    @ns_geored.doc('Receive a Gx CCR-T termination relay and abort matching Rx AF subscriptions')
+    @no_auth_required
+    def post(self):
+        '''Send Rx ASR to AFs whose signalling-bearer subscription for the given IMSI/APN is held on this node'''
+        try:
+            json_data = request.get_json(force=True)
+            imsi = json_data.get('imsi')
+            apn = json_data.get('apn')
+            if imsi is None or apn is None:
+                return {'error': 'imsi and apn are required'}, 400
+            diameterClient.rx_terminate_local_af_subscriptions(imsi, apn)
             return {'result': 'OK'}, 200
         except Exception as E:
             print(E)
