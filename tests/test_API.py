@@ -172,6 +172,8 @@ class Subscriber_Tests(unittest.TestCase):
         log.debug("Created APN ID " + str(r.json()['apn_id']))
         self.__class__.template_data['default_apn'] = r.json()['apn_id']
         self.__class__.template_data['apn_list'] = '1,2,' + str(r.json()['apn_id'])
+        # SWx allowlist intentionally narrower than apn_list to verify the per-interface split round-trips through the API
+        self.__class__.template_data['apn_list_swx'] = str(r.json()['apn_id'])
         self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
 
     def test_A_create_another_APN_for_Sub(self):
@@ -525,6 +527,8 @@ class GeoRed_MME(unittest.TestCase):
         self.__class__.apn_id = r.json()['apn_id']
         self.__class__.subscriber_template_data['default_apn'] = r.json()['apn_id']
         self.__class__.subscriber_template_data['apn_list'] = str(r.json()['apn_id'])
+        # No SWx subscription on this fixture; expect apn_list_swx to round-trip as None.
+        self.__class__.subscriber_template_data['apn_list_swx'] = None
         self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
 
     def test_C_GeoRed_MME_create_Subscriber(self):
@@ -639,6 +643,7 @@ class GeoRed_PCRF(unittest.TestCase):
         self.__class__.apn_id = r.json()['apn_id']
         self.__class__.subscriber_template_data['default_apn'] = r.json()['apn_id']
         self.__class__.subscriber_template_data['apn_list'] = str(r.json()['apn_id'])
+        self.__class__.subscriber_template_data['apn_list_swx'] = None
         self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
 
     def test_C_GeoRed_PCRF_create_Subscriber(self):

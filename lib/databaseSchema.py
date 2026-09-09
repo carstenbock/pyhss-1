@@ -9,7 +9,7 @@ from sqlalchemy_utils import create_database, database_exists
 
 
 class DatabaseSchema:
-    latest = 3
+    latest = 4
 
     def __init__(self, logTool, base, engine: Engine, main_service: bool):
         self.logTool = logTool
@@ -233,8 +233,16 @@ class DatabaseSchema:
         self.add_column("ims_subscriber", "ue_srvcc_capability", "INTEGER")
         self.set_version(3)
 
+    def upgrade_add_apn_list_swx(self):
+        if self.get_version() >= 4:
+            return
+        self.upgrade_msg(4)
+        self.add_column("subscriber", "apn_list_swx", "VARCHAR(64)")
+        self.set_version(4)
+
 
     def upgrade_all(self):
         self.upgrade_from_20240603_release_1_0_1()
         self.upgrade_add_ifc_template()
         self.upgrade_add_sh_srvcc_columns()
+        self.upgrade_add_apn_list_swx()

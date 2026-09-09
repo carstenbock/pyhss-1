@@ -39,6 +39,12 @@ curl -X 'PUT' \
 
 ### Define Subscriber for EPC Access
 This defines IMSI 001010000000001 with access to APN with APN_ID 1 & APN_ID 2, where the APN with APN_ID 1 is the default APN for the subscriber. The AMBR values allow for 9999999 bytes per second (~8Mbps).
+
+The subscriber's allowed APNs are configured per Diameter interface:
+
+- `apn_list` -- comma-separated APN IDs returned in the S6a Update-Location-Answer (mobile / 3GPP access via MME). This field is required.
+- `apn_list_swx` -- comma-separated APN IDs returned in the SWx Server-Assignment-Answer (untrusted non-3GPP access via ePDG). Optional. When NULL or empty the SWx SAA is rejected with `DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450)` per 3GPP TS 29.273 §5.2.2.4, so VoWiFi attach is denied. Operators that want VoWiFi must list at least the IMS APN here.
+
 ```shell
 curl -X 'PUT' \
   'http://10.97.0.36:8080/subscriber/' \
@@ -49,7 +55,8 @@ curl -X 'PUT' \
   "enabled": true,
   "auc_id": 1,
   "default_apn": 1,
-  "apn_list": "1",
+  "apn_list": "1,2",
+  "apn_list_swx": "1",
   "msisdn": "599416501",
   "ue_ambr_dl": 9999999,
   "ue_ambr_ul": 9999999,

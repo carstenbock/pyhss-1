@@ -50,6 +50,10 @@ class DiameterAsync:
 
                 # SLh LCS
                 {"commandCode": 8388622, "applicationId": 16777291, "responseMethod": self.Answer_16777291_8388622, "failureResultCode": 4100 ,"requestAcronym": "LRR", "responseAcronym": "LRA", "requestName": "LCS Routing Info Request", "responseName": "LCS Routing Info Answer"},
+
+                # SWx AAA Server <-> HSS (TS 29.273)
+                {"commandCode": 303, "applicationId": 16777265, "responseMethod": self.Answer_16777265_303, "failureResultCode": 4100 ,"requestAcronym": "MAR", "responseAcronym": "MAA", "requestName": "Multimedia Authentication Request (SWx)", "responseName": "Multimedia Authentication Answer (SWx)"},
+                {"commandCode": 301, "applicationId": 16777265, "responseMethod": self.Answer_16777265_301, "failureResultCode": 4100 ,"requestAcronym": "SAR", "responseAcronym": "SAA", "requestName": "Server Assignment Request (SWx)", "responseName": "Server Assignment Answer (SWx)"},
             ]
 
         self.redisUseUnixSocket = config.get('redis', {}).get('useUnixSocket', False)
@@ -468,4 +472,10 @@ class DiameterAsync:
         pass
 
     async def Answer_16777238_258(self):
+        pass
+
+    async def Answer_16777265_303(self):
+        pass
+
+    async def Answer_16777265_301(self):
         pass

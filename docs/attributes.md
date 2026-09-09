@@ -38,6 +38,7 @@ We can also get this information in the `/subscriber/imsi/` and `/subscriber/msi
   "imsi": "0010100000000101",
   "auc_id": 1,
   "apn_list": "1,2,3",
+  "apn_list_swx": "1",
   "ue_ambr_dl": 9999999,
   "nam": 0,
   "serving_mme": null,

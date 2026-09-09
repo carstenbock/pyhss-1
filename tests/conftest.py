@@ -86,6 +86,7 @@ def create_test_db():
         "auc_id": 1,
         "default_apn": "internet",
         "apn_list": "1,2",
+        "apn_list_swx": "1",
         "imsi": test_imsi,
         "msisdn": "100",
     })

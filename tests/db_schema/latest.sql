@@ -219,6 +219,7 @@ CREATE TABLE serving_apn (
 );
 CREATE TABLE subscriber (
 	apn_list VARCHAR(64) NOT NULL,
+	apn_list_swx VARCHAR(64),
 	auc_id INTEGER NOT NULL,
 	default_apn INTEGER NOT NULL,
 	enabled BOOLEAN,

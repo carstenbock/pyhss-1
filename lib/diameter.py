@@ -28,6 +28,18 @@ from pyhss_config import config
 from rat import SubscriberRATRestriction, RAT
 from ast import literal_eval
 
+# SWx Server-Assignment-Type values (TS 29.229 clause 6.3.15, reused by TS 29.273).
+# Registration and profile-update types bind the serving 3GPP AAA Server to the
+# subscriber; de-registration types release that binding.
+SWX_SAT_REGISTRATION_TYPES = (1, 2, 3, 12, 13, 14)
+SWX_SAT_DEREGISTRATION_TYPES = (4, 5, 6, 7, 8, 9, 10, 11)
+
+# Lifetime of the swx_aaa_server:<imsi> binding used as SWx RTR Destination-Host.
+# Must not be shorter than the AAA server's established-session TTL
+# (AAA_SESSION_ESTABLISHED_TIMEOUT / ?ESTABLISHED_TTL_SEC, 7 days), otherwise the
+# HSS forgets the serving AAA while its SWm session is still live.
+SWX_AAA_BINDING_TTL_SEC = 604800
+
 
 class Diameter:
 
@@ -131,6 +143,25 @@ class Diameter:
                 {"commandCode": 8388622, "applicationId": 16777291, "responseMethod": self.Answer_16777291_8388622, "failureResultCode": 4100 ,"requestAcronym": "LRR", "responseAcronym": "LRA", "requestName": "LCS Routing Info Request", "responseName": "LCS Routing Info Answer"},
             ]
 
+        # SWx Interface (Application ID: 16777265) - 3GPP AAA Server ↔ HSS (TS 29.273)
+        # Enabled by default — required for VoWiFi/ePDG authentication
+        if config.get('hss', {}).get('SWx_enabled', True):
+            self.diameterResponseList.extend([
+                {"commandCode": 303, "applicationId": 16777265,
+                 "responseMethod": self.Answer_16777265_303, "failureResultCode": 4100,
+                 "requestAcronym": "MAR", "responseAcronym": "MAA",
+                 "requestName": "Multimedia Authentication Request (SWx)",
+                 "responseName": "Multimedia Authentication Answer (SWx)"},
+                {"commandCode": 301, "applicationId": 16777265,
+                 "responseMethod": self.Answer_16777265_301, "failureResultCode": 4100,
+                 "requestAcronym": "SAR", "responseAcronym": "SAA",
+                 "requestName": "Server Assignment Request (SWx)",
+                 "responseName": "Server Assignment Answer (SWx)"},
+            ])
+            self.logTool.log(service='HSS', level='info',
+                           message="SWx Interface (VoWiFi) enabled - MAR/MAA, SAR/SAA registered",
+                           redisClient=self.redisMessaging)
+
         self.diameterRequestList = [
                 # Gx PCEF/PCRF
                 {"commandCode": 304, "applicationId": 16777216, "requestMethod": self.Request_16777216_304, "failureResultCode": 5012 ,"requestAcronym": "RTR", "responseAcronym": "RTA", "requestName": "Registration Termination Request", "responseName": "Registration Termination Answer"},
@@ -148,6 +179,11 @@ class Diameter:
                 {"commandCode": 309, "applicationId": 16777217, "requestMethod": self.Request_16777217_309, "failureResultCode": 5012 ,"requestAcronym": "PNR", "responseAcronym": "PNA", "requestName": "Push Notification Request", "responseName": "Push Notification Answer"},
 
         ]
+
+        if config.get('hss', {}).get('SWx_enabled', True):
+            self.diameterRequestList.append(
+                {"commandCode": 304, "applicationId": 16777265, "requestMethod": self.Request_16777265_304, "failureResultCode": 5012, "requestAcronym": "SWX_RTR", "responseAcronym": "SWX_RTA", "requestName": "SWx Registration Termination Request", "responseName": "SWx Registration Termination Answer"},
+            )
 
     @staticmethod
     def get_unknown_imsi_reject_cause() -> int:
@@ -777,7 +813,7 @@ class Diameter:
         
     def getPeerType(self, originHost: str) -> str:
         try:
-            peerTypes = ['mme', 'pgw', 'pcscf', 'icscf', 'scscf', 'hss', 'ocs', 'dra']
+            peerTypes = ['mme', 'pgw', 'pcscf', 'icscf', 'scscf', 'hss', 'ocs', 'dra', 'aaa']
 
             for peer in peerTypes:
                 if peer in originHost.lower():
@@ -872,7 +908,7 @@ class Diameter:
     def getConnectedPeersByType(self, peerType: str) -> list:
         try:
             requestedPeerType = peerType.lower()
-            peerTypes = ['mme', 'pgw', 'pcscf', 'icscf', 'scscf', 'hss', 'ocs', 'dra']
+            peerTypes = ['mme', 'pgw', 'pcscf', 'icscf', 'scscf', 'hss', 'ocs', 'dra', 'aaa']
             filteredConnectedPeers = []
 
             if requestedPeerType not in peerTypes:
@@ -1811,6 +1847,10 @@ class Diameter:
         avp += self.generate_avp(258, 40, format(int(16777238),"x").zfill(8))                            #Auth-Application-ID - Diameter Gx
         avp += self.generate_avp(258, 40, format(int(10),"x").zfill(8))                                  #Auth-Application-ID - Diameter CER
         avp += self.generate_avp(258, 40, format(int(16777236),"x").zfill(8))                            #Auth-Application-ID - Diameter Rx
+        if config.get('hss', {}).get('SWx_enabled', True):
+            avp += self.generate_avp(265, 40, format(int(10415),"x").zfill(8))                               #Supported-Vendor-ID (3GPP)
+            avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (SWx)
+            avp += self.generate_avp(258, 40, format(int(16777265),"x").zfill(8))                            #Auth-Application-ID - SWx
         avp += self.generate_avp(265, 40, format(int(5535),"x").zfill(8))                                #Supported-Vendor-ID (3GGP v2)
         avp += self.generate_avp(265, 40, format(int(10415),"x").zfill(8))                               #Supported-Vendor-ID (3GPP)
         avp += self.generate_avp(265, 40, format(int(13019),"x").zfill(8))                               #Supported-Vendor-ID 13019 (ETSI)
@@ -3540,6 +3580,313 @@ class Diameter:
         
         response = self.generate_diameter_packet("01", "40", 304, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
         return response
+
+    #3GPP SWx Multimedia Authentication Answer (TS 29.273)
+    #Generates EAP-AKA/AKA' authentication vectors for non-3GPP access
+    def Answer_16777265_303(self, packet_vars, avps):
+        avp = ''
+        session_id = self.get_avp_data(avps, 263)[0]
+        avp += self.generate_avp(263, 40, session_id)                                                    #Session-ID
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) + "0000010a4000000c000028af")   #Vendor-Specific-Application-ID (SWx)
+        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State
+        avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin-Host
+        avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin-Realm
+
+        try:
+            username = self.get_avp_data(avps, 1)[0]
+            username = binascii.unhexlify(username).decode('utf-8')
+            self.logTool.log(service='HSS', level='debug', message="SWx MAR for user: " + str(username), redisClient=self.redisMessaging)
+
+            if '@' in username:
+                imsi = username.split('@')[0]
+                # Strip leading '0' from EAP identity NAI (0<IMSI>@nai.epc...)
+                if imsi.startswith('0'):
+                    imsi = imsi[1:]
+            else:
+                imsi = username
+
+            subscriber_details = self.database.Get_Subscriber(imsi=imsi)
+            if not subscriber_details.get('enabled', True):
+                self.logTool.log(service='HSS', level='info',
+                                 message="SWx MAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                                 redisClient=self.redisMessaging)
+                avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+                response = self.generate_diameter_packet("01", "40", 303, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+                return response
+        except Exception as e:
+            self.logTool.log(service='HSS', level='debug', message="SWx MAR subscriber " + str(imsi) + " unknown: " + str(e), redisClient=self.redisMessaging)
+            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                            metricType='counter', metricAction='inc', metricValue=1.0,
+                                            metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 303, "event": "Unknown User", "imsi_prefix": str(imsi[0:6]) if imsi else ""},
+                                            metricHelp='Diameter Authentication related Counters',
+                                            metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
+            experimental_result = self.generate_avp(298, 40, self.int_to_hex(5001, 4))
+            experimental_result += self.generate_vendor_avp(266, 40, 10415, "")
+            avp += self.generate_avp(297, 40, experimental_result)
+            response = self.generate_diameter_packet("01", "40", 303, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        plmn = self.EncodePLMN_from_IMSI(imsi)
+
+        # Determine number of requested auth vectors
+        num_items = 1
+        try:
+            num_items_avp = self.get_avp_data(avps, 607)
+            if num_items_avp:
+                num_items = int(num_items_avp[0], 16)
+        except:
+            pass
+
+        # Determine requested auth scheme from SIP-Auth-Data-Item (AVP 612)
+        auth_scheme = "EAP-AKA"
+        try:
+            for sub_avp_612 in self.get_avp_data(avps, 612)[0]:
+                if sub_avp_612['avp_code'] == 608:
+                    auth_scheme = binascii.unhexlify(sub_avp_612['misc_data']).decode('utf-8')
+                if sub_avp_612['avp_code'] == 610:
+                    # SQN resync
+                    auts = str(sub_avp_612['misc_data'])[32:]
+                    rand = str(sub_avp_612['misc_data'])[:32]
+                    rand = binascii.unhexlify(rand)
+                    self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "sqn_resync", auts=auts, rand=rand)
+                    self.logTool.log(service='HSS', level='debug', message="SWx MAR: resynced SQN for IMSI " + str(imsi), redisClient=self.redisMessaging)
+        except:
+            pass
+
+        self.logTool.log(service='HSS', level='debug', message="SWx MAR: generating " + auth_scheme + " vectors for IMSI " + str(imsi), redisClient=self.redisMessaging)
+
+        # Generate auth vectors — SWx uses sip_auth (same as Cx) to get RAND/AUTN/XRES/CK/IK
+        vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "sip_auth", plmn=plmn)
+
+        avp_SIP_Item_Number = self.generate_vendor_avp(613, "c0", 10415, format(int(0),"x").zfill(8))
+        avp_SIP_Authentication_Scheme = self.generate_vendor_avp(608, "c0", 10415, str(binascii.hexlify(auth_scheme.encode('utf-8')),'ascii'))
+        avp_SIP_Authenticate = self.generate_vendor_avp(609, "c0", 10415, str(binascii.hexlify(vector_dict['SIP_Authenticate']),'ascii'))
+        avp_SIP_Authorization = self.generate_vendor_avp(610, "c0", 10415, str(binascii.hexlify(vector_dict['xres']),'ascii'))
+        avp_Confidentiality_Key = self.generate_vendor_avp(625, "c0", 10415, str(binascii.hexlify(vector_dict['ck']),'ascii'))
+        avp_Integrity_Key = self.generate_vendor_avp(626, "c0", 10415, str(binascii.hexlify(vector_dict['ik']),'ascii'))
+
+        auth_data_item = avp_SIP_Item_Number + avp_SIP_Authentication_Scheme + avp_SIP_Authenticate + avp_SIP_Authorization + avp_Confidentiality_Key + avp_Integrity_Key
+        avp += self.generate_vendor_avp(612, "c0", 10415, auth_data_item)
+        avp += self.generate_vendor_avp(607, "c0", 10415, "00000001")                                    #SIP-Number-Auth-Items
+        avp += self.generate_avp(268, 40, "000007d1")                                                    #Result-Code: DIAMETER_SUCCESS
+
+        self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                        metricType='counter', metricAction='inc', metricValue=1.0,
+                                        metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 303, "event": "Success", "imsi_prefix": str(imsi[0:6])},
+                                        metricHelp='Diameter Authentication related Counters',
+                                        metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
+        response = self.generate_diameter_packet("01", "40", 303, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+        return response
+
+    #3GPP SWx Server Assignment Answer (TS 29.273)
+    #Handles non-3GPP access server assignment, returns Non-3GPP-User-Data
+    def Answer_16777265_301(self, packet_vars, avps):
+        avp = ''
+        session_id = self.get_avp_data(avps, 263)[0]
+        avp += self.generate_avp(263, 40, session_id)                                                    #Session-ID
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) + "0000010a4000000c000028af")
+        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State
+        avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin-Host
+        avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin-Realm
+
+        try:
+            username = self.get_avp_data(avps, 1)[0]
+            username = binascii.unhexlify(username).decode('utf-8')
+            if '@' in username:
+                imsi = username.split('@')[0]
+                if imsi.startswith('0'):
+                    imsi = imsi[1:]
+            else:
+                imsi = username
+
+            subscriber_details = self.database.Get_Subscriber(imsi=imsi)
+        except:
+            self.logTool.log(service='HSS', level='debug', message="SWx SAR subscriber unknown", redisClient=self.redisMessaging)
+            experimental_result = self.generate_avp(298, 40, self.int_to_hex(5001, 4))
+            experimental_result += self.generate_vendor_avp(266, 40, 10415, "")
+            avp += self.generate_avp(297, 40, experimental_result)
+            response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        # Server-Assignment-Type (AVP 614)
+        server_assignment_type = 0
+        try:
+            sat_avp = self.get_avp_data(avps, 614)
+            if sat_avp:
+                server_assignment_type = int(sat_avp[0], 16)
+        except:
+            pass
+
+        self.logTool.log(service='HSS', level='debug', message="SWx SAR: IMSI=" + str(imsi) + " assignment_type=" + str(server_assignment_type), redisClient=self.redisMessaging)
+
+        # De-registration releases the AAA binding. Done before any rejection path
+        # below so the binding cannot outlive the SWm session it points at.
+        if server_assignment_type in SWX_SAT_DEREGISTRATION_TYPES:
+            try:
+                # deleteQueue is RedisMessaging's generic key delete; there is no
+                # deleteValue counterpart to setValue/getValue.
+                self.redisMessaging.deleteQueue(queue=f"swx_aaa_server:{imsi}", usePrefix=False)
+                self.logTool.log(service='HSS', level='debug',
+                                 message="SWx SAR: released AAA binding for IMSI " + str(imsi),
+                                 redisClient=self.redisMessaging)
+            except Exception:
+                pass
+
+        # An administratively disabled subscriber must not be (re-)registered for
+        # non-3GPP access. De-registration types are exempt, otherwise the AAA can
+        # never tell the HSS that the session is gone (TS 29.273 §8.1.2.2).
+        if server_assignment_type in SWX_SAT_REGISTRATION_TYPES and not subscriber_details.get('enabled', True):
+            self.logTool.log(service='HSS', level='info',
+                             message="SWx SAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                             redisClient=self.redisMessaging)
+            avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+            response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        # Per-interface APN allowlist: SWx uses subscriber.apn_list_swx (separate from S6a apn_list).
+        # Per 3GPP TS 29.273 §5.2.2.4, when the subscriber has no non-3GPP subscription
+        # (no APN allowed via SWx), reject with DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450).
+        apn_list_swx_raw = subscriber_details.get('apn_list_swx') or ''
+        swx_apn_ids = [x.strip() for x in str(apn_list_swx_raw).split(',') if x.strip()]
+        if not swx_apn_ids:
+            self.logTool.log(service='HSS', level='info',
+                             message="SWx SAR: IMSI=" + str(imsi) + " has no apn_list_swx; rejecting SAA with DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION (5450)",
+                             redisClient=self.redisMessaging)
+            experimental_result = self.generate_vendor_avp(266, 40, 10415, "")
+            experimental_result += self.generate_avp(298, 40, self.int_to_hex(5450, 4))
+            avp += self.generate_avp(297, 40, experimental_result)
+            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                            metricType='counter', metricAction='inc', metricValue=1.0,
+                                            metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 301, "event": "NoNon3gppSubscription", "imsi_prefix": str(imsi[0:6])},
+                                            metricHelp='Diameter Authentication related Counters',
+                                            metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
+            response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        # Place default_apn first if it appears in the SWx allowlist, otherwise keep declared order.
+        default_apn = subscriber_details.get('default_apn')
+        if default_apn is not None and str(default_apn) in swx_apn_ids:
+            swx_apn_ids = [str(default_apn)] + [x for x in swx_apn_ids if x != str(default_apn)]
+
+        # Build Non-3GPP-User-Data AVP (vendor 10415, AVP 1500) per TS 29.273 §8.2.3.1
+        # Non-3GPP-IP-Access (AVP 1501): NON_3GPP_SUBSCRIPTION_ALLOWED (0)
+        non_3gpp_ip_access = self.generate_vendor_avp(1501, "c0", 10415, format(int(0),"x").zfill(8))
+        # Non-3GPP-IP-Access-APN (AVP 1502): NON_3GPP_APNS_ENABLE (0)
+        non_3gpp_ip_access_apn = self.generate_vendor_avp(1502, "c0", 10415, format(int(0),"x").zfill(8))
+        # AN-Trusted (AVP 1503): UNTRUSTED (1) — ePDG access is always untrusted
+        an_trusted = self.generate_vendor_avp(1503, "c0", 10415, format(int(1),"x").zfill(8))
+
+        # APN-Configuration-Profile (AVP 1429) wraps one APN-Configuration (AVP 1430) per allowed APN.
+        apn_configurations = ''
+        apn_context_identifer_count = 1
+        for apn_id in swx_apn_ids:
+            try:
+                apn_data = self.database.Get_APN(apn_id)
+            except Exception as e:
+                self.logTool.log(service='HSS', level='error',
+                                 message="SWx SAR: failed to load APN id " + str(apn_id) + ": " + str(e),
+                                 redisClient=self.redisMessaging)
+                continue
+
+            apn_context_id = self.generate_vendor_avp(1423, "c0", 10415, self.int_to_hex(apn_context_identifer_count, 4))
+            apn_service_selection = self.generate_avp(493, "40", self.string_to_hex(str(apn_data['apn'])))
+            apn_pdn_type = self.generate_vendor_avp(1456, "c0", 10415, self.int_to_hex(int(apn_data['ip_version']), 4))
+
+            apn_ambr_ul_avp = self.generate_vendor_avp(516, "c0", 10415, self.int_to_hex(int(apn_data['apn_ambr_ul']), 4))
+            apn_ambr_dl_avp = self.generate_vendor_avp(515, "c0", 10415, self.int_to_hex(int(apn_data['apn_ambr_dl']), 4))
+            apn_ambr = self.generate_vendor_avp(1435, "c0", 10415, apn_ambr_ul_avp + apn_ambr_dl_avp)
+
+            apn_configurations += self.generate_vendor_avp(1430, "c0", 10415,
+                apn_context_id + apn_service_selection + apn_pdn_type + apn_ambr)
+            apn_context_identifer_count += 1
+
+        if not apn_configurations:
+            self.logTool.log(service='HSS', level='error',
+                             message="SWx SAR: IMSI=" + str(imsi) + " apn_list_swx references APN ids that could not be loaded; rejecting with 5450",
+                             redisClient=self.redisMessaging)
+            experimental_result = self.generate_vendor_avp(266, 40, 10415, "")
+            experimental_result += self.generate_avp(298, 40, self.int_to_hex(5450, 4))
+            avp += self.generate_avp(297, 40, experimental_result)
+            response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        # APN-Configuration-Profile (AVP 1429): use the first allowed APN as default Context-Identifier.
+        apn_config_profile_context = self.generate_vendor_avp(1423, "c0", 10415, self.int_to_hex(1, 4))
+        all_apn_config_included = self.generate_vendor_avp(1428, "c0", 10415, format(int(0),"x").zfill(8))
+        apn_config_profile = self.generate_vendor_avp(1429, "c0", 10415,
+            apn_config_profile_context + all_apn_config_included + apn_configurations)
+
+        # Subscriber UE-AMBR (TS 29.273 keeps the same AMBR encoding as S6a; SWx and S6a should agree).
+        ue_ambr_ul = int(subscriber_details.get('ue_ambr_ul') or 0)
+        ue_ambr_dl = int(subscriber_details.get('ue_ambr_dl') or 0)
+        ambr_ul = self.generate_vendor_avp(516, "c0", 10415, self.int_to_hex(ue_ambr_ul, 4))
+        ambr_dl = self.generate_vendor_avp(515, "c0", 10415, self.int_to_hex(ue_ambr_dl, 4))
+        ambr = self.generate_vendor_avp(1435, "c0", 10415, ambr_ul + ambr_dl)
+
+        non_3gpp_user_data = self.generate_vendor_avp(1500, "c0", 10415,
+            non_3gpp_ip_access + non_3gpp_ip_access_apn + an_trusted + apn_config_profile + ambr)
+
+        avp += non_3gpp_user_data
+        avp += self.generate_avp(268, 40, "000007d1")                                                    #Result-Code: DIAMETER_SUCCESS
+
+        self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_auth_event_count',
+                                        metricType='counter', metricAction='inc', metricValue=1.0,
+                                        metricLabels={"diameter_application_id": 16777265, "diameter_cmd_code": 301, "event": "Success", "imsi_prefix": str(imsi[0:6])},
+                                        metricHelp='Diameter Authentication related Counters',
+                                        metricExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')
+        # Bind 3GPP-AAA-Server-Name / Origin-Host so later HSS-initiated
+        # SWx RTR can set Destination-Host (TS 29.273 §8.1.2.3).
+        try:
+            aaa_host = None
+            aaa_name = self.get_avp_data(avps, 318)
+            if aaa_name:
+                aaa_host = binascii.unhexlify(aaa_name[0]).decode("utf-8")
+            if not aaa_host:
+                oh = self.get_avp_data(avps, 264)
+                if oh:
+                    candidate = binascii.unhexlify(oh[0]).decode("utf-8")
+                    if "aaa" in candidate.lower():
+                        aaa_host = candidate
+            if aaa_host and server_assignment_type in SWX_SAT_REGISTRATION_TYPES:
+                self.redisMessaging.setValue(
+                    key=f"swx_aaa_server:{imsi}",
+                    value=aaa_host,
+                    keyExpiry=SWX_AAA_BINDING_TTL_SEC,
+                    usePrefix=False,
+                )
+                self.logTool.log(
+                    service="HSS",
+                    level="info",
+                    message=f"SWx SAR bound 3GPP-AAA-Server-Name {aaa_host} for IMSI {imsi}",
+                    redisClient=self.redisMessaging,
+                )
+        except Exception:
+            pass
+        response = self.generate_diameter_packet("01", "40", 301, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+        return response
+
+    ################################
+    ####  Sh Data-Reference     ####
+    ####  Handlers (TS 29.328)  ####
+    ################################
+
+    # Data-Reference enum values (TS 29.329 section 6.3.4)
+    SH_DATA_REF_REPOSITORY_DATA = 0
+    SH_DATA_REF_IMS_PUBLIC_IDENTITY = 10
+    SH_DATA_REF_IMS_USER_STATE = 11
+    SH_DATA_REF_SCSCF_NAME = 12
+    SH_DATA_REF_IFC = 13
+    SH_DATA_REF_LOCATION_INFORMATION = 14
+    SH_DATA_REF_USER_STATE = 15
+    SH_DATA_REF_CHARGING_INFORMATION = 16
+    SH_DATA_REF_MSISDN = 17
+    SH_DATA_REF_TADS_INFORMATION = 26
+    SH_DATA_REF_STN_SR = 27
+    SH_DATA_REF_UE_SRVCC_CAPABILITY = 28
+
+    # Requested-Domain enum (TS 29.329 section 6.3.7)
+    SH_REQUESTED_DOMAIN_CS = 0
+    SH_REQUESTED_DOMAIN_PS = 1
 
     def _sh_repository_data(self, subscriber_details, service_indication=None):
         """TS 29.328 section 7.6.1 - RepositoryData (Data-Reference 0)"""
@@ -5469,6 +5816,31 @@ class Diameter:
     
         response = self.generate_diameter_packet("01", "c0", 304, 16777216, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
 
+        return response
+
+    #3GPP SWx Registration Termination Request (RTR)
+    def Request_16777265_304(self, imsi, destinationRealm, destinationHost=None, reasonCode=0, reasonInfo="Administrative Deregistration"):
+        avp = ''
+        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_swx'
+        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777265),"x").zfill(8) +  "0000010a4000000c000028af")
+
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))
+        if destinationHost is not None:
+            avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))
+
+        avp += self.generate_avp(277, 40, "00000001")
+        avp += self.generate_avp(1, 40, self.string_to_hex(str(imsi)))
+
+        reason_code_avp = self.generate_vendor_avp(616, "c0", 10415, self.int_to_hex(int(reasonCode), 4))
+        reason_info_avp = self.generate_vendor_avp(617, "c0", 10415, self.string_to_hex(str(reasonInfo)))
+        avp += self.generate_vendor_avp(615, "c0", 10415, reason_code_avp + reason_info_avp)
+
+        avp += self.generate_avp(282, "40", self.OriginHost)
+
+        response = self.generate_diameter_packet("01", "c0", 304, 16777265, self.generate_id(4), self.generate_id(4), avp)
         return response
 
     #3GPP Sh User-Data Request (UDR)
