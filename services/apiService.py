@@ -59,8 +59,11 @@ diameterClient = Diameter(
                     originRealm=originRealm, 
                     mnc=mnc,
                     mcc=mcc,
-                    productName='PyHSS-client-API'
+                    productName='PyHSS-client-API',
+                    main_service=True
                 )
+
+databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging, main_service=True)
 
 enumClient = ENUMClient(config=config, log_tool=logTool, redis_messaging=redisMessaging)
 
@@ -86,6 +89,7 @@ SUBSCRIBER_ROUTING = database.SUBSCRIBER_ROUTING
 ROAMING_NETWORK = database.ROAMING_NETWORK
 ROAMING_RULE = database.ROAMING_RULE
 EMERGENCY_SUBSCRIBER = database.EMERGENCY_SUBSCRIBER
+IFC_TEMPLATE = database.IFC_TEMPLATE
 
 
 apiService.wsgi_app = ProxyFix(apiService.wsgi_app)
@@ -112,6 +116,7 @@ ns_pcrf = api.namespace('pcrf', description='PyHSS PCRF Dynamic Functions')
 ns_geored = api.namespace('geored', description='PyHSS GeoRedundancy Functions')
 ns_push = api.namespace('push', description='PyHSS Push Async Diameter Command')
 ns_roaming = api.namespace('roaming', description='PyHSS Roaming Functions')
+ns_ifc_template = api.namespace('ifc_template', description='PyHSS IFC Template Functions')
 
 parser = reqparse.RequestParser()
 parser.add_argument('APN JSON', type=str, help='APN Body')
@@ -177,6 +182,10 @@ IMSI_IMEI_HISTORY_model = api.schema_model('IMSI_IMEI_HISTORY JSON',
 
 SUBSCRIBER_ATTRIBUTES_model = api.schema_model('SUBSCRIBER_ATTRIBUTES JSON', 
     databaseClient.Generate_JSON_Model_for_Flask(SUBSCRIBER_ATTRIBUTES)
+)
+
+IFC_TEMPLATE_model = api.schema_model('IFC_TEMPLATE JSON', 
+    databaseClient.Generate_JSON_Model_for_Flask(IFC_TEMPLATE)
 )
 
 PCRF_Push_model = api.model('PCRF_Rule', {
@@ -2442,6 +2451,138 @@ class PyHSS_Push_CLR(Resource):
             print("Exception when sending CLR: " + str(E))
             response_json = {'result': 'Failed', 'Reason' : "Unable to send CLR: " + str(E)}
             return response_json
+
+
+### IFC Template Endpoints ###
+
+@ns_ifc_template.route('/<string:ifc_template_id>')
+class PyHSS_IFC_Template_Get(Resource):
+    def get(self, ifc_template_id):
+        '''Get IFC template data for specified template ID'''
+        try:
+            template_data = databaseClient.GetObj(IFC_TEMPLATE, ifc_template_id)
+            return template_data, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+    def delete(self, ifc_template_id):
+        '''Delete IFC template for specified template ID'''
+        try:
+            args = parser.parse_args()
+            operation_id = args.get('operation_id', None)
+            data = databaseClient.DeleteObj(IFC_TEMPLATE, ifc_template_id, False, operation_id)
+            # Publish cache invalidation message
+            try:
+                invalidation_msg = json.dumps({'action': 'invalidate', 'template_id': int(ifc_template_id)})
+                redisMessaging.publish('ifc_template_invalidation', invalidation_msg)
+            except Exception as pub_error:
+                print(f"Warning: Failed to publish cache invalidation: {pub_error}")
+            return data, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+    @ns_ifc_template.doc('Update IFC Template')
+    @ns_ifc_template.expect(IFC_TEMPLATE_model)
+    def patch(self, ifc_template_id):
+        '''Update IFC template for specified template ID'''
+        try:
+            json_data = request.get_json(force=True)
+            args = parser.parse_args()
+            operation_id = args.get('operation_id', None)
+            data = databaseClient.UpdateObj(IFC_TEMPLATE, json_data, ifc_template_id, False, operation_id)
+            # Publish cache invalidation message
+            try:
+                invalidation_msg = json.dumps({'action': 'invalidate', 'template_id': int(ifc_template_id)})
+                redisMessaging.publish('ifc_template_invalidation', invalidation_msg)
+            except Exception as pub_error:
+                print(f"Warning: Failed to publish cache invalidation: {pub_error}")
+
+            warnings = []
+            if 'template_content' in json_data:
+                warnings = push_ppr_for_ifc_template_subscribers(
+                    diameterClient,
+                    databaseClient,
+                    int(ifc_template_id),
+                    mcc=mcc,
+                    mnc=mnc,
+                    log_tool=logTool,
+                    redis_messaging=redisMessaging,
+                )
+                relay_to_diameter_nodes('/geored/push_ifc_template', {'ifc_template_id': int(ifc_template_id)})
+
+            if warnings:
+                data = dict(data) if isinstance(data, dict) else {'result': data}
+                data['warnings'] = warnings
+            return data, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_ifc_template.route('/')
+class PyHSS_IFC_Template(Resource):
+    @ns_ifc_template.doc('Create IFC Template Object')
+    @ns_ifc_template.expect(IFC_TEMPLATE_model)
+    def put(self):
+        '''Create new IFC template'''
+        try:
+            json_data = request.get_json(force=True)
+            args = parser.parse_args()
+            operation_id = args.get('operation_id', None)
+            template_id = databaseClient.CreateObj(IFC_TEMPLATE, json_data, False, operation_id)
+            return template_id, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_ifc_template.route('/list')
+class PyHSS_IFC_Template_List(Resource):
+    @ns_ifc_template.expect(paginatorParser)
+    def get(self):
+        '''Get all IFC templates'''
+        try:
+            args = paginatorParser.parse_args()
+            data = databaseClient.getAllPaginated(IFC_TEMPLATE, args['page'], args['page_size'])
+            return data, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_ifc_template.route('/name/<string:template_name>')
+class PyHSS_IFC_Template_By_Name(Resource):
+    def get(self, template_name):
+        '''Get IFC template by name'''
+        try:
+            template_data = databaseClient.Get_IFC_Template_by_Name(template_name)
+            return template_data, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_ifc_template.route('/cache/invalidate')
+class PyHSS_IFC_Template_Cache_Invalidate(Resource):
+    def post(self):
+        '''Invalidate all IFC template caches'''
+        try:
+            invalidation_msg = json.dumps({'action': 'invalidate_all'})
+            redisMessaging.publish('ifc_template_invalidation', invalidation_msg)
+            return {'result': 'Cache invalidation message published'}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_ifc_template.route('/cache/invalidate/<string:ifc_template_id>')
+class PyHSS_IFC_Template_Cache_Invalidate_Single(Resource):
+    def post(self, ifc_template_id):
+        '''Invalidate specific IFC template cache'''
+        try:
+            invalidation_msg = json.dumps({'action': 'invalidate', 'template_id': int(ifc_template_id)})
+            redisMessaging.publish('ifc_template_invalidation', invalidation_msg)
+            return {'result': f'Cache invalidation message published for template {ifc_template_id}'}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
 
 
 def main():

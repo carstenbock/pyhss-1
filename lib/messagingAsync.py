@@ -292,6 +292,30 @@ class RedisMessagingAsync:
         await self.redisClient.close()
         return True
 
+    async def subscribe(self, channel: str, usePrefix: bool=False, prefixHostname: str='unknown', prefixServiceName: str='common'):
+        """
+        Subscribes to a Redis pub/sub channel and returns a pubsub object.
+        Use the returned pubsub object to listen for messages with listen() method.
+        """
+        try:
+            channel = await(self.handlePrefix(key=channel, usePrefix=usePrefix, prefixHostname=prefixHostname, prefixServiceName=prefixServiceName))
+            pubsub = self.redisClient.pubsub()
+            await pubsub.subscribe(channel)
+            return pubsub
+        except Exception as e:
+            return None
+
+    async def publish(self, channel: str, message: str, usePrefix: bool=False, prefixHostname: str='unknown', prefixServiceName: str='common') -> int:
+        """
+        Publishes a message to a Redis pub/sub channel asynchronously.
+        Returns the number of subscribers that received the message.
+        """
+        try:
+            channel = await(self.handlePrefix(key=channel, usePrefix=usePrefix, prefixHostname=prefixHostname, prefixServiceName=prefixServiceName))
+            return await self.redisClient.publish(channel, message)
+        except Exception as e:
+            return 0
+
 
 if __name__ == '__main__':
     redisMessaging = RedisMessagingAsync()

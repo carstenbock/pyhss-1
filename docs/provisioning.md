@@ -58,8 +58,29 @@ curl -X 'PUT' \
 }'
 ```
 
+### Define an iFC Template
+IMS subscribers reference an Initial Filter Criteria (iFC) template stored in the
+database via `ifc_template_id`. Create the template first; `template_content` is a
+Jinja2 XML document whose `iFC_vars` placeholders are resolved per-subscriber at
+registration time.
+
+```shell
+curl -X 'PUT' \
+  'http://10.97.0.36:8080/ifc_template/' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "name": "default_ifc",
+  "description": "Default VoLTE iFC",
+  "template_content": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><IMSSubscription>...</IMSSubscription>"
+}'
+```
+
+The response contains the assigned `ifc_template_id`.
+
 ### Define Subscriber for IMS Access
-This defines a subscriber for access to the IMS.
+This defines a subscriber for access to the IMS, referencing the
+`ifc_template_id` created above.
 
 Multiple MSISDNs can be defined as comma separated values in `msisdn_list` as required.
 
@@ -73,7 +94,10 @@ curl -X 'PUT' \
   "msisdn": "12341235",
   "msisdn_list": "12341235",
   "imsi": "001010000000002",
-  "ifc_path": "string",
+  "ifc_template_id": 1,
   "xcap_profile": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><simservs>Your XCAP Data...</simservs>"
 }'
 ```
+
+> The legacy `ifc_path` field (a path to an iFC file on disk) is **deprecated**;
+> use `ifc_template_id` to reference a database-stored iFC template instead.

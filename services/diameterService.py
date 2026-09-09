@@ -15,6 +15,7 @@ from diameterAsync import DiameterAsync
 from banners import Banners
 from logtool import LogTool
 from baseModels import Peer, InboundData, OutboundData
+from template_cache import get_template_cache
 import pydantic_core
 import traceback
 from pyhss_config import config
@@ -59,6 +60,11 @@ class DiameterService:
         self.hostname = self.originHost
         self.useExternalSocketService = config.get('hss', {}).get('use_external_socket_service', False)
         self.diameterPeerKey = config.get('hss', {}).get('diameter_peer_key', 'diameterPeers')
+        
+        # IFC template cache configuration
+        self.ifcUseDatabase = config.get('hss', {}).get('ifc_templates', {}).get('use_database', False)
+        self.ifcTemplateCache = get_template_cache(logTool=self.logTool)
+        self.redisCacheInvalidationMessaging = RedisMessagingAsync(host=self.redisHost, port=self.redisPort, useUnixSocket=self.redisUseUnixSocket, unixSocketPath=self.redisUnixSocketPath)
     
     async def validateDiameterInbound(self, clientAddress: str, clientPort: str, inboundData) -> bool:
         """
@@ -78,6 +84,40 @@ class DiameterService:
         except Exception as e:
             await(self.logTool.logAsync(service='Diameter', level='warning', message=f"[Diameter] [validateDiameterInbound] Exception: {e}\n{traceback.format_exc()}"))
             await(self.logTool.logAsync(service='Diameter', level='warning', message=f"[Diameter] [validateDiameterInbound] AVPs: {avps}\nPacketVars: {packetVars}"))
+            return False
+
+    async def handleIfcTemplateInvalidation(self) -> bool:
+        """
+        Subscribes to IFC template cache invalidation channel and handles invalidation messages.
+        Only runs when ifc_templates.use_database is True.
+        """
+        try:
+            pubsub = await self.redisCacheInvalidationMessaging.subscribe('ifc_template_invalidation')
+            if pubsub is None:
+                await(self.logTool.logAsync(service='Diameter', level='error', message="[Diameter] [handleIfcTemplateInvalidation] Failed to subscribe to cache invalidation channel"))
+                return False
+            
+            await(self.logTool.logAsync(service='Diameter', level='info', message="[Diameter] [handleIfcTemplateInvalidation] Subscribed to IFC template cache invalidation channel"))
+            
+            async for message in pubsub.listen():
+                try:
+                    if message['type'] == 'message':
+                        data = json.loads(message['data'].decode('utf-8'))
+                        action = data.get('action')
+                        
+                        if action == 'invalidate':
+                            template_id = data.get('template_id')
+                            if template_id:
+                                self.ifcTemplateCache.invalidate_db_template(template_id)
+                                await(self.logTool.logAsync(service='Diameter', level='info', message=f"[Diameter] [handleIfcTemplateInvalidation] Invalidated template {template_id}"))
+                        elif action == 'invalidate_all':
+                            count = self.ifcTemplateCache.invalidate_all()
+                            await(self.logTool.logAsync(service='Diameter', level='info', message=f"[Diameter] [handleIfcTemplateInvalidation] Invalidated all templates ({count} templates)"))
+                except Exception as e:
+                    await(self.logTool.logAsync(service='Diameter', level='warning', message=f"[Diameter] [handleIfcTemplateInvalidation] Error processing message: {e}"))
+                    continue
+        except Exception as e:
+            await(self.logTool.logAsync(service='Diameter', level='error', message=f"[Diameter] [handleIfcTemplateInvalidation] Exception: {traceback.format_exc()}"))
             return False
 
     async def handleOutboundDwr(self) -> bool:
@@ -408,6 +448,10 @@ class DiameterService:
             handleOutboundDwrTask = asyncio.create_task(self.handleOutboundDwr())
 
         handleActiveDiameterPeerTask = asyncio.create_task(self.handleActiveDiameterPeers())
+        
+        # Start IFC template cache invalidation subscriber if database mode is enabled
+        if self.ifcUseDatabase:
+            handleIfcTemplateInvalidationTask = asyncio.create_task(self.handleIfcTemplateInvalidation())
 
         if not self.useExternalSocketService:
 

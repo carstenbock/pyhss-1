@@ -109,8 +109,18 @@ CREATE TABLE emergency_subscriber (
 	serving_pgw_timestamp VARCHAR(512),
 	PRIMARY KEY (emergency_subscriber_id)
 );
+CREATE TABLE ifc_template (
+	description VARCHAR(1024),
+	ifc_template_id INTEGER NOT NULL,
+	last_modified VARCHAR(100),
+	name VARCHAR(256) NOT NULL,
+	template_content TEXT NOT NULL,
+	PRIMARY KEY (ifc_template_id),
+	UNIQUE (name)
+);
 CREATE TABLE ims_subscriber (
 	ifc_path VARCHAR(512),
+	ifc_template_id INTEGER,
 	ims_subscriber_id INTEGER NOT NULL,
 	imsi VARCHAR(18),
 	last_modified VARCHAR(100),
@@ -139,6 +149,7 @@ CREATE TABLE operation_log (
 	eir_id INTEGER,
 	emergency_subscriber_id INTEGER,
 	id INTEGER NOT NULL,
+	ifc_template_id INTEGER,
 	ims_subscriber_id INTEGER,
 	imsi_imei_history_id INTEGER,
 	item_id INTEGER NOT NULL,

@@ -110,6 +110,51 @@ hss:
         - code: "*#101#"
           msg: "Your IMSI is %imsi%"
 
+  # IFC Template Configuration
+  # Controls how Initial Filter Criteria (IFC) templates are loaded and cached
+  ifc_templates:
+    # Whether to use database-stored templates (True) or file-based templates (False)
+    # Default: False (file-based) for backward compatibility
+    use_database: False
+    # Whether to cache compiled Jinja2 templates in memory (recommended for production)
+    # Works for both database and file-based modes
+    cache_enabled: True
+    # Default template path when subscriber has no ifc_path or ifc_template_id set
+    default_template_path: 'default_ifc.xml'
+
+  # Enable Zn Interface for GBA (Generic Bootstrapping Architecture)
+  # Zn-Interface connects BSF (Bootstrapping Server Function) to HSS
+  # According to 3GPP TS 29.109
+  Zn_enabled: True
+  
+  # BSF (Bootstrapping Server Function) Parameters
+  bsf:
+    # BSF Hostname for GBA Authentication
+    bsf_hostname: "bsf.epc.mnc001.mcc001.3gppnetwork.org"
+    
+    # GAA (Generic Authentication Architecture) Key lifetime in seconds
+    # Default: 3600 seconds (1 hour)
+    gaa_key_lifetime: 3600
+    
+    # Supported NAF (Network Application Function) Groups
+    # NAFs that are allowed to use GBA credentials
+    naf_groups:
+      - name: "default_naf_group"
+        naf_hostnames:
+          - "naf1.epc.mnc001.mcc001.3gppnetwork.org"
+          - "naf2.epc.mnc001.mcc001.3gppnetwork.org"
+    
+    # B-TID (Bootstrapping Transaction Identifier) format
+    # Format: base64(RAND)@bsf_hostname
+    btid_format: "base64"
+    
+    # Ks_NAF key derivation algorithm
+    # Options: "milenage", "tuak"
+    key_derivation_algorithm: "milenage"
+    
+    # Enable Ks_ext_NAF (extended NAF key) support for 2G/3G
+    ks_ext_naf_enabled: True    
+
 api:
   bind_ip: "127.0.0.1"
   bind_port: 8080

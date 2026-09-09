@@ -9,7 +9,7 @@ from sqlalchemy_utils import create_database, database_exists
 
 
 class DatabaseSchema:
-    latest = 1
+    latest = 2
 
     def __init__(self, logTool, base, engine: Engine, main_service: bool):
         self.logTool = logTool
@@ -212,6 +212,20 @@ class DatabaseSchema:
         self.add_column("subscriber", "serving_vlr", "VARCHAR(512)")
         self.add_column("subscriber", "serving_vlr_timestamp", "DATETIME")
         self.set_version(1)
+    def upgrade_add_ifc_template(self):
+        if self.get_version() >= 2:
+            return
+        self.upgrade_msg(2)
+        # Create the ifc_template table (check if exists to handle race conditions)
+        if not self.table_exists("ifc_template"):
+            self.base.metadata.tables["ifc_template"].create(bind=self.engine)
+        # Add foreign key column to ims_subscriber
+        self.add_column("ims_subscriber", "ifc_template_id", "INTEGER")
+        # Add foreign key column to operation_log for IFC_TEMPLATE_OPERATION_LOG
+        self.add_column("operation_log", "ifc_template_id", "INTEGER")
+        self.set_version(2)
+
 
     def upgrade_all(self):
         self.upgrade_from_20240603_release_1_0_1()
+        self.upgrade_add_ifc_template()

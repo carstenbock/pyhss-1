@@ -269,6 +269,43 @@ class RedisMessaging:
         except Exception as e:
             return e
 
+    def publish(self, channel: str, message: str, usePrefix: bool=False, prefixHostname: str='unknown', prefixServiceName: str='common') -> int:
+        """
+        Publishes a message to a Redis pub/sub channel.
+        Returns the number of subscribers that received the message.
+        """
+        try:
+            channel = self.handlePrefix(key=channel, usePrefix=usePrefix, prefixHostname=prefixHostname, prefixServiceName=prefixServiceName)
+            return self.redisClient.publish(channel, message)
+        except Exception as e:
+            return 0
+
+    def subscribe(self, channel: str, usePrefix: bool=False, prefixHostname: str='unknown', prefixServiceName: str='common'):
+        """
+        Subscribes to a Redis pub/sub channel and returns a pubsub object.
+        Use the returned pubsub object to listen for messages with listen() method.
+        """
+        try:
+            channel = self.handlePrefix(key=channel, usePrefix=usePrefix, prefixHostname=prefixHostname, prefixServiceName=prefixServiceName)
+            pubsub = self.redisClient.pubsub()
+            pubsub.subscribe(channel)
+            return pubsub
+        except Exception as e:
+            return None
+
+    def psubscribe(self, pattern: str, usePrefix: bool=False, prefixHostname: str='unknown', prefixServiceName: str='common'):
+        """
+        Subscribes to Redis pub/sub channels matching a pattern and returns a pubsub object.
+        Use the returned pubsub object to listen for messages with listen() method.
+        """
+        try:
+            pattern = self.handlePrefix(key=pattern, usePrefix=usePrefix, prefixHostname=prefixHostname, prefixServiceName=prefixServiceName)
+            pubsub = self.redisClient.pubsub()
+            pubsub.psubscribe(pattern)
+            return pubsub
+        except Exception as e:
+            return None
+
 if __name__ == '__main__':
     redisMessaging = RedisMessaging()
     print(redisMessaging.getNextQueue())

@@ -45,6 +45,12 @@ hss:
         - code: "*#101#"
           msg: "Your IMSI is: %imsi%"
 
+  # IFC Template configuration (backward compatible)
+  ifc_templates:
+    use_database: False      # False = file-based (default), True = database-based
+    cache_enabled: True      # Cache compiled Jinja2 templates (works for both modes)
+    default_template_path: 'default_ifc.xml'  # Default template when ifc_path is not set
+
 api:
   page_size: 200
   enable_insecure_auc: False
