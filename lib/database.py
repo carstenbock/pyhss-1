@@ -29,6 +29,7 @@ from messaging import RedisMessaging
 import json
 import socket
 import traceback
+from ast import literal_eval
 from pyhss_config import config
 
 
@@ -2143,6 +2144,10 @@ class Database:
                     assert(len(serving_pgw) > 0)
                     assert("None" not in serving_pgw)
                     
+                    if ServingAPN and ((subscriber_routing == "None") or (subscriber_routing == "") or (subscriber_routing == "Failed to Decode / Get UE IP") or (subscriber_routing == None)):
+                        json_data['subscriber_routing'] = ServingAPN['subscriber_routing']
+                        self.logTool.log(service='Database', level='debug', message="Using existing subscriber routing from Serving APN", redisClient=self.redisMessaging)
+
                     self.UpdateObj(SERVING_APN, json_data, ServingAPN['serving_apn_id'], True)
                     objectData = self.GetObj(SERVING_APN, ServingAPN['serving_apn_id'])
                     self.handleWebhook(objectData, 'PATCH')
@@ -2184,6 +2189,7 @@ class Database:
         self.logTool.log(service='Database', level='debug', message="Getting Serving APN " + str(apn_id) + " with subscriber_id " + str(subscriber_id), redisClient=self.redisMessaging)
         Session = sessionmaker(bind = self.engine)
         session = Session()
+        result = None
 
         try:
             result = session.query(SERVING_APN).filter_by(subscriber_id=subscriber_id, apn=apn_id).first()
@@ -2191,6 +2197,10 @@ class Database:
             self.logTool.log(service='Database', level='debug', message=E, redisClient=self.redisMessaging)
             self.safe_close(session)
             raise ValueError(E)
+        if result is None:
+            self.logTool.log(service='Database', level='debug', message="No matching SERVING_APN found for subscriber_id " + str(subscriber_id) + " and apn_id " + str(apn_id), redisClient=self.redisMessaging)
+            self.safe_close(session)
+            return None        
         result = result.__dict__
         result.pop('_sa_instance_state')
         

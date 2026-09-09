@@ -25,6 +25,7 @@ import pydantic_core
 import xml.etree.ElementTree as ET
 from pyhss_config import config
 from rat import SubscriberRATRestriction, RAT
+from ast import literal_eval
 
 
 class Diameter:
@@ -58,6 +59,13 @@ class Diameter:
             self.redisMessaging = RedisMessaging(host=self.redisHost, port=self.redisPort, useUnixSocket=self.redisUseUnixSocket, unixSocketPath=self.redisUnixSocketPath)
         
         self.hostname = socket.gethostname()
+        # diameterService / hssService prefix the shared Redis keys
+        # (diameterPeers, diameter-inbound, diameter-outbound-*) with the
+        # configured Diameter Origin-Host, which can differ from the OS
+        # hostname (split provisioning/diameter pods, docker-compose nodes).
+        # Use the Origin-Host for those keys so peer lookups and outbound
+        # queueing reach the local Diameter stack from every service.
+        self.diameterServiceHostname = originHost
 
         self.database = Database(logTool=logTool, main_service=main_service)
         self.diameterRequestTimeout = int(config.get('hss', {}).get('diameter_request_timeout', 10))
@@ -240,6 +248,23 @@ class Diameter:
             plmn = plmn + bits
         self.logTool.log(service='HSS', level='debug', message="Encoded PLMN: " + str(plmn), redisClient=self.redisMessaging)
         return plmn
+
+    def EncodePLMN_from_IMSI(self, imsi):
+        """Encoded PLMN (TBCD hex string) from the IMSI's leading MCC/MNC digits.
+
+        Private identities are not always IMSI-shaped (TS 23.003 allows any
+        NAI as IMPI), and a non-digit identity would make EncodePLMN emit
+        non-hex characters that crash binascii.unhexlify inside the crypto
+        helpers (S6a_crypt.generate_maa_vector and friends). Fall back to the
+        configured home PLMN in that case: the MAA / EAP-AKA vector maths
+        never uses the PLMN (it only feeds KASME on the S6a/EUTRAN path), so
+        any valid encoding is acceptable there.
+        """
+        imsi = str(imsi)
+        if len(imsi) >= 5 and imsi[:5].isdigit():
+            return self.EncodePLMN(imsi[0:3], imsi[3:5])
+        self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [EncodePLMN_from_IMSI] Identity '{imsi}' is not IMSI-shaped - using configured home PLMN {self.MCC}/{self.MNC}", redisClient=self.redisMessaging)
+        return self.EncodePLMN(self.MCC, self.MNC)
 
     def TBCD_special_chars(self, input):
         self.logTool.log(service='HSS', level='debug', message="Special character possible in " + str(input), redisClient=self.redisMessaging)
@@ -617,7 +642,7 @@ class Diameter:
             try:
                 failsafeCounter += 1
 
-                if failsafeCounter > 100:
+                if failsafeCounter > 250:
                     self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [decodeAvpPacket] Diameter AVP Decoder Failsafe activated: {data}", redisClient=self.redisMessaging)
                     break
                 avp_vars = {}
@@ -808,7 +833,7 @@ class Diameter:
         try:
             filteredConnectedPeers = []
             
-            activePeers = self.redisMessaging.getAllHashData(name=self.diameterPeerKey, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+            activePeers = self.redisMessaging.getAllHashData(name=self.diameterPeerKey, usePrefix=True, prefixHostname=self.diameterServiceHostname, prefixServiceName='diameter')
             if not activePeers:
                 return filteredConnectedPeers
             
@@ -842,7 +867,7 @@ class Diameter:
             if requestedPeerType not in peerTypes:
                 return filteredConnectedPeers
             
-            activePeers = self.redisMessaging.getAllHashData(name=self.diameterPeerKey, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+            activePeers = self.redisMessaging.getAllHashData(name=self.diameterPeerKey, usePrefix=True, prefixHostname=self.diameterServiceHostname, prefixServiceName='diameter')
             if not activePeers:
                 return filteredConnectedPeers
             
@@ -885,7 +910,7 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [getPeerByHostname] Looking for peer with hostname {hostname}", redisClient=self.redisMessaging)
         try:
             hostname = hostname.lower()
-            activePeers = self.redisMessaging.getAllHashData(name=self.diameterPeerKey, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+            activePeers = self.redisMessaging.getAllHashData(name=self.diameterPeerKey, usePrefix=True, prefixHostname=self.diameterServiceHostname, prefixServiceName='diameter')
 
             if not activePeers:
                 return {}
@@ -937,7 +962,7 @@ class Diameter:
                 name=self.diameterPeerKey,
                 key=peerKey,
                 usePrefix=True,
-                prefixHostname=self.hostname,
+                prefixHostname=self.diameterServiceHostname,
                 prefixServiceName='diameter'
             )
             
@@ -963,7 +988,7 @@ class Diameter:
                 key=peerKey,
                 value=json.dumps(merged_peer),
                 usePrefix=True,
-                prefixHostname=self.hostname,
+                prefixHostname=self.diameterServiceHostname,
                 prefixServiceName='diameter'
             )
             
@@ -1037,7 +1062,8 @@ class Diameter:
                     peerIp = connectedPeer.IpAddress
                     peerPort = connectedPeer.Port
                 except Exception as e:
-                    pass
+                    self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [sendDiameterRequest] [{requestType}] Could not get connection information for peer {hostname}: peer not found or not connected", redisClient=self.redisMessaging)
+                    return ''
 
                 try:
                     request = diameterApplication["requestMethod"](**kwargs)
@@ -1051,7 +1077,7 @@ class Diameter:
                                                 DestinationPort=peerPort,
                                                 InitialReceiveTimestamp=sendTime,
                                                 OutboundHex=request)
-                self.redisMessaging.sendMessage(queue=outboundQueue, message=outboundMessage.model_dump_json(), queueExpiry=self.diameterRequestTimeout, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+                self.redisMessaging.sendMessage(queue=outboundQueue, message=outboundMessage.model_dump_json(), queueExpiry=self.diameterRequestTimeout, usePrefix=True, prefixHostname=self.diameterServiceHostname, prefixServiceName='diameter')
                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [sendDiameterRequest] [{requestType}] Queueing for host: {hostname} on {peerIp}-{peerPort}", redisClient=self.redisMessaging)
             return request
         except Exception as e:
@@ -1094,7 +1120,7 @@ class Diameter:
                                                 InitialReceiveTimestamp=sendTime,
                                                 OutboundHex=request)
                     
-                    self.redisMessaging.sendMessage(queue=outboundQueue, message=outboundMessage.model_dump_json(), queueExpiry=self.diameterRequestTimeout, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+                    self.redisMessaging.sendMessage(queue=outboundQueue, message=outboundMessage.model_dump_json(), queueExpiry=self.diameterRequestTimeout, usePrefix=True, prefixHostname=self.diameterServiceHostname, prefixServiceName='diameter')
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [broadcastDiameterRequest] [{requestType}] Queueing for peer type: {peerType} on {peerIp}-{peerPort}", redisClient=self.redisMessaging)
             return connectedPeerList
         except Exception as e:
@@ -1149,14 +1175,14 @@ class Diameter:
                                                 DestinationPort=peerPort,
                                                 InitialReceiveTimestamp=sendTime,
                                                 OutboundHex=request)
-                self.redisMessaging.sendMessage(queue=outboundQueue, message=outboundMessage.model_dump_json(), queueExpiry=self.diameterRequestTimeout, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+                self.redisMessaging.sendMessage(queue=outboundQueue, message=outboundMessage.model_dump_json(), queueExpiry=self.diameterRequestTimeout, usePrefix=True, prefixHostname=self.diameterServiceHostname, prefixServiceName='diameter')
                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [awaitDiameterRequestAndResponse] [{requestType}] Queueing for host: {hostname} on {peerIp}-{peerPort}", redisClient=self.redisMessaging)
                 startTimer = time.time()
                 while True:
                     try:
                         if not time.time() >= startTimer + timeout:
                             if sessionId is None:
-                                queuedMessages = self.redisMessaging.getList(key=f"diameter-inbound", usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+                                queuedMessages = self.redisMessaging.getList(key=f"diameter-inbound", usePrefix=True, prefixHostname=self.diameterServiceHostname, prefixServiceName='diameter')
                                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [awaitDiameterRequestAndResponse] [{requestType}] queuedMessages(NoSessionId): {queuedMessages}", redisClient=self.redisMessaging)
                                 for queuedMessage in queuedMessages:
                                     queuedMessage = json.loads(queuedMessage)
@@ -1173,7 +1199,7 @@ class Diameter:
                                             return messageHex
                                 time.sleep(0.02)
                             else:
-                                queuedMessages = self.redisMessaging.getList(key=f"diameter-inbound", usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+                                queuedMessages = self.redisMessaging.getList(key=f"diameter-inbound", usePrefix=True, prefixHostname=self.diameterServiceHostname, prefixServiceName='diameter')
                                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [awaitDiameterRequestAndResponse] [{requestType}] queuedMessages({sessionId}): {queuedMessages} responseType: {responseType}", redisClient=self.redisMessaging)
                                 for queuedMessage in queuedMessages:
                                     queuedMessage = json.loads(queuedMessage)
@@ -1240,7 +1266,13 @@ class Diameter:
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [generateDiameterResponse] [{diameterApplication.get('requestAcronym', '')}] Successfully generated response: {response}", redisClient=self.redisMessaging)
                         except Exception as e:
                             self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [generateDiameterResponse] [{diameterApplication.get('requestAcronym', '')}] Error generating response: {traceback.format_exc()}", redisClient=self.redisMessaging)
-                            return ''
+                            try:
+                                response = self.Respond_ResultCode(packet_vars, avps, 5012)
+                                self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [generateDiameterResponse] [{diameterApplication.get('requestAcronym', '')}] Returning DIAMETER_UNABLE_TO_COMPLY (5012) due to unhandled error", redisClient=self.redisMessaging)
+                                return response
+                            except Exception as fallbackError:
+                                self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [generateDiameterResponse] [{diameterApplication.get('requestAcronym', '')}] Failed to generate fallback error response: {traceback.format_exc()}", redisClient=self.redisMessaging)
+                                return ''
                         break
                     except Exception as e:
                         continue
@@ -1426,7 +1458,7 @@ class Diameter:
                     servingScscf = servingScscf.split(';')[0]
                 self.sendDiameterRequest(
                 requestType='RTR',
-                peerType=servingScscfPeer,
+                hostname=servingScscfPeer,
                 imsi=imsi,
                 destinationHost=servingScscf, 
                 destinationRealm=servingScscfRealm, 
@@ -1767,6 +1799,7 @@ class Diameter:
         avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777238),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (Gx)
         avp += self.generate_avp(258, 40, format(int(16777238),"x").zfill(8))                            #Auth-Application-ID - Diameter Gx
         avp += self.generate_avp(258, 40, format(int(10),"x").zfill(8))                                  #Auth-Application-ID - Diameter CER
+        avp += self.generate_avp(258, 40, format(int(16777236),"x").zfill(8))                            #Auth-Application-ID - Diameter Rx
         avp += self.generate_avp(265, 40, format(int(5535),"x").zfill(8))                                #Supported-Vendor-ID (3GGP v2)
         avp += self.generate_avp(265, 40, format(int(10415),"x").zfill(8))                               #Supported-Vendor-ID (3GPP)
         avp += self.generate_avp(265, 40, format(int(13019),"x").zfill(8))                               #Supported-Vendor-ID 13019 (ETSI)
@@ -2447,12 +2480,20 @@ class Diameter:
 
     #3GPP Gx Credit Control Answer
     def Answer_16777238_272(self, packet_vars, avps):
+        imsi = "unknown"
+        avp = ''
+
         try:
             CC_Request_Type = self.get_avp_data(avps, 416)[0]
             CC_Request_Number = self.get_avp_data(avps, 415)[0]
             #Called Station ID
             self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777238_272] [CCA] Attempting to find APN in CCR", redisClient=self.redisMessaging)
-            apn = bytes.fromhex(self.get_avp_data(avps, 30)[0]).decode('utf-8')
+            try:
+                apn = self.get_avp_data(avps, 30)[0]               #Get APN from AVP
+                apn = binascii.unhexlify(apn).decode('utf-8')      #Format it
+            except Exception as e:
+                self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777238_272] [CCA] Failed to get APN from AVP: " + str(e), redisClient=self.redisMessaging)
+                apn = "internet"
             # Strip plmn based domain from apn, if present
             try:
                 if '.' in apn:
@@ -2460,7 +2501,13 @@ class Diameter:
                         assert('mnc' in apn)
                         apn = apn.split('.')[0]
             except Exception as e:
-                apn = bytes.fromhex(self.get_avp_data(avps, 30)[0]).decode('utf-8')
+                self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777238_272] [CCA] Failed to strip PLMN from APN: " + str(e), redisClient=self.redisMessaging)
+                try:
+                    apn = bytes.fromhex(self.get_avp_data(avps, 30)[0]).decode('utf-8')
+                except:
+                    self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777238_272] [CCA] Failed to re-get APN from AVP", redisClient=self.redisMessaging)
+                    apn = "internet"
+
             self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777238_272] [CCA] CCR for APN " + str(apn), redisClient=self.redisMessaging)
 
             OriginHost = self.get_avp_data(avps, 264)[0]                          #Get OriginHost from AVP
@@ -2930,8 +2977,13 @@ class Diameter:
             username = self.get_avp_data(avps, 1)[0]                                                     
             username = binascii.unhexlify(username).decode('utf-8')
             self.logTool.log(service='HSS', level='debug', message="Username AVP is present, value is " + str(username), redisClient=self.redisMessaging)
-            imsi = username.split('@')[0]   #Strip Domain
-            domain = username.split('@')[1] #Get Domain Part
+            if '@' in username:
+                imsi = username.split('@')[0]
+                domain = username.split('@')[1]
+            else:
+                self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [Answer_16777216_300] [UAR] Username '{username}' missing '@' domain separator, using username as IMSI", redisClient=self.redisMessaging)
+                imsi = username
+                domain = binascii.unhexlify(self.OriginRealm).decode('utf-8')
             self.logTool.log(service='HSS', level='debug', message="Extracted imsi: " + str(imsi) + " now checking backend for this IMSI", redisClient=self.redisMessaging)
             ims_subscriber_details = self.database.Get_IMS_Subscriber(imsi=imsi)
         except Exception as E:
@@ -2960,6 +3012,7 @@ class Diameter:
             return response
 
         #Determine SAR Type & Store
+        User_Authorization_Type = None
         user_authorization_type_avp_data = self.get_avp_data(avps, 623)
         if user_authorization_type_avp_data:
             try:
@@ -2976,6 +3029,24 @@ class Diameter:
                     
             except Exception as E:
                 self.logTool.log(service='HSS', level='debug', message="Failed to get User_Authorization_Type AVP & Update_Serving_CSCF error: " + str(E), redisClient=self.redisMessaging)
+
+        # Refuse a disabled subscriber's registration. DE_REGISTRATION is exempt so
+        # stored S-CSCF state can still be cleared; the branch above normally
+        # returns early for it, but it raises when no S-CSCF is stored, so the type
+        # is checked explicitly here rather than relying on that return.
+        if User_Authorization_Type != 1:
+            try:
+                subscriber_enabled = (self.database.Get_Subscriber(imsi=imsi)).get('enabled', True)
+            except Exception:
+                subscriber_enabled = True
+            if not subscriber_enabled:
+                self.logTool.log(service='HSS', level='info',
+                                 message="Cx UAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                                 redisClient=self.redisMessaging)
+                avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+                response = self.generate_diameter_packet("01", "40", 300, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+                return response
+
         self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(ims_subscriber_details), redisClient=self.redisMessaging)
         if ims_subscriber_details['scscf'] != None:
             self.logTool.log(service='HSS', level='debug', message="Already has SCSCF Assigned from DB: " + str(ims_subscriber_details['scscf']), redisClient=self.redisMessaging)
@@ -3048,6 +3119,27 @@ class Diameter:
             avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
             response = self.generate_diameter_packet("01", "40", 301, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
             return response
+
+        # Refuse to hand out a service profile for a disabled subscriber, but only
+        # for REGISTRATION (1) / RE_REGISTRATION (2). De-registration assignment
+        # types must still be processed below, otherwise the stored S-CSCF is never
+        # cleared and the next Cx RTR has no Destination-Host to target.
+        try:
+            requested_assignment_type = self.hex_to_int(self.get_avp_data(avps, 614)[0])
+        except Exception:
+            requested_assignment_type = None
+        if requested_assignment_type in (1, 2):
+            try:
+                subscriber_enabled = (self.database.Get_Subscriber(imsi=imsi)).get('enabled', True)
+            except Exception:
+                subscriber_enabled = True
+            if not subscriber_enabled:
+                self.logTool.log(service='HSS', level='info',
+                                 message="Cx SAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                                 redisClient=self.redisMessaging)
+                avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+                response = self.generate_diameter_packet("01", "40", 301, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+                return response
 
         avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(str(imsi) + '@' + str(domain))),'ascii'))
         #Cx-User-Data (XML)
@@ -3166,9 +3258,16 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Got MAR for public_identity : " + str(public_identity), redisClient=self.redisMessaging)
         username = self.get_avp_data(avps, 1)[0]
         username = binascii.unhexlify(username).decode('utf-8')
-        imsi = username.split('@')[0]   #Strip Domain
-        domain = username.split('@')[1] #Get Domain Part
         self.logTool.log(service='HSS', level='debug', message="Got MAR username: " + str(username), redisClient=self.redisMessaging)
+
+        if '@' in username:
+            imsi = username.split('@')[0]
+            domain = username.split('@')[1]
+        else:
+            self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [Answer_16777216_303] [MAR] Username '{username}' missing '@' domain separator, using OriginRealm as domain fallback", redisClient=self.redisMessaging)
+            imsi = username
+            domain = binascii.unhexlify(self.OriginRealm).decode('utf-8')
+
         auth_scheme = ''
 
         avp = ''                                                                                    #Initiate empty var AVP
@@ -3205,9 +3304,19 @@ class Diameter:
             return response
         
         self.logTool.log(service='HSS', level='debug', message="Got subscriber data for MAA OK", redisClient=self.redisMessaging)
-        
-        mcc, mnc = imsi[0:3], imsi[3:5]
-        plmn = self.EncodePLMN(mcc, mnc)
+
+        # An administratively disabled subscriber must not be issued IMS auth
+        # vectors. TS 29.228 defines no experimental code for this condition, so
+        # answer with base Result-Code DIAMETER_AUTHORIZATION_REJECTED (RFC 6733).
+        if not subscriber_details.get('enabled', True):
+            self.logTool.log(service='HSS', level='info',
+                             message="Cx MAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
+                             redisClient=self.redisMessaging)
+            avp += self.generate_avp(268, 40, self.int_to_hex(5003, 4))
+            response = self.generate_diameter_packet("01", "40", 303, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            return response
+
+        plmn = self.EncodePLMN_from_IMSI(imsi)
 
         #Determine if SQN Resync is required & auth type to use
         for sub_avp_612 in self.get_avp_data(avps, 612)[0]:
@@ -4197,8 +4306,8 @@ class Diameter:
 
             else:
                 self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_275] [STA] Unable to find serving APN for RAR, returning Result-Code 2001", redisClient=self.redisMessaging)
-
-            avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))
+                avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))
+    
             response = self.generate_diameter_packet("01", "40", 275, 16777236, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
             return response
         except Exception as e:
