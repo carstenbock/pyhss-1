@@ -181,8 +181,9 @@ class Diameter:
             self._initialize_zn_interface()
 
         self.diameterRequestList = [
-                # Gx PCEF/PCRF
+                # Cx IMS
                 {"commandCode": 304, "applicationId": 16777216, "requestMethod": self.Request_16777216_304, "failureResultCode": 5012 ,"requestAcronym": "RTR", "responseAcronym": "RTA", "requestName": "Registration Termination Request", "responseName": "Registration Termination Answer"},
+                {"commandCode": 305, "applicationId": 16777216, "requestMethod": self.Request_16777216_305, "failureResultCode": 5012 ,"requestAcronym": "PPR", "responseAcronym": "PPA", "requestName": "Push Profile Request", "responseName": "Push Profile Answer"},
 
                 # Re OCS
                 {"commandCode": 258, "applicationId": 16777238, "requestMethod": self.Request_16777238_258, "failureResultCode": 5012 ,"requestAcronym": "RAR", "responseAcronym": "RAA", "requestName": "Re Auth Request", "responseName": "Re Auth Answer"},
@@ -1450,79 +1451,6 @@ class Diameter:
         
         return True
 
-
-    def deregisterApn(self, imsi: str=None, msisdn: str=None, apn: str=None) -> bool:
-        """
-        Revokes a given UE's session with the assigned PGW (If it exists), and sends a CLR to the MME.
-        """
-        try:
-            if imsi is None and msisdn is None:
-                return False
-
-            if imsi is not None:
-                subscriberDetails = self.database.Get_Subscriber(imsi=imsi)
-            if msisdn is not None:
-                subscriberDetails = self.database.Get_Subscriber(msisdn=msisdn)
-                imsi = subscriberDetails.get('imsi', '')
-        
-            if subscriberDetails is None:
-                return False
-            
-            subscriberId = subscriberDetails.get('subscriber_id', None)
-
-            # If a subscriber has an active serving apn, grab the pcrf session id for that apn and send a CCR-T, then a Registration Termination Request to the serving pgw peer.
-            if subscriberId is not None:
-                servingApns = self.database.Get_Serving_APNs(subscriber_id=subscriberId)
-                if len(servingApns.get('apns', {})) > 0:
-                    for apnKey, apnDict in servingApns['apns'].items():
-                        pcrfSessionId = None
-                        servingPgwPeer = None
-                        servingPgwRealm = None
-                        servingPgw = None
-                        for apnDataKey, apnDataValue in servingApns['apns'][apnKey].items():
-                            if apnDataKey == 'pcrf_session_id':
-                                pcrfSessionId = apnDataValue
-                            if apnDataKey == 'serving_pgw_peer':
-                                servingPgwPeer = apnDataValue
-                            if apnDataKey == 'serving_pgw_realm':
-                                servingPgwRealm = apnDataValue
-                            if apnDataKey == 'serving_pgw':
-                                servingPgwRealm = apnDataValue
-                            
-                        if pcrfSessionId is not None and servingPgwPeer is not None and servingPgwRealm is not None and servingPgw is not None:
-                            if ';' in servingPgwPeer:
-                                servingPgwPeer = servingPgwPeer.split(';')[0]
-                            
-                            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [deregisterData] Sending CCR-T with Session-ID:{pcrfSessionId} to peer: {servingPgwPeer} {apnKey}", redisClient=self.redisMessaging)
-
-                            self.sendDiameterRequest(
-                            requestType='CCR',
-                            hostname=servingPgwPeer,
-                            imsi=imsi,
-                            destinationHost=servingPgw, 
-                            destinationRealm=servingPgwRealm,
-                            ccr_type=3,
-                            sessionId=pcrfSessionId,
-                            domain=servingPgwRealm
-                            )
-
-                            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [deregisterData] Sending RTR to peer: {servingPgwPeer} {apnKey}", redisClient=self.redisMessaging)
-
-                            self.sendDiameterRequest(
-                            requestType='RTR',
-                            hostname=servingPgwPeer,
-                            imsi=imsi,
-                            destinationHost=servingPgw, 
-                            destinationRealm=servingPgwRealm, 
-                            domain=servingPgwRealm
-                            )
-
-                        self.database.Update_Serving_APN(imsi=imsi, apn=apnKey, pcrf_session_id=None, serving_pgw=None, subscriber_routing='')
-            
-            return True
-        except Exception as e:
-            self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [deregisterIms] Error deregistering subscriber from IMS: {traceback.format_exc()}", redisClient=self.redisMessaging)
-            return False
 
     def deregisterIms(self, imsi=None, msisdn=None) -> bool:
         """
@@ -6011,33 +5939,57 @@ class Diameter:
         return response
 
     #3GPP Cx Registration Termination Request (RTR)
-    def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm):
-        avp = ''                                                                                    #Initiate empty var AVP                                                                                           #Session-ID
-        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_cx'                           #Session state generate
-        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))          #Session ID AVP
-        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777216),"x").zfill(8) +  "0000010a4000000c000028af")      #Vendor-Specific-Application-ID (Cx)
-        
-        avp += self.generate_avp(264, 40, self.OriginHost)                                                    #Origin Host
-        avp += self.generate_avp(296, 40, self.OriginRealm)                                                   #Origin Realm
-        
-        #SIP-Deregistration-Reason
-        reason_code_avp = self.generate_vendor_avp(616, "c0", 10415, "00000000")
-        reason_info_avp = self.generate_vendor_avp(617, "c0", 10415, self.string_to_hex("Administrative Deregistration"))
-        avp += self.generate_vendor_avp(615, "c0", 10415, reason_code_avp + reason_info_avp)
-        
-        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))                 #Destination Realm
-        avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))                 #Destination Host
-        
-        avp += self.generate_avp(277, 40, "00000001")                                                    #Auth-Session-State (Not maintained)
-        avp += self.generate_avp(1, 40, self.string_to_hex(str(imsi) + "@" + domain))                         #User-Name
-        avp += self.generate_vendor_avp(601, "c0", 10415, self.string_to_hex("sip:" + str(imsi) + "@" + domain))                      #Public-Identity
-        avp += self.generate_vendor_avp(602, "c0", 10415, self.ProductName)                         #Server-Name
-        
-        #* [ Route-Record ]
-        avp += self.generate_avp(282, "40", self.OriginHost)
-    
-        response = self.generate_diameter_packet("01", "c0", 304, 16777216, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
+    def Request_16777216_304(self, imsi, domain, destinationHost, destinationRealm, publicIdentities=None, reasonCode=0, reasonInfo="Administrative Deregistration"):
+        avp = ''
+        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_cx'
+        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777216),"x").zfill(8) +  "0000010a4000000c000028af")
 
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+
+        reason_code_avp = self.generate_vendor_avp(616, "c0", 10415, self.int_to_hex(int(reasonCode), 4))
+        reason_info_avp = self.generate_vendor_avp(617, "c0", 10415, self.string_to_hex(str(reasonInfo)))
+        avp += self.generate_vendor_avp(615, "c0", 10415, reason_code_avp + reason_info_avp)
+
+        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))
+        if destinationHost is not None:
+            avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))
+
+        avp += self.generate_avp(277, 40, "00000001")
+        user_name = str(imsi) + "@" + str(domain)
+        avp += self.generate_avp(1, 40, self.string_to_hex(user_name))
+
+        identities = publicIdentities if publicIdentities else [f"sip:{imsi}@{domain}"]
+        for public_identity in identities:
+            avp += self.generate_vendor_avp(601, "c0", 10415, self.string_to_hex(str(public_identity)))
+
+        avp += self.generate_vendor_avp(602, "c0", 10415, self.ProductName)
+        avp += self.generate_avp(282, "40", self.OriginHost)
+
+        response = self.generate_diameter_packet("01", "c0", 304, 16777216, self.generate_id(4), self.generate_id(4), avp)
+        return response
+
+    #3GPP Cx Push Profile Request (PPR)
+    def Request_16777216_305(self, imsi, domain, destinationHost, destinationRealm, cxUserData):
+        avp = ''
+        sessionid = str(bytes.fromhex(self.OriginHost).decode('ascii')) + ';' + self.generate_id(5) + ';1;app_cx'
+        avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionid)),'ascii'))
+        avp += self.generate_avp(260, 40, "000001024000000c" + format(int(16777216),"x").zfill(8) +  "0000010a4000000c000028af")
+
+        avp += self.generate_avp(264, 40, self.OriginHost)
+        avp += self.generate_avp(296, 40, self.OriginRealm)
+        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))
+        if destinationHost is not None:
+            avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))
+
+        avp += self.generate_avp(277, 40, "00000001")
+        user_name = str(imsi) + "@" + str(domain)
+        avp += self.generate_avp(1, 40, self.string_to_hex(user_name))
+        avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(cxUserData)),'ascii'))
+        avp += self.generate_avp(282, "40", self.OriginHost)
+
+        response = self.generate_diameter_packet("01", "c0", 305, 16777216, self.generate_id(4), self.generate_id(4), avp)
         return response
 
     #3GPP SWx Registration Termination Request (RTR)
@@ -6275,11 +6227,25 @@ class Diameter:
         return response
 
     #3GPP Gx - Re Auth Request
-    def Request_16777238_258(self, sessionId, servingPgw, servingRealm, chargingRules=None, ueIp=None, chargingRuleAction='install', chargingRuleName=None):
+    def Request_16777238_258(self, sessionId, servingPgw, servingRealm, chargingRules=None, ueIp=None, chargingRuleAction='install', chargingRuleName=None, sessionReleaseCause=None):
         avp = ''
         self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Request_16777238_258] [RAR] Creating Re Auth Request", redisClient=self.redisMessaging)
 
         avp += self.generate_avp(263, 40, str(binascii.hexlify(str.encode(sessionId)),'ascii'))          #Session-Id set AVP
+
+        # PCRF-initiated IP-CAN session termination (TS 29.212 §4.5.9.6): the RAR
+        # carries Session-Release-Cause (AVP 1045) and no charging rules; the PCEF
+        # answers RAA and then tears the session down with a CCR-T.
+        if sessionReleaseCause is not None:
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Request_16777238_258] [RAR] Session-Release-Cause: {sessionReleaseCause}", redisClient=self.redisMessaging)
+            avp += self.generate_vendor_avp(1045, "c0", 10415, self.int_to_hex(int(sessionReleaseCause), 4))
+            avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin Host
+            avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
+            avp += self.generate_avp(293, 40, self.string_to_hex(servingPgw))                                #Destination Host
+            avp += self.generate_avp(283, 40, self.string_to_hex(servingRealm))                              #Destination Realm
+            avp += self.generate_avp(258, 40, format(int(16777238),"x").zfill(8))                            #Auth-Application-ID Gx
+            avp += self.generate_avp(285, 40, format(int(0),"x").zfill(8))                                   #Re-Auth Request Type
+            return self.generate_diameter_packet("01", "c0", 258, 16777238, self.generate_id(4), self.generate_id(4), avp)
 
         #Setup Charging Rule
         self.logTool.log(service='HSS', level='debug', message=chargingRules, redisClient=self.redisMessaging)
