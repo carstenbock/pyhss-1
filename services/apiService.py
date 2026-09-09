@@ -28,6 +28,7 @@ from baseModels import SubscriberInfo
 from version import pyhss_version
 import database
 from pyhss_config import config
+from enum_management import ENUMClient, ENUMManagementError
 
 
 siteName = config.get("hss", {}).get("site_name", "")
@@ -61,7 +62,8 @@ diameterClient = Diameter(
                     productName='PyHSS-client-API'
                 )
 
-databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging)
+enumClient = ENUMClient(config=config, log_tool=logTool, redis_messaging=redisMessaging)
+
 
 apiService = Flask(__name__)
 
@@ -735,9 +737,26 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
     def delete(self, ims_subscriber_id):
         '''Delete all data for specified ims_subscriber_id'''
         try:
+            # Get subscriber data before deletion to know which ENUM entries to remove
+            subscriber_data = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
+            msisdn = subscriber_data.get('msisdn')
+            msisdn_list = subscriber_data.get('msisdn_list')
+            imsi = subscriber_data.get('imsi')
+
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.DeleteObj(IMS_SUBSCRIBER, ims_subscriber_id, False, operation_id)
+
+            # Delete ENUM entries after subscriber deletion
+            try:
+                enumClient.delete_enum_entries(msisdn=msisdn, msisdn_list=msisdn_list)
+            except ENUMManagementError as enum_error:
+                # In strict mode, log the error but don't fail - subscriber is already deleted
+                logTool.log(service='API', level='error', message=f"[API] ENUM deletion failed after subscriber deletion: {enum_error}", redisClient=redisMessaging)
+
+            if warnings:
+                data = dict(data) if isinstance(data, dict) else {'result': data}
+                data['warnings'] = warnings
             return data, 200
         except Exception as E:
             print(E)
@@ -749,14 +768,43 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
         '''Update IMS SUBSCRIBER data for specified ims_subscriber'''
         try:
             json_data = request.get_json(force=True)
-            if 'msisdn' in json_data:
-                json_data['msisdn'] = json_data['msisdn'].replace('+', '')
-            if 'msisdn_list' in json_data:
-                json_data['msisdn_list'] = json_data['msisdn_list'].replace('+', '')
+            # Get current subscriber data before update to compare MSISDNs
+            old_subscriber = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
+            old_msisdn = old_subscriber.get('msisdn')
+            old_msisdn_list = old_subscriber.get('msisdn_list')
+
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.UpdateObj(IMS_SUBSCRIBER, json_data, ims_subscriber_id, False, operation_id)
 
+            # Update ENUM entries if MSISDNs changed
+            new_msisdn = data.get('msisdn')
+            new_msisdn_list = data.get('msisdn_list')
+            try:
+                enumClient.update_enum_entries(
+                    old_msisdn=old_msisdn,
+                    old_msisdn_list=old_msisdn_list,
+                    new_msisdn=new_msisdn,
+                    new_msisdn_list=new_msisdn_list
+                )
+            except ENUMManagementError as enum_error:
+                # In strict mode, log but don't fail - subscriber is already updated
+                logTool.log(service='API', level='error', message=f"[API] ENUM update failed: {enum_error}", redisClient=redisMessaging)
+
+            # Push the changed Sh repository data to subscribed ASs (TS 29.328 6.1.4)
+            if 'xcap_profile' in json_data or 'sh_profile' in json_data:
+                try:
+                    notify_subscribed_application_servers(data)
+                except Exception as pnr_error:
+                    logTool.log(service='API', level='error', message=f"[API] Sh PNR notification failed: {pnr_error}", redisClient=redisMessaging)
+
+            warnings = []
+            if ims_profile_push_fields_changed(old_subscriber, json_data):
+                warnings = push_ims_profile_and_relay(data)
+
+            if warnings:
+                data = dict(data) if isinstance(data, dict) else {'result': data}
+                data['warnings'] = warnings
             return data, 200
         except Exception as E:
             print(E)
@@ -777,6 +825,18 @@ class PyHSS_IMS_SUBSCRIBER(Resource):
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.CreateObj(IMS_SUBSCRIBER, json_data, False, operation_id)
+
+            # Create ENUM entries for the new subscriber
+            try:
+                enumClient.create_enum_entries(
+                    msisdn=json_data.get('msisdn'),
+                    msisdn_list=json_data.get('msisdn_list')
+                )
+            except ENUMManagementError as enum_error:
+                # In strict mode, ENUM errors are raised - rollback subscriber creation
+                logTool.log(service='API', level='error', message=f"[API] ENUM creation failed, rolling back subscriber: {enum_error}", redisClient=redisMessaging)
+                databaseClient.DeleteObj(IMS_SUBSCRIBER, data.get('ims_subscriber_id'), False, operation_id)
+                return {"error": f"ENUM creation failed: {str(enum_error)}"}, 500
 
             return data, 200
         except Exception as E:
@@ -1580,6 +1640,20 @@ class PyHSS_OAM_Reconcile_IMS(Resource):
             return response_dict, 200
         except Exception as E:
             print(E)
+            return handle_exception(E)
+
+@ns_oam.route('/reconcile/enum')
+class PyHSS_OAM_Reconcile_ENUM(Resource):
+    def get(self):
+        '''Reconcile ENUM entries - recreate all NAPTR records from IMS subscriber database'''
+        try:
+            result = enumClient.reconcile_all(databaseClient)
+            if result.get('status') == 'error':
+                return result, 500
+            return result, 200
+        except Exception as E:
+            print(E)
+            logTool.log(service='API', level='error', message=f"[API] ENUM reconciliation failed: {traceback.format_exc()}", redisClient=redisMessaging)
             return handle_exception(E)
 
 @ns_pcrf.route('/pcrf_subscriber/list')

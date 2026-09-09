@@ -87,6 +87,13 @@ geored:
     - 'http://hss01.mnc001.mcc001.3gppnetwork.org:8080'
     - 'http://hss02.mnc001.mcc001.3gppnetwork.org:8080'
 
+enum:
+  enabled: False
+  strict_mode: False
+  naptr_order: 10
+  naptr_preference: 10
+  naptr_ttl: 3600
+
 redis:
   connectionType: "tcp"
   host: localhost

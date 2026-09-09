@@ -194,6 +194,34 @@ geored:
     - 'http://hss01.mnc001.mcc001.3gppnetwork.org:8080'
     - 'http://hss02.mnc001.mcc001.3gppnetwork.org:8080'
 
+## ENUM Management Parameters (RFC 6116)
+# Manages NAPTR records in PowerDNS for E.164 Number Mapping (ENUM)
+# Used to map MSISDNs to SIP URIs for IMS subscribers
+enum:
+  enabled: False
+  # If true, fail IMS subscriber operations when ENUM updates fail
+  # If false, log errors but allow subscriber operations to succeed
+  strict_mode: False
+  # NAPTR record parameters
+  naptr_order: 10
+  naptr_preference: 10
+  naptr_ttl: 3600
+  # PowerDNS API endpoints - each can have multiple domains
+  # endpoints:
+  #   - name: "primary-pdns"
+  #     url: "http://pdns1.example.com:8081"
+  #     api_key: "changeme"
+  #     sip_domain: "ims.mnc001.mcc001.3gppnetwork.org"
+  #     domains:
+  #       - "e164.arpa"
+  #       - "e164.example.com"
+  #   - name: "secondary-pdns"
+  #     url: "http://pdns2.example.com:8081"
+  #     api_key: "changeme"
+  #     sip_domain: "ims.mnc001.mcc001.3gppnetwork.org"
+  #     domains:
+  #       - "e164.arpa"
+
 #Redis is required to run PyHSS. An instance running on a local network is recommended for production.
 redis:
   # Which connection type to attempt. Valid options are: tcp, unix, sentinel
