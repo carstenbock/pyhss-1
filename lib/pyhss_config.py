@@ -12,6 +12,69 @@ from gsup.protocol.gsup_msg import GMMCause
 config = None
 
 
+def _as_bool(val):
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _split_urls(val):
+    if not val:
+        return []
+    return [u.strip() for u in str(val).replace(",", " ").split() if u.strip()]
+
+
+def _apply_env_overrides(cfg):
+    """Overlay Helm / Docker env vars that are not always in config.yaml.template.
+
+    Helm injects ENABLE_GEO_REDUNDANCY, SYNC_ENDPOINTS, SH_NOTIFY_ENDPOINTS,
+    RX_NOTIFY_ENDPOINTS. Docker compose uses GEORED_ENABLED / GEORED_ENDPOINT_N.
+    """
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    geored = cfg.setdefault("geored", {})
+    enabled = os.environ.get("ENABLE_GEO_REDUNDANCY", os.environ.get("GEORED_ENABLED"))
+    if enabled is not None:
+        geored["enabled"] = _as_bool(enabled)
+
+    endpoints = os.environ.get("SYNC_ENDPOINTS")
+    if endpoints is None:
+        collected = []
+        i = 1
+        while True:
+            ep = os.environ.get(f"GEORED_ENDPOINT_{i}")
+            if not ep:
+                break
+            collected.append(ep.strip())
+            i += 1
+        if collected:
+            endpoints = " ".join(collected)
+    if endpoints is not None:
+        geored["endpoints"] = _split_urls(endpoints)
+
+    actions = os.environ.get("GEORED_SYNC_ACTIONS")
+    if actions:
+        geored["sync_actions"] = [a.strip() for a in actions.replace(",", " ").split() if a.strip()]
+    elif isinstance(geored.get("sync_actions"), str):
+        geored["sync_actions"] = [a.strip() for a in geored["sync_actions"].replace(",", " ").split() if a.strip()]
+    if not geored.get("sync_actions"):
+        geored["sync_actions"] = ["HSS", "IMS", "PCRF", "EIR"]
+
+    hss = cfg.setdefault("hss", {})
+    sh_notify = os.environ.get("SH_NOTIFY_ENDPOINTS")
+    if sh_notify is not None:
+        hss["sh_notify_endpoints"] = _split_urls(sh_notify)
+    rx_notify = os.environ.get("RX_NOTIFY_ENDPOINTS")
+    if rx_notify is not None:
+        hss["rx_notify_endpoints"] = _split_urls(rx_notify)
+    swx_aaa = os.environ.get("SWX_AAA_DESTINATION_HOSTS")
+    if swx_aaa is not None:
+        hss["swx_aaa_destination_hosts"] = [h.strip() for h in swx_aaa.replace(" ", ",").split(",") if h.strip()]
+
+    return cfg
+
+
 def load_config():
     global config
 
@@ -30,7 +93,7 @@ def load_config():
     for path in paths:
         if os.path.exists(path):
             with open(path, "r") as stream:
-                config = yaml.safe_load(stream)
+                config = _apply_env_overrides(yaml.safe_load(stream))
             return
 
     print("ERROR: failed to find PyHSS config, tried these paths:")

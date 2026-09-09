@@ -33,6 +33,22 @@ from ast import literal_eval
 from pyhss_config import config
 
 
+geored_config_changed = None
+
+def geored_check_updated_endpoints(config):
+    global geored_config_changed
+    update_file = config.get('geored', {}).get('update_file', '/tmp/pyhss_geored_endpoints.txt')
+    if update_file and update_file != '':
+        if os.path.isfile(update_file):
+            if (geored_config_changed != os.path.getmtime(update_file)):
+                print(f"Geored config updated: {geored_config_changed}")
+                try:
+                    config.get('geored', {})['endpoints'] = yaml.safe_load(open(update_file, 'r'))
+                    geored_config_changed = os.path.getmtime(update_file)
+                except:
+                    print(f"Error reading updated endpoints from {update_file}")
+    return config.get('geored', {}).get('endpoints', [])
+
 Base = declarative_base()
 
 class DATABASE_SCHEMA_VERSION(Base):
@@ -969,8 +985,9 @@ class Database:
                 return
             georedDict = {}
             if config.get('geored', {}).get('enabled', False):
-                if config.get('geored', {}).get('endpoints', []) is not None:
-                    if len(config.get('geored', {}).get('endpoints', [])) > 0:
+                geored_endpoints = geored_check_updated_endpoints(config)
+                if geored_endpoints is not None:
+                    if len(geored_endpoints) > 0:
                         georedDict['body'] = jsonData
                         georedDict['operation'] = operation
                         georedDict['timestamp'] = time.time_ns()
