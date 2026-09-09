@@ -25,6 +25,19 @@ def payload_without_last_modified(payload):
     return payload
 
 
+def with_plus_msisdn(payload):
+    """The API only accepts global E.164 MSISDNs with leading '+';
+    storage and responses are digits-only. Wrap request bodies with this
+    helper so the templates can stay digits-only for response comparison."""
+    data = dict(payload)
+    if data.get('msisdn'):
+        data['msisdn'] = '+' + str(data['msisdn']).lstrip('+')
+    if data.get('msisdn_list'):
+        data['msisdn_list'] = ','.join(
+            '+' + m.strip().lstrip('+') for m in str(data['msisdn_list']).split(','))
+    return data
+
+
 class API_Tests(unittest.TestCase):
     def test_A_API_Response(self):
         r = requests.get(str(base_url) + '/swagger.json')
@@ -186,7 +199,7 @@ class Subscriber_Tests(unittest.TestCase):
     def test_B_create_Subscriber(self):
         log.debug(self.__class__.template_data)
         headers = {"Content-Type": "application/json"}
-        r = requests.put(str(base_url) + '/subscriber/', data=json.dumps(self.__class__.template_data), headers=headers)
+        r = requests.put(str(base_url) + '/subscriber/', data=json.dumps(with_plus_msisdn(self.__class__.template_data)), headers=headers)
         self.__class__.subscriber_id = r.json()['subscriber_id']
         log.debug("Created Subscriber ID " + str(self.__class__.subscriber_id))
         self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
@@ -222,7 +235,7 @@ class Subscriber_Tests(unittest.TestCase):
         headers = {"Content-Type": "application/json"}
         self.__class__.template_data['msisdn'] = '123414299213'
         self.__class__.template_data['apn_list'] = self.__class__.template_data['apn_list'] + "," + str(self.__class__.apn_secondary)
-        r = requests.patch(str(base_url) + '/subscriber/' + str(self.__class__.subscriber_id), data=json.dumps(self.__class__.template_data), headers=headers)
+        r = requests.patch(str(base_url) + '/subscriber/' + str(self.__class__.subscriber_id), data=json.dumps(with_plus_msisdn(self.__class__.template_data)), headers=headers)
         payload = payload_without_last_modified(r.json())
         self.assertEqual(self.__class__.template_data, payload, "JSON body should match input")
 
@@ -257,7 +270,7 @@ class IMS_Subscriber(unittest.TestCase):
 
     def test_B_create_IMS_Subscriber(self):
         headers = {"Content-Type": "application/json"}
-        r = requests.put(str(base_url) + '/ims_subscriber/', data=json.dumps(self.__class__.template_data), headers=headers)
+        r = requests.put(str(base_url) + '/ims_subscriber/', data=json.dumps(with_plus_msisdn(self.__class__.template_data)), headers=headers)
         self.__class__.ims_subscriber_id = r.json()['ims_subscriber_id']
         log.debug("Created ims_subscriber_id " + str(self.__class__.ims_subscriber_id))
         self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
@@ -284,7 +297,7 @@ class IMS_Subscriber(unittest.TestCase):
     def test_D_Patch_IMS_Subscriber(self):
         headers = {"Content-Type": "application/json"}
         self.__class__.template_data['msisdn'] = "5132312321"
-        r = requests.patch(str(base_url) + '/ims_subscriber/' + str(self.__class__.ims_subscriber_id), data=json.dumps(self.__class__.template_data), headers=headers)
+        r = requests.patch(str(base_url) + '/ims_subscriber/' + str(self.__class__.ims_subscriber_id), data=json.dumps(with_plus_msisdn(self.__class__.template_data)), headers=headers)
         payload = payload_without_last_modified(r.json())
         self.assertEqual(self.__class__.template_data, payload, "JSON body should match input")
 
@@ -534,7 +547,7 @@ class GeoRed_MME(unittest.TestCase):
     def test_C_GeoRed_MME_create_Subscriber(self):
         log.debug(self.__class__.subscriber_template_data)
         headers = {"Content-Type": "application/json"}
-        r = requests.put(str(base_url) + '/subscriber/', data=json.dumps(self.__class__.subscriber_template_data), headers=headers)
+        r = requests.put(str(base_url) + '/subscriber/', data=json.dumps(with_plus_msisdn(self.__class__.subscriber_template_data)), headers=headers)
         self.__class__.subscriber_id = r.json()['subscriber_id']
         log.debug("Created Subscriber ID " + str(self.__class__.subscriber_id))
         self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
@@ -649,7 +662,7 @@ class GeoRed_PCRF(unittest.TestCase):
     def test_C_GeoRed_PCRF_create_Subscriber(self):
         log.debug(self.__class__.subscriber_template_data)
         headers = {"Content-Type": "application/json"}
-        r = requests.put(str(base_url) + '/subscriber/', data=json.dumps(self.__class__.subscriber_template_data), headers=headers)
+        r = requests.put(str(base_url) + '/subscriber/', data=json.dumps(with_plus_msisdn(self.__class__.subscriber_template_data)), headers=headers)
         self.__class__.subscriber_id = r.json()['subscriber_id']
         self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
 
@@ -699,7 +712,7 @@ class GeoRed_IMS(unittest.TestCase):
 
     def test_A_GeoRed_IMS_create_IMS_Subscriber(self):
         headers = {"Content-Type": "application/json"}
-        r = requests.put(str(base_url) + '/ims_subscriber/', data=json.dumps(self.__class__.ims_template_data), headers=headers)
+        r = requests.put(str(base_url) + '/ims_subscriber/', data=json.dumps(with_plus_msisdn(self.__class__.ims_template_data)), headers=headers)
         self.__class__.ims_subscriber_id = r.json()['ims_subscriber_id']
         log.debug("Created ims_subscriber_id " + str(self.__class__.ims_subscriber_id))
         self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")

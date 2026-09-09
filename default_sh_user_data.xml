@@ -2,9 +2,11 @@
 <!--This is the default iFC template used by PyHSS, variables come from the Jinja2 template passed inside diameter.py where you can additional variables if required -->
 <Sh-Data>
     <IMSPrivateUserIdentity>{{ Sh_template_vars['imsi'] }}@ims.mnc{{ Sh_template_vars['mnc'] }}.mcc{{ Sh_template_vars['mcc'] }}.3gppnetwork.org</IMSPrivateUserIdentity>
-    <!-- This provides the Public Identifiers to the Application Server -->
+    <!-- This provides the Public Identifiers to the Application Server.
+         The SIP URI carries the global E.164 MSISDN with leading '+';
+         the MSISDN element stays digits-only per TS 29.328. -->
     <PublicIdentifiers>
-        <IMSPublicIdentity>sip:{{ Sh_template_vars['msisdn'] }}@ims.mnc{{ Sh_template_vars['mnc'] }}.mcc{{ Sh_template_vars['mcc'] }}.3gppnetwork.org</IMSPublicIdentity>
+        <IMSPublicIdentity>sip:+{{ Sh_template_vars['msisdn'] }}@ims.mnc{{ Sh_template_vars['mnc'] }}.mcc{{ Sh_template_vars['mcc'] }}.3gppnetwork.org</IMSPublicIdentity>
         <MSISDN>{{ Sh_template_vars['msisdn'] }}</MSISDN>
     </PublicIdentifiers>
 

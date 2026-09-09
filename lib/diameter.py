@@ -1788,14 +1788,19 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Username AVP is present, value is " + str(username), redisClient=self.redisMessaging)
         username = username.split('@')[0]   #Strip Domain to get User part
         username = username[4:]             #Strip tel: or sip: prefix
-        #Determine if dealing with IMSI or MSISDN
-        if (len(username) == 15) or (len(username) == 16):
+        #Determine if dealing with IMSI or MSISDN.
+        #A leading '+' always denotes a global E.164 MSISDN (tel:+..., sip:+...),
+        #so check it before the IMSI length heuristic to avoid misclassifying
+        #14/15-digit MSISDNs with '+' as IMSIs.
+        if username.startswith('+'):
+            username = username[1:]
+            self.logTool.log(service='HSS', level='debug', message="We have an msisdn: " + str(username), redisClient=self.redisMessaging)
+            ims_subscriber_details = self.database.Get_IMS_Subscriber(msisdn=username)
+        elif (len(username) == 15) or (len(username) == 16):
             self.logTool.log(service='HSS', level='debug', message="We have an IMSI: " + str(username), redisClient=self.redisMessaging)
             ims_subscriber_details = self.database.Get_IMS_Subscriber(imsi=username)
         else:
             self.logTool.log(service='HSS', level='debug', message="We have an msisdn: " + str(username), redisClient=self.redisMessaging)
-            if username[0] == '+':
-                username = username[1:]
             ims_subscriber_details = self.database.Get_IMS_Subscriber(msisdn=username)
         self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(ims_subscriber_details), redisClient=self.redisMessaging)
         return ims_subscriber_details

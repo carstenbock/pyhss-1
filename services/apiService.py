@@ -17,6 +17,7 @@ import os
 sys.path.append(os.path.realpath(os.path.dirname(__file__) + "/../lib"))
 
 import time
+import re
 import requests
 import traceback
 import sqlalchemy
@@ -67,6 +68,38 @@ diameterClient = Diameter(
 databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging, main_service=True)
 
 enumClient = ENUMClient(config=config, log_tool=logTool, redis_messaging=redisMessaging)
+
+# MSISDN inputs must be global E.164 numbers with a leading '+'
+# (RFC 3966 / TS 23.003). They are stored canonically as digits-only;
+# the '+' is re-added when rendering IMS identities (iFC/Sh/ENUM).
+E164_MSISDN_PATTERN = re.compile(r'^\+[1-9][0-9]{6,14}$')
+
+
+class InvalidMsisdnError(ValueError):
+    """Raised when an MSISDN input is not a global E.164 number."""
+    pass
+
+
+def normalize_msisdn_input(json_data):
+    """Validate '+E.164' msisdn / msisdn_list inputs and strip the '+' for storage."""
+    if json_data.get('msisdn') is not None:
+        msisdn = str(json_data['msisdn']).strip()
+        if not E164_MSISDN_PATTERN.match(msisdn):
+            raise InvalidMsisdnError(
+                f"msisdn must be a global E.164 number with leading '+' (e.g. +4915888456043), got '{msisdn}'")
+        json_data['msisdn'] = msisdn[1:]
+    if json_data.get('msisdn_list') is not None:
+        normalized = []
+        for entry in str(json_data['msisdn_list']).split(','):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if not E164_MSISDN_PATTERN.match(entry):
+                raise InvalidMsisdnError(
+                    f"msisdn_list entries must be global E.164 numbers with leading '+', got '{entry}'")
+            normalized.append(entry[1:])
+        json_data['msisdn_list'] = ','.join(normalized)
+
 
 def send_pnr_for_local_subscriptions(ims_subscriber_data):
     """Send an Sh Push-Notification-Request (PNR, TS 29.328 section 6.1.4)
@@ -656,8 +689,10 @@ class PyHSS_SUBSCRIBER_Get(Resource):
         '''Update SUBSCRIBER data for specified subscriber_id'''
         try:
             json_data = request.get_json(force=True)
-            if 'msisdn' in json_data:
-                json_data['msisdn'] = json_data['msisdn'].replace('+', '')
+            try:
+                normalize_msisdn_input(json_data)
+            except InvalidMsisdnError as validation_error:
+                return {"error": str(validation_error)}, 400
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.UpdateObj(SUBSCRIBER, json_data, subscriber_id, False, operation_id)
@@ -699,8 +734,10 @@ class PyHSS_SUBSCRIBER(Resource):
         '''Create new SUBSCRIBER'''
         try:
             json_data = request.get_json(force=True)
-            if 'msisdn' in json_data:
-                json_data['msisdn'] = json_data['msisdn'].replace('+', '')
+            try:
+                normalize_msisdn_input(json_data)
+            except InvalidMsisdnError as validation_error:
+                return {"error": str(validation_error)}, 400
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.CreateObj(SUBSCRIBER, json_data, False, operation_id)
@@ -726,7 +763,8 @@ class PyHSS_SUBSCRIBER_MSISDN(Resource):
     def get(self, msisdn):
         '''Get data for MSISDN'''
         try:
-            data = databaseClient.Get_Subscriber(msisdn=msisdn, get_attributes=True)
+            # Accept both '+E.164' and digits-only lookups (storage is digits-only)
+            data = databaseClient.Get_Subscriber(msisdn=msisdn.lstrip('+'), get_attributes=True)
             return data, 200
         except Exception as E:
             print(E)
@@ -847,6 +885,11 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
         '''Update IMS SUBSCRIBER data for specified ims_subscriber'''
         try:
             json_data = request.get_json(force=True)
+            try:
+                normalize_msisdn_input(json_data)
+            except InvalidMsisdnError as validation_error:
+                return {"error": str(validation_error)}, 400
+
             # Get current subscriber data before update to compare MSISDNs
             old_subscriber = databaseClient.GetObj(IMS_SUBSCRIBER, ims_subscriber_id)
             old_msisdn = old_subscriber.get('msisdn')
@@ -897,10 +940,10 @@ class PyHSS_IMS_SUBSCRIBER(Resource):
         '''Create new IMS SUBSCRIBER'''
         try:
             json_data = request.get_json(force=True)
-            if 'msisdn' in json_data:
-                json_data['msisdn'] = json_data['msisdn'].replace('+', '')
-            if 'msisdn_list' in json_data:
-                json_data['msisdn_list'] = json_data['msisdn_list'].replace('+', '')
+            try:
+                normalize_msisdn_input(json_data)
+            except InvalidMsisdnError as validation_error:
+                return {"error": str(validation_error)}, 400
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.CreateObj(IMS_SUBSCRIBER, json_data, False, operation_id)
@@ -927,7 +970,8 @@ class PyHSS_IMS_SUBSCRIBER_MSISDN(Resource):
     def get(self, msisdn):
         '''Get IMS data for MSISDN'''
         try:
-            data = databaseClient.Get_IMS_Subscriber(msisdn=msisdn)
+            # Accept both '+E.164' and digits-only lookups (storage is digits-only)
+            data = databaseClient.Get_IMS_Subscriber(msisdn=msisdn.lstrip('+'))
             return data, 200
         except Exception as E:
             print("Flask Exception: " + str(E))

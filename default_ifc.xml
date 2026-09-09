@@ -3,8 +3,12 @@
 <IMSSubscription>
     <PrivateID>{{ iFC_vars['imsi'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</PrivateID>
     <ServiceProfile>
+        <!-- MSISDN identities are global E.164 with leading '+' (RFC 3966 / TS 23.003).
+             SPEC-DEVIATION: TS 23.003 13.4 / GSMA IR.92 -- the SIP URI alias omits
+             ";user=phone" because downstream elements (ipsecgw alias cache) match
+             P-Associated-URI values as exact strings. -->
         <PublicIdentity>
-            <Identity>sip:{{ iFC_vars['msisdn'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</Identity>
+            <Identity>sip:+{{ iFC_vars['msisdn'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</Identity>
             <Extension>
                 <IdentityType>0</IdentityType>
                 <Extension>
@@ -13,7 +17,7 @@
             </Extension>
         </PublicIdentity>
         <PublicIdentity>
-            <Identity>tel:{{ iFC_vars['msisdn'] }}</Identity>
+            <Identity>tel:+{{ iFC_vars['msisdn'] }}</Identity>
             <Extension>
                 <IdentityType>0</IdentityType>
                 <Extension>
