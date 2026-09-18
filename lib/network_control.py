@@ -435,8 +435,9 @@ def push_ims_profile(
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
         return warnings
 
+    sent = ""
     try:
-        diameter_client.sendDiameterRequest(
+        sent = diameter_client.sendDiameterRequest(
             requestType="PPR",
             hostname=serving_scscf_peer,
             imsi=imsi,
@@ -445,11 +446,27 @@ def push_ims_profile(
             destinationRealm=serving_scscf_realm,
             cxUserData=cx_user_data,
         )
-        _log(log_tool, redis_messaging, "info", f"[network_control] Sent Cx PPR for IMSI {imsi} to {serving_scscf_peer}")
     except Exception as exc:
         msg = f"Cx PPR to serving S-CSCF failed for IMSI {imsi}: {exc}"
         warnings.append(msg)
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
+        return warnings
+
+    if sent:
+        _log(log_tool, redis_messaging, "info", f"[network_control] Sent Cx PPR for IMSI {imsi} to {serving_scscf_peer}")
+        return warnings
+
+    # sendDiameterRequest returns empty without raising when the peer is absent from
+    # this process's peer table, which is always the case in the API service: the Cx
+    # connections belong to the diameter nodes. Logging success regardless left a
+    # caller believing the S-CSCF had been refreshed while it kept serving the iFC it
+    # cached at registration.
+    msg = (
+        f"Cx PPR for IMSI {imsi} was not sent: peer {serving_scscf_peer} is not connected to "
+        f"this node, so the S-CSCF keeps the iFC it cached until the subscriber re-registers"
+    )
+    warnings.append(msg)
+    _log(log_tool, redis_messaging, "warning", f"[network_control] {msg}")
 
     return warnings
 

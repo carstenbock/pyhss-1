@@ -3281,13 +3281,32 @@ class Diameter:
                 return response
 
         avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(str(imsi) + '@' + str(domain))),'ascii'))
-        #Cx-User-Data (XML)
+
+        # TS 29.228 clause 6.1.2: on a RE_REGISTRATION the HSS only downloads the
+        # user profile when User-Data-Already-Available says the S-CSCF has none.
+        # This used to send Cx-User-Data unconditionally, so an S-CSCF that reported
+        # ALREADY_AVAILABLE could never be told apart from one that did not, and the
+        # AVP was untestable. Omission is restricted to RE_REGISTRATION: an initial
+        # REGISTRATION assigns the subscriber to a possibly different S-CSCF, and one
+        # that claims to hold data for a subscriber it was not serving is not worth
+        # trusting when the cost of the download is one AVP.
         try:
-            xmlbody = self.build_cx_user_data(ims_subscriber_details)
-        except ValueError:
-            self.logTool.log(service='HSS', level='error', message="Failed to load iFC template", redisClient=self.redisMessaging)
-            raise
-        avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))
+            user_data_already_available = self.hex_to_int(self.get_avp_data(avps, 624)[0])
+        except Exception:
+            user_data_already_available = 0
+
+        if requested_assignment_type == 2 and user_data_already_available == 1:
+            self.logTool.log(service='HSS', level='debug',
+                             message="Cx SAR: RE_REGISTRATION with USER_DATA_ALREADY_AVAILABLE; omitting Cx-User-Data",
+                             redisClient=self.redisMessaging)
+        else:
+            #Cx-User-Data (XML)
+            try:
+                xmlbody = self.build_cx_user_data(ims_subscriber_details)
+            except ValueError:
+                self.logTool.log(service='HSS', level='error', message="Failed to load iFC template", redisClient=self.redisMessaging)
+                raise
+            avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))
         
         #Charging Information
         #avp += self.generate_vendor_avp(618, "c0", 10415, "0000026dc000001b000028af7072695f6363665f6164647265737300")
