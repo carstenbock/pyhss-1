@@ -25,7 +25,10 @@
                 </Extension>
             </Extension>
         </PublicIdentity>
+        <!-- The IMSI-derived identity (TS 23.003 13.4B) is for registration only and
+             must not be announced in P-Associated-URI or used for sessions. -->
         <PublicIdentity>
+            <BarringIndication>1</BarringIndication>
             <Identity>sip:{{ iFC_vars['imsi'] }}@ims.mnc{{ iFC_vars['mnc'] }}.mcc{{ iFC_vars['mcc'] }}.3gppnetwork.org</Identity>
             <Extension>
                 <IdentityType>0</IdentityType>
