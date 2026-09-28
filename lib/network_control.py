@@ -110,6 +110,44 @@ def _send_clr(
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
 
 
+def send_clr(diameter_client, imsi: str, clr: dict) -> bool:
+    """Queue an operator-requested S6a CLR via this node's peer table.
+
+    clr carries the PUT /push/clr body: diameterPeer, DestinationRealm,
+    optional DestinationHost, cancellationType and immediateReattach.
+    Returns True when the request was queued to a connected peer.
+    """
+    sent = diameter_client.sendDiameterRequest(
+        requestType="CLR",
+        hostname=clr["diameterPeer"],
+        imsi=imsi,
+        DestinationHost=clr.get("DestinationHost"),
+        DestinationRealm=clr["DestinationRealm"],
+        CancellationType=clr["cancellationType"],
+        immediateReattach=clr["immediateReattach"],
+    )
+    return bool(sent)
+
+
+def push_clr_and_relay(diameter_client, imsi: str, clr: dict, relay) -> dict:
+    """Send an operator-requested CLR from this node and from every Diameter node.
+
+    The MME may be connected to any Diameter node, and each node only knows its
+    own peers, so the CLR is also relayed. relay(path, payload) returns the JSON
+    bodies of the nodes that answered. The CLR counts as sent when this node or
+    at least one relayed node queued it.
+    """
+    sent_locally = send_clr(diameter_client, imsi, clr)
+    node_results = relay("/geored/push_clr", dict(clr, imsi=imsi)) or []
+    nodes_sent = sum(1 for result in node_results if result.get("result") == "OK")
+    return {
+        "sent": sent_locally or nodes_sent > 0,
+        "sent_locally": sent_locally,
+        "relayed": len(node_results) > 0,
+        "nodes_sent": nodes_sent,
+    }
+
+
 def _send_cx_rtr(
     diameter_client,
     ims_subscriber_info: dict,

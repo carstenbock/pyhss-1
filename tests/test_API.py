@@ -797,3 +797,34 @@ class GeoRed_IMS(unittest.TestCase):
         r = requests.delete(str(base_url) + '/ims_subscriber/' + str(self.__class__.ims_subscriber_id))
         xres = {"Result": "OK"}
         self.assertEqual(xres, r.json(), "JSON body should match " + str(xres))
+
+class Push_CLR_Tests(unittest.TestCase):
+    clr_body = {
+        "diameterPeer": "mme-not-connected.epc.mnc001.mcc001.3gppnetwork.org",
+        "DestinationHost": "mme-not-connected.epc.mnc001.mcc001.3gppnetwork.org",
+        "DestinationRealm": "epc.mnc001.mcc001.3gppnetwork.org",
+        "cancellationType": 2,
+        "immediateReattach": False,
+    }
+
+    def test_A_Push_CLR_Without_Any_Peer_Fails(self):
+        # No local peer and no relay endpoints in the test config: no MME was
+        # reached, so the operator must get an error, not a success.
+        r = requests.put(str(base_url) + '/push/clr/262423403000001', json=self.clr_body)
+        self.assertEqual(r.status_code, 400, "Status Code should be 400 when the CLR reached no node")
+        payload = r.json()
+        self.assertFalse(payload['sent'])
+        self.assertFalse(payload['relayed'])
+
+    def test_B_Geored_Push_CLR_Reports_Node_Outcome(self):
+        # The relay target reports its own node's outcome. The provisioning API
+        # counts a node as having sent the CLR only on result 'OK', so an
+        # absent peer must answer 'NotSent' rather than an HTTP error.
+        r = requests.post(str(base_url) + '/geored/push_clr', json=dict(self.clr_body, imsi='262423403000001'), timeout=5)
+        self.assertEqual(r.status_code, 200, "Status Code should be 200 OK")
+        self.assertEqual(r.json()['result'], 'NotSent')
+        self.assertNotIn('relayed', r.json())
+
+    def test_C_Geored_Push_CLR_Requires_IMSI(self):
+        r = requests.post(str(base_url) + '/geored/push_clr', json=self.clr_body)
+        self.assertEqual(r.status_code, 400, "Status Code should be 400 without imsi")

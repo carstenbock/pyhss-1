@@ -650,6 +650,8 @@ curl -X PUT 'http://hssip:8080/push/clr/001010000000001' \
 
 `cancellationType` follows 3GPP TS 29.272 §7.3.24.
 
+The CLR is sent from the receiving node and relayed to every node in `hss.sh_notify_endpoints` (`POST /geored/push_clr`), so it reaches the MME whichever Diameter node it is connected to. The response reports `sent_locally`, `relayed` and `nodes_sent`; it is `400` when no node had `diameterPeer` connected.
+
 ---
 
 ## Integrating from Python

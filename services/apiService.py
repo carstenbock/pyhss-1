@@ -28,6 +28,8 @@ from messaging import RedisMessaging
 from baseModels import SubscriberInfo
 import database
 from network_control import (
+    send_clr,
+    push_clr_and_relay,
     teardown_subscriber,
     push_ims_profile,
     ims_profile_push_fields_changed,
@@ -178,10 +180,12 @@ def relay_to_diameter_nodes(path, payload):
     outbound CLR/RTR/PPR must be executed on the Diameter nodes that hold the
     peer table. Uses the same SH_NOTIFY_ENDPOINTS headless-service expansion
     as Sh PNR relay. Diameter nodes must not call this helper (no loop).
+    Returns the JSON bodies of the nodes that answered with HTTP < 400.
     """
+    results = []
     endpoints = config.get('hss', {}).get('sh_notify_endpoints', []) or []
     if not endpoints:
-        return
+        return results
     for endpoint in endpoints:
         parsed = urlparse(endpoint)
         host = parsed.hostname
@@ -203,8 +207,14 @@ def relay_to_diameter_nodes(path, payload):
                         message=f"[API] Diameter relay to {url} returned HTTP {resp.status_code}: {resp.text[:200]}",
                         redisClient=redisMessaging,
                     )
+                else:
+                    try:
+                        results.append(resp.json())
+                    except ValueError:
+                        results.append({})
             except Exception as e:
                 logTool.log(service='API', level='warning', message=f"[API] Diameter relay to {url} failed: {e}", redisClient=redisMessaging)
+    return results
 
 
 def teardown_subscriber_and_relay(imsi, domains):
@@ -2315,6 +2325,26 @@ class PyHSS_Geored_Network_Teardown(Resource):
             print(E)
             return handle_exception(E)
 
+@ns_geored.route('/push_clr')
+class PyHSS_Geored_Push_Clr(Resource):
+    @ns_geored.doc('Send an operator-requested S6a CLR from this Diameter node')
+    @no_auth_required
+    def post(self):
+        '''Send S6a CLR for the given IMSI via this node's Diameter peer table (no further relay)'''
+        try:
+            json_data = request.get_json(force=True)
+            imsi = json_data.get('imsi')
+            if not imsi:
+                return {'error': 'imsi is required'}, 400
+            for key in ('diameterPeer', 'DestinationRealm', 'cancellationType', 'immediateReattach'):
+                if key not in json_data:
+                    return {'error': f'{key} is required'}, 400
+            sent = send_clr(diameterClient, imsi, json_data)
+            return {'result': 'OK' if sent else 'NotSent', 'peer': json_data['diameterPeer'], 'node': originHostname}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
 @ns_geored.route('/push_ims_profile')
 class PyHSS_Geored_Push_Ims_Profile(Resource):
     @ns_geored.doc('Send Cx PPR from this Diameter node')
@@ -2709,23 +2739,18 @@ class PyHSS_Push_CLR(Resource):
             json_data = request.get_json(force=True)
             if 'DestinationHost' not in json_data:
                 json_data['DestinationHost'] = None
-            diameterRequest = diameterClient.sendDiameterRequest(
-                requestType='CLR',
-                hostname=json_data['diameterPeer'],
-                imsi=imsi, 
-                DestinationHost=json_data['DestinationHost'], 
-                DestinationRealm=json_data['DestinationRealm'], 
-                CancellationType=json_data['cancellationType'],
-                immediateReattach=json_data['immediateReattach']
-            )
-            if not len(diameterRequest) > 0:
-                return {'result': f'Failed queueing CLR to {json_data["diameterPeer"]}'}, 400
+            outcome = push_clr_and_relay(diameterClient, imsi, json_data, relay_to_diameter_nodes)
+            if not outcome['sent']:
+                return dict(outcome, result=f'Failed queueing CLR to {json_data["diameterPeer"]}'), 400
 
-            subscriber_details = databaseClient.Get_Subscriber(imsi=str(imsi))
-            if subscriber_details['serving_mme'] == json_data['DestinationHost']:
-                databaseClient.Update_Serving_MME(imsi=imsi, serving_mme=None)
+            try:
+                subscriber_details = databaseClient.Get_Subscriber(imsi=str(imsi))
+                if subscriber_details['serving_mme'] == json_data['DestinationHost']:
+                    databaseClient.Update_Serving_MME(imsi=imsi, serving_mme=None)
+            except Exception as exc:
+                logTool.log(service='API', level='warning', message=f"[API] CLR sent but serving MME for IMSI {imsi} not cleared: {exc}", redisClient=redisMessaging)
 
-            return {'result': f'Successfully queued CLR to {json_data["diameterPeer"]}'}, 200
+            return dict(outcome, result=f'Successfully queued CLR to {json_data["diameterPeer"]}'), 200
         except Exception as E:
             print("Exception when sending CLR: " + str(E))
             response_json = {'result': 'Failed', 'Reason' : "Unable to send CLR: " + str(E)}
