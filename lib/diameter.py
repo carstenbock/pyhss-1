@@ -338,6 +338,30 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Encoded PLMN: " + str(plmn), redisClient=self.redisMessaging)
         return plmn
 
+    @staticmethod
+    def imsi_from_eap_nai(username):
+        """IMSI from the User-Name of an SWx request.
+
+        The AAA server passes the UE's EAP identity, a root NAI whose user part
+        is the IMSI behind one digit that names the EAP method (TS 23.003
+        section 19.3.2): "0" for EAP-AKA, "6" for EAP-AKA'. Only "0" used to be
+        removed, so every EAP-AKA' identity was looked up as the IMSI "6<IMSI>"
+        and answered with DIAMETER_ERROR_USER_UNKNOWN (5001).
+
+        An IMSI has at most 15 digits, so a longer user part certainly carries
+        the prefix. A user part of up to 15 digits is ambiguous for "6" (it is
+        also a bare IMSI of an MCC 6xx network) and is left alone; "0" keeps
+        being removed there as before.
+        """
+        user = username.split('@')[0]
+        if '@' not in username:
+            return user
+        if len(user) > 15 and user[0] in ('0', '6'):
+            return user[1:]
+        if user.startswith('0'):
+            return user[1:]
+        return user
+
     def EncodePLMN_from_IMSI(self, imsi):
         """Encoded PLMN (TBCD hex string) from the IMSI's leading MCC/MNC digits.
 
@@ -3675,13 +3699,7 @@ class Diameter:
             username = binascii.unhexlify(username).decode('utf-8')
             self.logTool.log(service='HSS', level='debug', message="SWx MAR for user: " + str(username), redisClient=self.redisMessaging)
 
-            if '@' in username:
-                imsi = username.split('@')[0]
-                # Strip leading '0' from EAP identity NAI (0<IMSI>@nai.epc...)
-                if imsi.startswith('0'):
-                    imsi = imsi[1:]
-            else:
-                imsi = username
+            imsi = self.imsi_from_eap_nai(username)
 
             subscriber_details = self.database.Get_Subscriber(imsi=imsi)
             if not subscriber_details.get('enabled', True):
@@ -3770,12 +3788,7 @@ class Diameter:
         try:
             username = self.get_avp_data(avps, 1)[0]
             username = binascii.unhexlify(username).decode('utf-8')
-            if '@' in username:
-                imsi = username.split('@')[0]
-                if imsi.startswith('0'):
-                    imsi = imsi[1:]
-            else:
-                imsi = username
+            imsi = self.imsi_from_eap_nai(username)
 
             subscriber_details = self.database.Get_Subscriber(imsi=imsi)
         except:
