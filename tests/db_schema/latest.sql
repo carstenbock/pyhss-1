@@ -287,4 +287,6 @@ CREATE TABLE tft (
 	tft_string VARCHAR(100) NOT NULL,
 	PRIMARY KEY (tft_id)
 );
+CREATE INDEX ix_subscriber_msisdn ON subscriber (msisdn);
+CREATE INDEX ix_ims_subscriber_imsi ON ims_subscriber (imsi);
 COMMIT;

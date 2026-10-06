@@ -574,6 +574,10 @@ Operations and maintenance functions.
 | `GET /oam/serving_subs` | Subscribers currently served by the HSS |
 | `GET /oam/serving_subs_pcrf` | Subscribers currently served by the PCRF |
 | `GET /oam/serving_subs_ims` | Subscribers currently served by the IMS |
+| `GET /oam/serving_subs_ims/count` | Number of subscribers currently served by the IMS |
+| `PUT /oam/bulk/subscribers` | Create up to 50,000 consecutive subscribers (AuC + subscriber + IMS subscriber) in one transaction; no operation log, webhooks, geored or ENUM |
+| `GET /oam/bulk/subscribers?imsi_start=&count=` | Rows per table inside an IMSI range |
+| `DELETE /oam/bulk/subscribers?imsi_start=&count=` | Delete an IMSI range from all three tables; does not deregister |
 | `GET /oam/deregister/<imsi>` | De-register an IMSI from the whole network (CLR/RTR/CCR-T) |
 | `GET /oam/reconcile/ims/<imsi>` | Compare IMS location across all GeoRed HSS nodes |
 | `GET /oam/reconcile/enum` | Rebuild all ENUM/NAPTR records from the IMS database |

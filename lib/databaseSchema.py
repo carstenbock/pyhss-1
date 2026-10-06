@@ -8,7 +8,7 @@ from sqlalchemy_utils import database_exists, create_database
 
 
 class DatabaseSchema:
-    latest = 4
+    latest = 5
 
     def __init__(self, logTool, base, engine: Engine, main_service: bool):
         self.logTool = logTool
@@ -242,8 +242,31 @@ class DatabaseSchema:
         self.add_column("ims_subscriber", "ue_srvcc_capability", "INTEGER")
         self.set_version(4)
 
+    def add_index(self, table, column):
+        # Same name SQLAlchemy gives an index=True column.
+        name = f"ix_{table}_{column}"
+        inspector = sqlalchemy.inspect(self.engine)
+        if any(index["name"] == name for index in inspector.get_indexes(table)):
+            return
+        # MySQL has no CREATE INDEX IF NOT EXISTS. Elsewhere it keeps the
+        # replicated statement harmless on a replica that created the index itself.
+        is_mysql = self.engine.name == "mysql" and not self.engine.dialect.is_mariadb
+        guard = "" if is_mysql else "IF NOT EXISTS "
+        self.execute(f"CREATE INDEX {guard}{name} ON {table} ({column})")
+
+    def upgrade_add_lookup_indexes(self):
+        if self.get_version() >= 5:
+            return
+        self.upgrade_msg(5)
+        # Cx/Sh look IMS subscribers up by IMSI and Sh/SWx look subscribers up
+        # by MSISDN on every transaction; without an index each is a table scan.
+        self.add_index("ims_subscriber", "imsi")
+        self.add_index("subscriber", "msisdn")
+        self.set_version(5)
+
     def upgrade_all(self):
         self.upgrade_from_20240603_release_1_0_1()
         self.upgrade_add_ifc_template()
         self.upgrade_add_apn_list_swx()
         self.upgrade_add_sh_srvcc_columns()
+        self.upgrade_add_lookup_indexes()

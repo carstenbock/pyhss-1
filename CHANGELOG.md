@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `PUT /oam/bulk/subscribers` creates up to 50,000 consecutive subscribers (AuC, subscriber and IMS subscriber) in one transaction, `DELETE /oam/bulk/subscribers` deletes an IMSI range and `GET /oam/bulk/subscribers` counts it. They bypass the operation log, webhooks, geored and ENUM, and deleting does not deregister; they are meant for load-test ranges, where row-by-row requests take about a day per million subscribers.
+- `GET /oam/serving_subs_ims/count` returns the number of IMS-registered subscribers without loading every row.
+
+### Changed
+
+- Database schema version 5 adds the indexes `ix_ims_subscriber_imsi` and `ix_subscriber_msisdn`. Cx and Sh look IMS subscribers up by IMSI on every transaction, which was a full table scan. On a replicated setup the master must be upgraded before the replicas start the new version.
+- The database methods no longer run `Base.metadata.create_all()` on every read; the schema is prepared once at start-up.
+
+### Fixed
+
+- Diameter over SCTP: the listening socket now sets `SCTP_NODELAY` and a default payload protocol identifier of 46, and accepted associations inherit both. Without the first, an answer sent while the peer still delayed its SACK for the previous one waited up to 200 ms for it (RFC 3539 section 3.2: Nagle is not used with SCTP); without the second, every message left with PPID 0 instead of the 46 that RFC 6733 section 2.1.1 assigns to clear-text Diameter. Each Diameter message is also sent in its own `send()` on both transports: messages written while the socket was not writable were joined in asyncio's buffer and would have left as one SCTP message.
+- Diameter: the inbound worker now forwards a request to the HSS service as soon as it arrives and batches only what is already queued behind it. It used to collect requests for a fixed 100 ms window (the docstring said 10 ms), which added a uniform 0–100 ms wait to every answer, about 50 ms on average and about 200 ms per IMS registration with its four Cx requests.
+
 ## [1.7.13] - 2026-09-08
 
 ### Added

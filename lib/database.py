@@ -119,7 +119,7 @@ class SUBSCRIBER(Base):
     default_apn = Column(Integer, ForeignKey('apn.apn_id'), doc='APN ID to use for the default APN', nullable=False)
     apn_list = Column(String(64), doc='Comma separated list of APN IDs allowed via S6a (mobile access)', nullable=False)
     apn_list_swx = Column(String(64), doc='Comma separated list of APN IDs allowed via SWx (untrusted access via ePDG); NULL or empty = SWx access denied (DIAMETER_ERROR_USER_NO_NON_3GPP_SUBSCRIPTION)', nullable=True, default=None)
-    msisdn = Column(String(18), doc='Primary Phone number of Subscriber')
+    msisdn = Column(String(18), index=True, doc='Primary Phone number of Subscriber')
     ue_ambr_dl = Column(Integer, default=999999, doc='Downlink Aggregate Maximum Bit Rate')
     ue_ambr_ul = Column(Integer, default=999999, doc='Uplink Aggregate Maximum Bit Rate')
     nam = Column(Integer, default=0, doc='Network Access Mode [3GPP TS. 123 008 2.1.1.2] - 0 (PACKET_AND_CIRCUIT) or 2 (ONLY_PACKET)')
@@ -183,7 +183,7 @@ class IMS_SUBSCRIBER(Base):
     ims_subscriber_id = Column(Integer, primary_key = True, doc='Unique ID of IMS_Subscriber entry')
     msisdn = Column(String(18), unique=True, doc=SUBSCRIBER.msisdn.doc)
     msisdn_list = Column(String(1200), doc='Comma Separated list of additional MSISDNs for Subscriber')
-    imsi = Column(String(18), unique=False, doc=SUBSCRIBER.imsi.doc)
+    imsi = Column(String(18), unique=False, index=True, doc=SUBSCRIBER.imsi.doc)
     ifc_path = Column(String(512), doc='Path to template file for the Initial Filter Criteria (deprecated, use ifc_template_id)')
     ifc_template_id = Column(Integer, ForeignKey('ifc_template.ifc_template_id'), doc='Reference to IFC Template in database')
     pcscf = Column(String(512), doc='Proxy-CSCF serving this subscriber')
@@ -685,7 +685,6 @@ class Database:
 
     def rollback_last_change(self, existingSession=None):
         if not existingSession:
-            Base.metadata.create_all(self.engine)
             Session = sessionmaker(bind=self.engine)
             session = Session()
         else:
@@ -789,7 +788,6 @@ class Database:
 
     def rollback_change_by_operation_id(self, operation_id, existingSession=None):
         if not existingSession:
-            Base.metadata.create_all(self.engine)
             Session = sessionmaker(bind=self.engine)
             session = Session()
         else:
@@ -893,7 +891,6 @@ class Database:
 
     def get_all_operation_logs(self, page=0, page_size=100, existingSession=None):
         if not existingSession:
-            Base.metadata.create_all(self.engine)
             Session = sessionmaker(bind=self.engine)
             session = Session()
         else:
@@ -930,7 +927,6 @@ class Database:
 
     def get_all_operation_logs_by_table(self, table_name, page=0, page_size=100, existingSession=None):
         if not existingSession:
-            Base.metadata.create_all(self.engine)
             Session = sessionmaker(bind=self.engine)
             session = Session()
         else:
@@ -967,7 +963,6 @@ class Database:
 
     def get_last_operation_log(self, existingSession=None):
         if not existingSession:
-            Base.metadata.create_all(self.engine)
             Session = sessionmaker(bind=self.engine)
             session = Session()
         else:
@@ -1077,7 +1072,6 @@ class Database:
     def GetObj(self, obj_type, obj_id=None, page=None, page_size=None):
         self.logTool.log(service='Database', level='debug', message="Called GetObj for type " + str(obj_type), redisClient=self.redisMessaging)
 
-        Base.metadata.create_all(self.engine)
         Session = sessionmaker(bind=self.engine)
         session = Session()
 
@@ -1123,7 +1117,6 @@ class Database:
     def GetAll(self, obj_type):
         self.logTool.log(service='Database', level='debug', message="Called GetAll for type " + str(obj_type), redisClient=self.redisMessaging)
 
-        Base.metadata.create_all(self.engine)
         Session = sessionmaker(bind = self.engine)
         session = Session()
         final_result_list = []
@@ -1149,7 +1142,6 @@ class Database:
         self.logTool.log(service='Database', level='debug', message="Called getAllPaginated for type " + str(obj_type), redisClient=self.redisMessaging)
 
         if not existingSession:
-            Base.metadata.create_all(self.engine)
             Session = sessionmaker(bind=self.engine)
             session = Session()
         else:
@@ -1186,7 +1178,6 @@ class Database:
     def GetAllByTable(self, obj_type, table):
         self.logTool.log(service='Database', level='debug', message=f"Called GetAll for type {str(obj_type)} and table {table}", redisClient=self.redisMessaging)
 
-        Base.metadata.create_all(self.engine)
         Session = sessionmaker(bind = self.engine)
         session = Session()
         final_result_list = []
@@ -1578,6 +1569,138 @@ class Database:
         self.safe_close(session)
         return Served_Subs
 
+
+    def Count_Served_IMS_Subscribers(self):
+        """Number of IMS subscribers with a serving S-CSCF, without loading the rows."""
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        try:
+            return session.query(func.count(IMS_SUBSCRIBER.ims_subscriber_id)).filter(
+                IMS_SUBSCRIBER.scscf.isnot(None)).scalar()
+        except Exception as E:
+            raise ValueError(E)
+        finally:
+            self.safe_close(session)
+
+    @staticmethod
+    def identity_range(start, count):
+        """First and last identity of ``count`` consecutive, equally long, digit-only
+        identities (IMSI or MSISDN) beginning at ``start``."""
+        start = str(start)
+        if not start.isdigit():
+            raise ValueError(f"identity must be digits only, got '{start}'")
+        if int(count) < 1:
+            raise ValueError("count must be at least 1")
+        last = str(int(start) + int(count) - 1).zfill(len(start))
+        if len(last) != len(start):
+            raise ValueError(f"{count} identities starting at {start} do not fit {len(start)} digits")
+        return start, last
+
+    @staticmethod
+    def _in_identity_range(column, first, last):
+        # Equal length makes the string comparison a numeric one.
+        return sqlalchemy.and_(column.between(first, last), func.length(column) == len(first))
+
+    def Bulk_Create_Subscribers(self, imsi_start, msisdn_start, count, auc, subscriber, ims_subscriber):
+        """Create ``count`` consecutive subscribers (AuC + subscriber + IMS subscriber)
+        in one transaction: either all of them exist afterwards or none.
+
+        ``auc``, ``subscriber`` and ``ims_subscriber`` hold the column values shared
+        by every row. Bypasses the operation log, webhooks, geored and ENUM, which
+        work per row and are what makes single creates slow; meant for test ranges.
+        """
+        count = int(count)
+        imsi_first, imsi_last = self.identity_range(imsi_start, count)
+        msisdn_first, _ = self.identity_range(msisdn_start, count)
+        for model, values in ((AUC, auc), (SUBSCRIBER, subscriber), (IMS_SUBSCRIBER, ims_subscriber)):
+            per_row = {model.__table__.primary_key.columns.keys()[0], 'imsi', 'msisdn', 'msisdn_list', 'auc_id', 'iccid'}
+            invalid = [key for key in values if key not in model.__table__.columns or key in per_row]
+            if invalid:
+                raise ValueError(f"{model.__tablename__}: not a shared column: {', '.join(invalid)}")
+
+        imsis = [str(int(imsi_first) + i).zfill(len(imsi_first)) for i in range(count)]
+        msisdns = [str(int(msisdn_first) + i).zfill(len(msisdn_first)) for i in range(count)]
+        last_modified = datetime.datetime.now(tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+
+        def ids(model, key):
+            rows = session.execute(select(model.imsi, key).where(self._in_identity_range(model.imsi, imsi_first, imsi_last)))
+            return dict(rows.all())
+
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        try:
+            session.execute(sqlalchemy.insert(AUC), [
+                dict(auc, imsi=imsi, last_modified=last_modified) for imsi in imsis])
+            auc_ids = ids(AUC, AUC.auc_id)
+            session.execute(sqlalchemy.insert(SUBSCRIBER), [
+                dict(subscriber, imsi=imsi, msisdn=msisdn, auc_id=auc_ids[imsi], last_modified=last_modified)
+                for imsi, msisdn in zip(imsis, msisdns)])
+            session.execute(sqlalchemy.insert(IMS_SUBSCRIBER), [
+                dict(ims_subscriber, imsi=imsi, msisdn=msisdn, msisdn_list=msisdn, last_modified=last_modified)
+                for imsi, msisdn in zip(imsis, msisdns)])
+            subscriber_ids = ids(SUBSCRIBER, SUBSCRIBER.subscriber_id)
+            ims_subscriber_ids = ids(IMS_SUBSCRIBER, IMS_SUBSCRIBER.ims_subscriber_id)
+            session.commit()
+        except Exception as E:
+            self.safe_rollback(session)
+            raise ValueError(E)
+        finally:
+            self.safe_close(session)
+
+        return [{'imsi': imsi, 'msisdn': msisdn, 'auc_id': auc_ids[imsi],
+                 'subscriber_id': subscriber_ids[imsi], 'ims_subscriber_id': ims_subscriber_ids[imsi]}
+                for imsi, msisdn in zip(imsis, msisdns)]
+
+    def Bulk_Count_Subscribers(self, imsi_start, count):
+        """Rows per table inside the IMSI range."""
+        first, last = self.identity_range(imsi_start, count)
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        try:
+            return {
+                model.__tablename__: session.query(func.count()).select_from(model).filter(
+                    self._in_identity_range(model.imsi, first, last)).scalar()
+                for model in (AUC, SUBSCRIBER, IMS_SUBSCRIBER)
+            }
+        except Exception as E:
+            raise ValueError(E)
+        finally:
+            self.safe_close(session)
+
+    def Bulk_Delete_Subscribers(self, imsi_start, count):
+        """Delete every AuC, subscriber and IMS subscriber row inside the IMSI range
+        in one transaction and return the rows deleted per table.
+
+        Like Bulk_Create_Subscribers this bypasses the operation log, webhooks,
+        geored and ENUM, and it does not deregister anything from the network:
+        the caller deregisters subscribers that are still attached first.
+        """
+        # SPEC-DEVIATION: TS 29.228 6.1.3 / TS 29.272 5.2.2.1 -- removing a
+        # subscription should trigger Cx RTR and S6a CLR; a range delete sends
+        # neither, the caller uses /oam/deregister/<imsi> for attached subscribers.
+        first, last = self.identity_range(imsi_start, count)
+        operation_log = OPERATION_LOG_BASE.__table__
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        deleted = {}
+        try:
+            # Children first: ims_subscriber and subscriber reference the AuC row.
+            for model in (IMS_SUBSCRIBER, SUBSCRIBER, AUC):
+                in_range = self._in_identity_range(model.imsi, first, last)
+                key = model.__table__.primary_key.columns.values()[0]
+                # Operation log rows keep their history but lose the reference,
+                # as the ORM does on a single delete.
+                session.execute(operation_log.update()
+                                .where(operation_log.c[key.name].in_(select(key).where(in_range)))
+                                .values({key.name: None}))
+                deleted[model.__tablename__] = session.execute(model.__table__.delete().where(in_range)).rowcount
+            session.commit()
+        except Exception as E:
+            self.safe_rollback(session)
+            raise ValueError(E)
+        finally:
+            self.safe_close(session)
+        return deleted
 
     def Get_Served_PCRF_Subscribers(self, get_local_users_only=False):
         self.logTool.log(service='Database', level='debug', message="Getting all subscribers served by this PCRF", redisClient=self.redisMessaging)

@@ -315,6 +315,12 @@ paginatorParser = reqparse.RequestParser()
 paginatorParser.add_argument('page', type=int, required=False, default=0, help='Page number for pagination')
 paginatorParser.add_argument('page_size', type=int, required=False, default=config['api'].get('page_size', 100), help='Number of items per page for pagination')
 
+# Rows per bulk request: one request is one database transaction.
+BULK_SUBSCRIBERS_MAX = 50000
+bulkRangeParser = reqparse.RequestParser()
+bulkRangeParser.add_argument('imsi_start', type=str, required=True, location='args', help='First IMSI of the range')
+bulkRangeParser.add_argument('count', type=int, required=True, location='args', help='Number of consecutive IMSIs')
+
 APN_model = api.schema_model('APN JSON', 
     databaseClient.Generate_JSON_Model_for_Flask(APN)
 )
@@ -1747,6 +1753,69 @@ class PyHSS_OAM_Serving_Subs_IMS(Resource):
         try:
             data = databaseClient.Get_Served_IMS_Subscribers()
             return data, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_oam.route('/serving_subs_ims/count')
+class PyHSS_OAM_Serving_Subs_IMS_Count(Resource):
+    def get(self):
+        '''Get the number of Subscribers served by IMS'''
+        try:
+            return {'count': databaseClient.Count_Served_IMS_Subscribers()}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_oam.route('/bulk/subscribers')
+class PyHSS_OAM_Bulk_Subscribers(Resource):
+    @ns_oam.expect(bulkRangeParser)
+    def get(self):
+        '''Count the AuC, Subscriber and IMS Subscriber rows inside an IMSI range'''
+        try:
+            args = bulkRangeParser.parse_args()
+            return databaseClient.Bulk_Count_Subscribers(args['imsi_start'], args['count']), 200
+        except ValueError as E:
+            return {'result': 'Failed', 'reason': str(E)}, 400
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+    def put(self):
+        '''Create consecutive subscribers (AuC + Subscriber + IMS Subscriber) in one transaction'''
+        try:
+            json_data = request.get_json(force=True)
+            count = int(json_data.get('count', 0))
+            if count > BULK_SUBSCRIBERS_MAX:
+                return {'result': 'Failed', 'reason': f'count exceeds {BULK_SUBSCRIBERS_MAX} per request'}, 400
+            msisdn_start = str(json_data.get('msisdn_start', '')).strip()
+            if not E164_MSISDN_PATTERN.match(msisdn_start):
+                return {'result': 'Failed', 'reason': "msisdn_start must be a global E.164 number with leading '+'"}, 400
+            data = databaseClient.Bulk_Create_Subscribers(
+                imsi_start=json_data.get('imsi_start', ''),
+                msisdn_start=msisdn_start[1:],
+                count=count,
+                auc=json_data.get('auc') or {},
+                subscriber=json_data.get('subscriber') or {},
+                ims_subscriber=json_data.get('ims_subscriber') or {},
+            )
+            return {'created': len(data), 'subscribers': data}, 200
+        except ValueError as E:
+            return {'result': 'Failed', 'reason': str(E)}, 400
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+    @ns_oam.expect(bulkRangeParser)
+    def delete(self):
+        '''Delete every AuC, Subscriber and IMS Subscriber row inside an IMSI range (no network deregistration)'''
+        try:
+            args = bulkRangeParser.parse_args()
+            if args['count'] > BULK_SUBSCRIBERS_MAX:
+                return {'result': 'Failed', 'reason': f'count exceeds {BULK_SUBSCRIBERS_MAX} per request'}, 400
+            return {'deleted': databaseClient.Bulk_Delete_Subscribers(args['imsi_start'], args['count'])}, 200
+        except ValueError as E:
+            return {'result': 'Failed', 'reason': str(E)}, 400
         except Exception as E:
             print(E)
             return handle_exception(E)

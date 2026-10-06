@@ -7,7 +7,7 @@ import sys, os, json
 import time, uuid
 from datetime import datetime
 from tzlocal import get_localzone
-import sctp, socket
+import sctp, socket, struct
 
 sys.path.append(os.path.realpath(os.path.dirname(__file__) + "/../lib"))
 
@@ -307,31 +307,32 @@ class DiameterService:
 
     async def inboundDataWorker(self, coroutineUuid: str) -> bool:
         """
-        Collects messages from the memory queue, performs peer validation and fires off to redis every 0.01 seconds.
+        Collects messages from the memory queue, performs peer validation and fires them off to redis.
+        Waits for the first message, then takes whatever else is already queued, so a single request is
+        forwarded immediately and a burst still goes out as one batch. A fixed collection window
+        (formerly 100 ms) added up to that much latency to every Diameter answer.
         """
-        batchInterval = 0.1
+        batchMaxSize = 100
         inboundQueueName = f"diameter-inbound"
         while True:
             try:
-                nextSendTime = time.time() + batchInterval
                 messageList = []
-                while time.time() < nextSendTime:
-                    try:
-                        inboundData = await(asyncio.wait_for(self.sharedQueue.get(), timeout=nextSendTime - time.time()))
+                pendingList = [await(self.sharedQueue.get())]
+                while not self.sharedQueue.empty() and len(pendingList) < batchMaxSize:
+                    pendingList.append(self.sharedQueue.get_nowait())
 
-                        if len(self.activePeers.get(f'{inboundData.SenderIp}-{inboundData.SenderPort}', {}).Metadata) == 0:
-                            if not await(self.validateDiameterInbound(inboundData.SenderIp, inboundData.SenderPort, inboundData.InboundHex)):
-                                await(self.logTool.logAsync(service='Diameter', level='warning', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Invalid Diameter Inbound, discarding data."))
-                                continue
-                            else:
-                                await(self.logTool.logAsync(service='Diameter', level='info', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Validated peer: {inboundData.SenderIp} on port {inboundData.SenderPort}"))
+                for inboundData in pendingList:
+                    if len(self.activePeers.get(f'{inboundData.SenderIp}-{inboundData.SenderPort}', {}).Metadata) == 0:
+                        if not await(self.validateDiameterInbound(inboundData.SenderIp, inboundData.SenderPort, inboundData.InboundHex)):
+                            await(self.logTool.logAsync(service='Diameter', level='warning', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Invalid Diameter Inbound, discarding data."))
+                            continue
+                        else:
+                            await(self.logTool.logAsync(service='Diameter', level='info', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Validated peer: {inboundData.SenderIp} on port {inboundData.SenderPort}"))
 
-                        await(self.logTool.logAsync(service='Diameter', level='debug', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Queueing to redis: {inboundData}"))
-                        messageList.append(inboundData.model_dump_json())
-                        if self.benchmarking:
-                            self.diameterRequests += 1
-                    except asyncio.TimeoutError:
-                        break
+                    await(self.logTool.logAsync(service='Diameter', level='debug', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Queueing to redis: {inboundData}"))
+                    messageList.append(inboundData.model_dump_json())
+                    if self.benchmarking:
+                        self.diameterRequests += 1
 
                 if messageList:
                     await self.redisReaderMessaging.sendBulkMessage(queue=inboundQueueName, messageList=messageList, queueExpiry=self.diameterRequestTimeout, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
@@ -401,6 +402,12 @@ class DiameterService:
                                                                      Connected=True)
 
             await(self.logActivePeers())
+
+            # drain() then waits until everything written is sent, so each Diameter message goes out in
+            # its own send(). With the default limit, messages written while the socket is not writable
+            # are joined in asyncio's buffer and would leave as one SCTP message, which a peer that takes
+            # one Diameter message per SCTP message cannot parse.
+            writer.transport.set_write_buffer_limits(high=0)
 
             readTask = asyncio.create_task(self.readInboundData(reader=reader, clientAddress=clientAddress, clientPort=clientPort, socketTimeout=self.socketTimeout, coroutineUuid=coroutineUuid))
             writeTask = asyncio.create_task(self.writeOutboundData(writer=writer, clientAddress=clientAddress, clientPort=clientPort, socketTimeout=self.socketTimeout, coroutineUuid=coroutineUuid))
@@ -480,6 +487,15 @@ class DiameterService:
                 self.sctpRtoInfo.max = int(self.sctpRtoMax)
                 self.sctpRtoInfo.min = int(self.sctpRtoMin)
                 self.sctpSocket.set_rtoinfo(self.sctpRtoInfo)
+                # Accepted associations inherit both options below from the listening socket.
+                # Nagle off (RFC 3539 3.2: not used with SCTP): with it on, an answer sent while the
+                # peer still delays its SACK for the previous one (200 ms on Linux) waits for that SACK.
+                self.sctpSocket.set_nodelay(1)
+                # Payload protocol identifier 46, Diameter in clear text (RFC 6733 2.1.1), as the default
+                # of every send: asyncio writes with plain send(), which would otherwise use PPID 0.
+                # struct sctp_sndrcvinfo: stream, ssn, flags, ppid (network order), context, ttl, tsn, cumtsn, assoc_id
+                self.sctpSocket.setsockopt(socket.IPPROTO_SCTP, 10,  # SCTP_DEFAULT_SEND_PARAM
+                                           struct.pack("=HHH2xIIIIIi", 0, 0, 0, socket.htonl(46), 0, 0, 0, 0, 0))
                 self.sctpAssociatedParameters = self.sctpSocket.get_assocparams()
                 sctpInitParameters = {
                     "initialRto": self.sctpRtoInfo.initial,
