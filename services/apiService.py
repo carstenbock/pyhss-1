@@ -30,6 +30,7 @@ import database
 from network_control import (
     send_clr,
     push_clr_and_relay,
+    purge_subscriber_state_and_relay,
     teardown_subscriber,
     push_ims_profile,
     ims_profile_push_fields_changed,
@@ -429,6 +430,7 @@ GeoRed_model = api.model('GeoRed', {
     'scscf_realm' : fields.String(description=IMS_SUBSCRIBER.scscf_realm.doc),
     'scscf_peer' : fields.String(description=IMS_SUBSCRIBER.scscf_peer.doc),
     'scscf_timestamp' : fields.String(description=IMS_SUBSCRIBER.scscf_timestamp.doc),
+    'scscf_state' : fields.Integer(description=IMS_SUBSCRIBER.scscf_state.doc),
     'xcap_profile' : fields.String(description=IMS_SUBSCRIBER.xcap_profile.doc),
     'imei' : fields.String(description=EIR.imei.doc),
     'match_response_code' : fields.String(description=EIR.match_response_code.doc),
@@ -772,6 +774,7 @@ class PyHSS_SUBSCRIBER_Get(Resource):
             if imsi:
                 warnings = teardown_subscriber_and_relay(imsi, ['pcrf', 'epc', 'ims', 'swx'])
             data = databaseClient.DeleteObj(SUBSCRIBER, subscriber_id, False, operation_id)
+            purge_subscriber_state_and_relay(diameterClient, relay_to_diameter_nodes, subscriber_ids=[subscriber_id], log_tool=logTool, redis_messaging=redisMessaging)
             if warnings:
                 data = dict(data) if isinstance(data, dict) else {'result': data}
                 data['warnings'] = warnings
@@ -956,6 +959,7 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.DeleteObj(IMS_SUBSCRIBER, ims_subscriber_id, False, operation_id)
+            purge_subscriber_state_and_relay(diameterClient, relay_to_diameter_nodes, ims_subscriber_ids=[ims_subscriber_id], log_tool=logTool, redis_messaging=redisMessaging)
 
             # Delete ENUM entries after subscriber deletion
             try:
@@ -1762,7 +1766,8 @@ class PyHSS_OAM_Serving_Subs_IMS_Count(Resource):
     def get(self):
         '''Get the number of Subscribers served by IMS'''
         try:
-            return {'count': databaseClient.Count_Served_IMS_Subscribers()}, 200
+            return {'count': databaseClient.Count_Served_IMS_Subscribers(),
+                    'unregistered': databaseClient.Count_Unregistered_IMS_Subscribers()}, 200
         except Exception as E:
             print(E)
             return handle_exception(E)
@@ -1813,7 +1818,10 @@ class PyHSS_OAM_Bulk_Subscribers(Resource):
             args = bulkRangeParser.parse_args()
             if args['count'] > BULK_SUBSCRIBERS_MAX:
                 return {'result': 'Failed', 'reason': f'count exceeds {BULK_SUBSCRIBERS_MAX} per request'}, 400
-            return {'deleted': databaseClient.Bulk_Delete_Subscribers(args['imsi_start'], args['count'])}, 200
+            ids = databaseClient.Bulk_Subscriber_Ids(args['imsi_start'], args['count'])
+            deleted = databaseClient.Bulk_Delete_Subscribers(args['imsi_start'], args['count'])
+            purge_subscriber_state_and_relay(diameterClient, relay_to_diameter_nodes, log_tool=logTool, redis_messaging=redisMessaging, **ids)
+            return {'deleted': deleted}, 200
         except ValueError as E:
             return {'result': 'Failed', 'reason': str(E)}, 400
         except Exception as E:
@@ -2464,6 +2472,23 @@ class PyHSS_Geored_Push_Ifc_Template(Resource):
             print(E)
             return handle_exception(E)
 
+@ns_geored.route('/purge_subscriber_state')
+class PyHSS_Geored_Purge_Subscriber_State(Resource):
+    @ns_geored.doc('Remove the Sh and Rx subscription state of deleted subscribers from this node')
+    @no_auth_required
+    def post(self):
+        '''Delete the Sh and Rx subscription keys of the given subscriber / IMS subscriber ids from this node's Redis (no further relay)'''
+        try:
+            json_data = request.get_json(force=True)
+            deleted = diameterClient.purge_subscriber_state(
+                subscriber_ids=json_data.get('subscriber_ids') or [],
+                ims_subscriber_ids=json_data.get('ims_subscriber_ids') or [],
+            )
+            return {'result': 'OK', 'deleted': deleted, 'node': originHostname}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
 @ns_geored.route('/rx_terminate_af_subscriptions')
 class PyHSS_Geored_Rx_Terminate_Af_Subscriptions(Resource):
     @ns_geored.doc('Receive a Gx CCR-T termination relay and abort matching Rx AF subscriptions')
@@ -2591,7 +2616,9 @@ class PyHSS_Geored(Resource):
                     json_data['scscf_peer'] = None
                 if 'scscf_timestamp' not in json_data:
                     json_data['scscf_timestamp'] = None
-                response_data.append(databaseClient.Update_Serving_CSCF(imsi=str(json_data['imsi']), serving_cscf=json_data['scscf'], scscf_realm=json_data['scscf_realm'], scscf_peer=json_data['scscf_peer'], scscf_timestamp=json_data['scscf_timestamp'], propagate=False))
+                # scscf_state is absent in an update from a node older than schema
+                # version 6; Update_Serving_CSCF then stores Registered with an S-CSCF.
+                response_data.append(databaseClient.Update_Serving_CSCF(imsi=str(json_data['imsi']), serving_cscf=json_data['scscf'], scscf_realm=json_data['scscf_realm'], scscf_peer=json_data['scscf_peer'], scscf_timestamp=json_data['scscf_timestamp'], propagate=False, scscf_state=json_data.get('scscf_state')))
                 redisMessaging.sendMetric(serviceName='api', metricName='prom_flask_http_geored_endpoints',
                                     metricType='counter', metricAction='inc', 
                                     metricValue=1.0, metricHelp='Number of Geored Pushes Received',

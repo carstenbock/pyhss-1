@@ -7,7 +7,7 @@
 from typing import Optional
 
 import sqlalchemy
-from sqlalchemy import Column, Integer, String, MetaData, Table, Boolean, ForeignKey, select, UniqueConstraint, DateTime, BigInteger, Text, DateTime, Float
+from sqlalchemy import Column, Integer, SmallInteger, String, MetaData, Table, Boolean, ForeignKey, select, UniqueConstraint, DateTime, BigInteger, Text, DateTime, Float
 from sqlalchemy import create_engine
 from sqlalchemy.sql import desc, func
 from sqlalchemy.orm import sessionmaker, relationship, Session, class_mapper
@@ -188,7 +188,7 @@ class IMS_SUBSCRIBER(Base):
     ifc_template_id = Column(Integer, ForeignKey('ifc_template.ifc_template_id'), doc='Reference to IFC Template in database')
     pcscf = Column(String(512), doc='Proxy-CSCF serving this subscriber')
     pcscf_realm = Column(String(512), doc='Realm of PCSCF')
-    pcscf_active_session = Column(String(512), doc='Session Id for the PCSCF when in a call')
+    pcscf_active_session = Column(String(512), index=True, doc='Session Id for the PCSCF when in a call')
     pcscf_timestamp = Column(DateTime, doc='Timestamp of last ue attach to PCSCF')
     pcscf_peer = Column(String(512), doc='Diameter peer used to reach PCSCF')
     # Conditional column definition based on the database type
@@ -202,11 +202,30 @@ class IMS_SUBSCRIBER(Base):
     scscf_timestamp = Column(DateTime, doc='Timestamp of last ue attach to SCSCF')
     scscf_realm = Column(String(512), doc='Realm of SCSCF')
     scscf_peer = Column(String(512), doc='Diameter peer used to reach SCSCF')
+    scscf_state = Column(SmallInteger, doc='Cx registration state (TS 29.228): 0=Not Registered, 1=Registered, 2=Unregistered (S-CSCF assigned for unregistered services). NULL with scscf set means Registered', nullable=True)
     sh_template_path = Column(String(512), doc='Path to template file for the Sh Profile')
     stn_sr = Column(String(64), doc='Session Transfer Number for SRVCC (TS 23.003)', nullable=True)
     ue_srvcc_capability = Column(Integer, doc='UE SRVCC Capability (TS 29.328 7.6.17): 0=not-supported, 1=supported', nullable=True)
     last_modified = Column(String(100), default=datetime.datetime.now(tz=timezone.utc), doc='Timestamp of last modification')
     operation_logs = relationship("IMS_SUBSCRIBER_OPERATION_LOG", back_populates="ims_subscriber")
+
+# Cx registration states of an IMS subscriber (TS 29.228 section 6.1.2).
+IMS_NOT_REGISTERED = 0
+IMS_REGISTERED = 1
+IMS_UNREGISTERED = 2
+
+def ims_registration_state(ims_subscriber) -> int:
+    """Cx registration state of an IMS subscriber row (dict).
+
+    The S-CSCF name decides between "Not Registered" and the two states that
+    have one; scscf_state only tells those two apart. A row written before the
+    column existed, or by a node that does not know it, has no state: with an
+    S-CSCF it is Registered, which is what such a node means by storing one."""
+    if not ims_subscriber.get('scscf'):
+        return IMS_NOT_REGISTERED
+    if ims_subscriber.get('scscf_state') == IMS_UNREGISTERED:
+        return IMS_UNREGISTERED
+    return IMS_REGISTERED
 
 class ROAMING_NETWORK(Base):
     __tablename__ = 'roaming_network'
@@ -1571,12 +1590,30 @@ class Database:
 
 
     def Count_Served_IMS_Subscribers(self):
-        """Number of IMS subscribers with a serving S-CSCF, without loading the rows."""
+        """Number of IMS-registered subscribers, without loading the rows. A
+        subscriber that only has an S-CSCF assigned for unregistered services
+        (Cx state Unregistered) is not registered."""
         Session = sessionmaker(bind=self.engine)
         session = Session()
         try:
             return session.query(func.count(IMS_SUBSCRIBER.ims_subscriber_id)).filter(
-                IMS_SUBSCRIBER.scscf.isnot(None)).scalar()
+                IMS_SUBSCRIBER.scscf.isnot(None),
+                sqlalchemy.or_(IMS_SUBSCRIBER.scscf_state.is_(None),
+                               IMS_SUBSCRIBER.scscf_state != IMS_UNREGISTERED)).scalar()
+        except Exception as E:
+            raise ValueError(E)
+        finally:
+            self.safe_close(session)
+
+    def Count_Unregistered_IMS_Subscribers(self):
+        """Number of IMS subscribers in Cx state Unregistered: not registered,
+        with an S-CSCF assigned for their unregistered services."""
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        try:
+            return session.query(func.count(IMS_SUBSCRIBER.ims_subscriber_id)).filter(
+                IMS_SUBSCRIBER.scscf.isnot(None),
+                IMS_SUBSCRIBER.scscf_state == IMS_UNREGISTERED).scalar()
         except Exception as E:
             raise ValueError(E)
         finally:
@@ -1661,6 +1698,25 @@ class Database:
                 model.__tablename__: session.query(func.count()).select_from(model).filter(
                     self._in_identity_range(model.imsi, first, last)).scalar()
                 for model in (AUC, SUBSCRIBER, IMS_SUBSCRIBER)
+            }
+        except Exception as E:
+            raise ValueError(E)
+        finally:
+            self.safe_close(session)
+
+    def Bulk_Subscriber_Ids(self, imsi_start, count):
+        """Subscriber and IMS subscriber ids inside the IMSI range. Per-subscriber
+        state outside the database is keyed by them, so a range delete reads
+        them before the rows are gone."""
+        first, last = self.identity_range(imsi_start, count)
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        try:
+            return {
+                'subscriber_ids': [row[0] for row in session.query(SUBSCRIBER.subscriber_id).filter(
+                    self._in_identity_range(SUBSCRIBER.imsi, first, last))],
+                'ims_subscriber_ids': [row[0] for row in session.query(IMS_SUBSCRIBER.ims_subscriber_id).filter(
+                    self._in_identity_range(IMS_SUBSCRIBER.imsi, first, last))],
             }
         except Exception as E:
             raise ValueError(E)
@@ -2147,42 +2203,60 @@ class Database:
         finally:
             self.safe_close(session)
 
-    def Update_Serving_CSCF(self, imsi, serving_cscf, scscf_realm=None, scscf_peer=None, scscf_timestamp=None, propagate=True):
+    def Update_Serving_CSCF(self, imsi, serving_cscf, scscf_realm=None, scscf_peer=None, scscf_timestamp=None, propagate=True, scscf_state=None):
+        """Store or clear the S-CSCF of an IMS subscriber together with its Cx
+        registration state.
+
+        scscf_state is IMS_REGISTERED or IMS_UNREGISTERED when an S-CSCF is
+        stored (default IMS_REGISTERED); without an S-CSCF the state is
+        IMS_NOT_REGISTERED. scscf_timestamp is the time of the change at the
+        node that made it and is only passed for a geored update: an update
+        older than what this node holds is dropped (last writer wins), since
+        updates of different Diameter nodes arrive in no particular order.
+        Returns False when the update was dropped for that reason."""
         self.logTool.log(service='Database', level='debug', message="Update_Serving_CSCF for sub " + str(imsi) + " to SCSCF " + str(serving_cscf) + " with realm " + str(scscf_realm) + " and peer " + str(scscf_peer), redisClient=self.redisMessaging)
         Session = sessionmaker(bind = self.engine)
         session = Session()
 
         try:
             result = session.query(IMS_SUBSCRIBER).filter_by(imsi=imsi).one()
-            try:
-                assert(type(serving_cscf) == str)
-                assert(len(serving_cscf) > 0)
+
+            change_time = None
+            if scscf_timestamp != None and scscf_timestamp != 'None':
+                try:
+                    change_time = datetime.datetime.strptime(scscf_timestamp, '%Y-%m-%dT%H:%M:%SZ')
+                except Exception as e:
+                    self.logTool.log(service='Database', level='debug', message="Update_Serving_CSCF: unusable scscf_timestamp " + str(scscf_timestamp) + ": " + str(e), redisClient=self.redisMessaging)
+            if change_time is not None and result.scscf_timestamp is not None \
+                    and change_time < result.scscf_timestamp.replace(tzinfo=None):
+                self.logTool.log(service='Database', level='info', message="Update_Serving_CSCF for sub " + str(imsi) + ": dropping update of " + str(scscf_timestamp) + ", local state is newer (" + str(result.scscf_timestamp) + ")", redisClient=self.redisMessaging)
+                return False
+            if change_time is None:
+                # Stored without microseconds: the geored message carries whole
+                # seconds, and the comparison above must see the same value on
+                # every node.
+                change_time = datetime.datetime.now(tz=timezone.utc).replace(tzinfo=None, microsecond=0)
+            scscf_timestamp_string = change_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+            if type(serving_cscf) == str and len(serving_cscf) > 0:
                 self.logTool.log(service='Database', level='debug', message="Setting serving CSCF", redisClient=self.redisMessaging)
                 #Strip duplicate SIP prefix before storing
                 serving_cscf = serving_cscf.replace("sip:sip:", "sip:")
                 result.scscf = serving_cscf
-                try:
-                    if scscf_timestamp != None and scscf_timestamp != 'None':
-                        result.scscf_timestamp = datetime.strptime(scscf_timestamp, '%Y-%m-%dT%H:%M:%SZ')
-                        result.scscf_timestamp = result.scscf_timestamp.replace(tzinfo=timezone.utc)
-                        scscf_timestamp_string = result.scscf_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
-                    else:
-                        result.scscf_timestamp = datetime.datetime.now(tz=timezone.utc)
-                        scscf_timestamp_string = result.scscf_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
-                except Exception as e:
-                    result.scscf_timestamp = datetime.datetime.now(tz=timezone.utc)
-                    scscf_timestamp_string = result.scscf_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
                 result.scscf_realm = scscf_realm
                 result.scscf_peer = str(scscf_peer)
-            except:
+                result.scscf_state = IMS_UNREGISTERED if scscf_state == IMS_UNREGISTERED else IMS_REGISTERED
+            else:
                 #Clear values
                 self.logTool.log(service='Database', level='debug', message="Clearing serving CSCF", redisClient=self.redisMessaging)
                 result.scscf = None
-                result.scscf_timestamp = None
                 result.scscf_realm = None
                 result.scscf_peer = None
-                scscf_timestamp_string = datetime.datetime.now(tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-            
+                result.scscf_state = IMS_NOT_REGISTERED
+            # Kept when the S-CSCF is cleared: it is the time of the last state
+            # change, which the geored ordering above depends on.
+            result.scscf_timestamp = change_time
+
             session.commit()
             objectData = self.GetObj(IMS_SUBSCRIBER, result.ims_subscriber_id)
             self.handleWebhook(objectData, 'PATCH')
@@ -2191,9 +2265,10 @@ class Database:
             if propagate == True:
                 if 'IMS' in config['geored']['sync_actions'] and self.georedEnabled == True:
                     self.logTool.log(service='Database', level='debug', message="Propagate IMS changes to Geographic PyHSS instances", redisClient=self.redisMessaging)
-                    self.handleGeored({"imsi": str(imsi), "scscf": result.scscf, "scscf_realm": result.scscf_realm, "scscf_timestamp": scscf_timestamp_string, "scscf_peer": result.scscf_peer})
+                    self.handleGeored({"imsi": str(imsi), "scscf": result.scscf, "scscf_realm": result.scscf_realm, "scscf_timestamp": scscf_timestamp_string, "scscf_peer": result.scscf_peer, "scscf_state": result.scscf_state})
                 else:
                     self.logTool.log(service='Database', level='debug', message="Config does not allow sync of IMS events", redisClient=self.redisMessaging)
+            return True
         except Exception as E:
             self.logTool.log(service='Database', level='error', message="An error occurred, rolling back session: " + str(E), redisClient=self.redisMessaging)
             self.safe_rollback(session)

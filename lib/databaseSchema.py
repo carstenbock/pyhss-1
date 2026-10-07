@@ -8,7 +8,7 @@ from sqlalchemy_utils import database_exists, create_database
 
 
 class DatabaseSchema:
-    latest = 5
+    latest = 6
 
     def __init__(self, logTool, base, engine: Engine, main_service: bool):
         self.logTool = logTool
@@ -189,7 +189,11 @@ class DatabaseSchema:
             # https://www.postgresql.org/docs/current/datatype-datetime.html
             typename = "TIMESTAMP"
 
-        self.execute(f"ALTER TABLE {table} ADD {column} {typename}")
+        # MySQL and SQLite have no ADD COLUMN IF NOT EXISTS. Elsewhere it keeps the
+        # replicated statement harmless on a replica that added the column itself.
+        is_mysql = self.engine.name == "mysql" and not self.engine.dialect.is_mariadb
+        guard = "" if is_mysql or self.engine.name == "sqlite" else "IF NOT EXISTS "
+        self.execute(f"ALTER TABLE {table} ADD COLUMN {guard}{column} {typename}")
 
     def upgrade_from_20240603_release_1_0_1(self):
         if self.get_version() >= 1:
@@ -264,9 +268,24 @@ class DatabaseSchema:
         self.add_index("subscriber", "msisdn")
         self.set_version(5)
 
+    def upgrade_add_scscf_state(self):
+        if self.get_version() >= 6:
+            return
+        self.upgrade_msg(6)
+        # Cx registration state (TS 29.228 section 6.1.2). Existing rows keep
+        # NULL, which reads as Registered when an S-CSCF is stored, so no row
+        # has to be rewritten.
+        self.add_column("ims_subscriber", "scscf_state", "SMALLINT")
+        # Every Rx STR looks the IMS subscriber up by its P-CSCF session id
+        # (Get_IMS_Subscriber_By_Session_Id); without an index that is a table
+        # scan per de-registration. add_index() tolerates an existing index.
+        self.add_index("ims_subscriber", "pcscf_active_session")
+        self.set_version(6)
+
     def upgrade_all(self):
         self.upgrade_from_20240603_release_1_0_1()
         self.upgrade_add_ifc_template()
         self.upgrade_add_apn_list_swx()
         self.upgrade_add_sh_srvcc_columns()
         self.upgrade_add_lookup_indexes()
+        self.upgrade_add_scscf_state()

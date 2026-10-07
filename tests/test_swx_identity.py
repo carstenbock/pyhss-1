@@ -34,3 +34,56 @@ class SwxIdentityTest(TestCase):
 
     def test_username_without_realm_is_the_imsi(self):
         self.assertEqual(IMSI, Diameter.imsi_from_eap_nai(IMSI))
+
+
+class EapAkaPrimeKeysTest(TestCase):
+    """For EAP-AKA' the SWx answer carries CK' and IK', not CK and IK (TS 33.402
+    section 6.2). The UE derives the same pair from its USIM; if the HSS hands
+    out anything else, AT_MAC of the challenge fails on the UE and the attach
+    is over. Vectors: RFC 5448 Appendix C."""
+
+    CK = bytes.fromhex("5349fbe098649f948f5d2e973a81c00f")
+    IK = bytes.fromhex("9744871ad32bf9bbd1dd5ce54e3e2e5a")
+    AUTN = bytes.fromhex("bb52e91c747ac3ab2a5c23d15ee351d5")
+
+    def test_rfc5448_case_1(self):
+        ck_prime, ik_prime = Diameter.eap_aka_prime_ck_ik(self.CK, self.IK, b"WLAN", self.AUTN)
+        self.assertEqual("0093962d0dd84aa5684b045c9edffa04", ck_prime.hex())
+        self.assertEqual("ccfc230ca74fcc96c0a5d61164f5a76c", ik_prime.hex())
+
+    def test_keys_depend_on_the_access_network(self):
+        # Case 2: same vector, other network name. A vector issued for one
+        # access network must be useless in another.
+        ck_prime, ik_prime = Diameter.eap_aka_prime_ck_ik(self.CK, self.IK, b"HRPD", self.AUTN)
+        self.assertEqual("3820f0277fa5f77732b1fb1d90c1a0da", ck_prime.hex())
+        self.assertEqual("db94a0ab557ef6c9ab48619ca05b9a9f", ik_prime.hex())
+
+
+class ForeignPlmnTest(TestCase):
+    """roaming_enabled and the roaming rules only apply to a subscriber the
+    HSS recognises as roaming. A PLMN is MCC plus MNC: a visited network that
+    shares only one of them with home is still another operator's network, and
+    treating it as home let barred subscribers attach there."""
+
+    class _Home:
+        MCC = "262"
+        MNC = "24"
+        is_foreign_plmn = Diameter.is_foreign_plmn
+
+    def test_home_plmn_is_not_roaming(self):
+        self.assertFalse(self._Home().is_foreign_plmn("262", "24"))
+
+    def test_other_country_is_roaming(self):
+        self.assertTrue(self._Home().is_foreign_plmn("001", "01"))
+
+    def test_other_operator_in_the_home_country_is_roaming(self):
+        # The case that was missed: same MCC, different MNC.
+        self.assertTrue(self._Home().is_foreign_plmn("262", "22"))
+
+    def test_same_mnc_in_another_country_is_roaming(self):
+        self.assertTrue(self._Home().is_foreign_plmn("232", "24"))
+
+    def test_mnc_padding_does_not_make_home_foreign(self):
+        home = self._Home()
+        home.MNC = "024"
+        self.assertFalse(home.is_foreign_plmn("262", "24"))

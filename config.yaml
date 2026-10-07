@@ -104,6 +104,19 @@ hss:
     cache_enabled: True
     # Default template path when subscriber has no ifc_path or ifc_template_id set
     default_template_path: 'default_ifc.xml'
+    # Shared iFC sets (SharedIFCSetID) that contain an iFC for the unregistered
+    # state (SessionCase 2). A subscriber that is not registered and whose
+    # template references one of them, or has such an iFC itself, is answered
+    # with DIAMETER_UNREGISTERED_SERVICE in the LIA instead of
+    # DIAMETER_ERROR_IDENTITY_NOT_REGISTERED. Default: [1]
+    unregistered_shared_ifc_sets: [1]
+
+  # Cx
+  cx:
+    # Answer to a SAR with TIMEOUT_/USER_DEREGISTRATION_STORE_SERVER_NAME:
+    # True keeps the S-CSCF assigned (state Unregistered), False clears it and
+    # answers DIAMETER_SUCCESS_SERVER_NAME_NOT_STORED. Default: False
+    keep_scscf_on_deregistration: False
 
   # Enable Zn Interface for GBA (Generic Bootstrapping Architecture)
   # Zn-Interface connects BSF (Bootstrapping Server Function) to HSS

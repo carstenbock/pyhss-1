@@ -4,15 +4,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import socket
 import binascii
+import hashlib
+import hmac
 import math
 import uuid
 import os
 import random
 import ipaddress
 import jinja2
-from database import Database, ROAMING_NETWORK, ROAMING_RULE, EMERGENCY_SUBSCRIBER, IMS_SUBSCRIBER, geored_check_updated_endpoints, IFC_TEMPLATE
+from database import Database, APN, ROAMING_NETWORK, ROAMING_RULE, EMERGENCY_SUBSCRIBER, IMS_SUBSCRIBER, geored_check_updated_endpoints, IFC_TEMPLATE
+from database import ims_registration_state, IMS_NOT_REGISTERED, IMS_REGISTERED, IMS_UNREGISTERED
 from messaging import RedisMessaging
-from template_cache import get_template_cache
+from template_cache import get_template_cache, IfcTemplateCache
 from redis import Redis
 import datetime
 import json
@@ -361,6 +364,20 @@ class Diameter:
         if user.startswith('0'):
             return user[1:]
         return user
+
+    @staticmethod
+    def eap_aka_prime_ck_ik(ck, ik, access_network_id, autn):
+        """CK' and IK' for EAP-AKA' (TS 33.402 Annex A.2, RFC 5448 section 3.3).
+
+        CK'|IK' = HMAC-SHA-256(CK|IK, 0x20 | ANID | len(ANID) | SQN xor AK | 0x0006),
+        with SQN xor AK being the first six bytes of AUTN. Binding the keys to
+        the access network name is what makes EAP-AKA' differ from EAP-AKA, and
+        TS 33.402 section 6.2 puts this step in the HSS: the AAA server uses
+        the keys of the SWx answer as they are.
+        """
+        s = b'\x20' + access_network_id + len(access_network_id).to_bytes(2, 'big') + autn[:6] + b'\x00\x06'
+        out = hmac.new(ck + ik, s, hashlib.sha256).digest()
+        return out[:16], out[16:]
 
     def EncodePLMN_from_IMSI(self, imsi):
         """Encoded PLMN (TBCD hex string) from the IMSI's leading MCC/MNC digits.
@@ -1513,6 +1530,21 @@ class Diameter:
             self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [deregisterIms] Error deregistering subscriber from IMS: {traceback.format_exc()}", redisClient=self.redisMessaging)
             return False
 
+    def is_foreign_plmn(self, mcc, mnc) -> bool:
+        """True if the visited PLMN of an S6a request is not the home PLMN.
+
+        A PLMN is identified by MCC and MNC together (TS 23.003 section 2.2), so
+        it is foreign as soon as either differs. The check used to require
+        both to differ: a visited network in the home country (same MCC) or
+        one with the home MNC under another MCC was treated as home, and
+        roaming_enabled and the roaming rules were never consulted for it.
+
+        The MNC is compared without leading zeros, so a home MNC configured
+        as "001" still matches "01" decoded from a 2-digit Visited-PLMN-Id.
+        """
+        return (str(mcc) != str(self.MCC)
+                or str(mnc).lstrip('0') != str(self.MNC).lstrip('0'))
+
     def validateOutboundRoamingNetwork(self, assignedRoamingRules: str, mcc: str, mnc: str) -> bool:
         """
         Ensures that a given PLMN is allowed for outbound roaming.
@@ -2001,7 +2033,7 @@ class Diameter:
             mnc = decodedPlmn[1]
             subscriberIsRoaming = False
             subscriberRoamingAllowed = False 
-            if str(mcc) != str(self.MCC) and str(mnc) != str(self.MNC):
+            if self.is_foreign_plmn(mcc, mnc):
                 subscriberIsRoaming = True
             
             if subscriberIsRoaming:
@@ -2366,7 +2398,7 @@ class Diameter:
             mnc = decodedPlmn[1]
             subscriberIsRoaming = False
             subscriberRoamingAllowed = False
-            if str(mcc) != str(self.MCC) and str(mnc) != str(self.MNC):
+            if self.is_foreign_plmn(mcc, mnc):
                 subscriberIsRoaming = True
             
             if subscriberIsRoaming:
@@ -3154,7 +3186,8 @@ class Diameter:
                 self.logTool.log(service='HSS', level='debug', message="User_Authorization_Type is: " + str(User_Authorization_Type), redisClient=self.redisMessaging)
                 if (User_Authorization_Type == 1):
                     self.logTool.log(service='HSS', level='debug', message="This is Deregister", redisClient=self.redisMessaging)
-                    self.database.Update_Serving_CSCF(imsi, serving_cscf=None)
+                    # TS 29.228 section 6.1.1.1: a UAR only queries the HSS. The
+                    # S-CSCF is cleared by the SAR of the de-registration.
                     #Populate S-CSCF Address
                     avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(ims_subscriber_details['scscf'])),'ascii'))
                     avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))                                 #Result Code (DIAMETER_SUCCESS (2001))
@@ -3165,7 +3198,8 @@ class Diameter:
                 self.logTool.log(service='HSS', level='debug', message="Failed to get User_Authorization_Type AVP & Update_Serving_CSCF error: " + str(E), redisClient=self.redisMessaging)
 
         # Refuse a disabled subscriber's registration. DE_REGISTRATION is exempt so
-        # stored S-CSCF state can still be cleared; the branch above normally
+        # the de-REGISTER reaches the S-CSCF, whose SAR clears the stored S-CSCF
+        # state; the branch above normally
         # returns early for it, but it raises when no S-CSCF is stored, so the type
         # is checked explicitly here rather than relying on that return.
         if User_Authorization_Type != 1:
@@ -3274,24 +3308,25 @@ class Diameter:
         except Exception as E:
             self.logTool.log(service='HSS', level='debug', message="Threw Exception: " + str(E), redisClient=self.redisMessaging)
             self.logTool.log(service='HSS', level='debug', message=f"No known MSISDN or IMSI in Answer_16777216_301()", redisClient=self.redisMessaging)
-            result_code = 5005
+            result_code = 5001          #DIAMETER_ERROR_USER_UNKNOWN (TS 29.228 section 6.1.2.1 step 1)
             #Experimental Result AVP
             avp_experimental_result = ''
             avp_experimental_result += self.generate_vendor_avp(266, 40, 10415, '')                         #AVP Vendor ID
             avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(result_code, 4))          #AVP Experimental-Result-Code
             avp += self.generate_avp(297, 40, avp_experimental_result)                                      #AVP Experimental-Result(297)
-            response = self.generate_diameter_packet("01", "40", 301, 16777217, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
+            response = self.generate_diameter_packet("01", "40", 301, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
             return response
 
-        # Refuse to hand out a service profile for a disabled subscriber, but only
-        # for REGISTRATION (1) / RE_REGISTRATION (2). De-registration assignment
+        # Refuse to hand out a service profile for a disabled subscriber: for
+        # REGISTRATION (1) / RE_REGISTRATION (2) and for UNREGISTERED_USER (3),
+        # which downloads it for a terminating request. De-registration assignment
         # types must still be processed below, otherwise the stored S-CSCF is never
         # cleared and the next Cx RTR has no Destination-Host to target.
         try:
             requested_assignment_type = self.hex_to_int(self.get_avp_data(avps, 614)[0])
         except Exception:
             requested_assignment_type = None
-        if requested_assignment_type in (1, 2):
+        if requested_assignment_type in (1, 2, 3):
             try:
                 subscriber_enabled = (self.database.Get_Subscriber(imsi=imsi)).get('enabled', True)
             except Exception:
@@ -3306,6 +3341,34 @@ class Diameter:
 
         avp += self.generate_avp(1, 40, str(binascii.hexlify(str.encode(str(imsi) + '@' + str(domain))),'ascii'))
 
+        Server_Assignment_Type = requested_assignment_type
+        self.logTool.log(service='HSS', level='debug', message="Server-Assignment-Type is: " + str(Server_Assignment_Type), redisClient=self.redisMessaging)
+        ServingCSCF = self.get_avp_data(avps, 602)[0]                          #Get Server-Name from AVP
+        ServingCSCF = binascii.unhexlify(ServingCSCF).decode('utf-8')      #Format it
+        ServingCSCF = ServingCSCF.replace("sip:sip:", "sip:")              #As Update_Serving_CSCF stores it
+        self.logTool.log(service='HSS', level='debug', message="Subscriber is served by S-CSCF " + str(ServingCSCF), redisClient=self.redisMessaging)
+        scscf_on_record = ims_subscriber_details.get('scscf', None)
+        registration_state = ims_registration_state(ims_subscriber_details)
+
+        def saa(result_code=None, experimental_result_code=None):
+            nonlocal avp
+            if experimental_result_code is not None:
+                avp_experimental_result = self.generate_vendor_avp(266, 40, 10415, '')                                  #AVP Vendor ID
+                avp_experimental_result += self.generate_avp(298, 40, self.int_to_hex(experimental_result_code, 4))     #AVP Experimental-Result-Code
+                avp += self.generate_avp(297, 40, avp_experimental_result)                                              #AVP Experimental-Result(297)
+            else:
+                avp += self.generate_avp(268, 40, self.int_to_hex(result_code, 4))                                      #Result Code
+            return self.generate_diameter_packet("01", "40", 301, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+
+        # TS 29.228 section 8.1.2: an S-CSCF other than the assigned one does not
+        # change anything. It is told which S-CSCF is assigned.
+        if scscf_on_record and scscf_on_record != ServingCSCF:
+            self.logTool.log(service='HSS', level='info', message="Cx SAR type " + str(Server_Assignment_Type) + " for IMSI " + str(imsi) + " from S-CSCF " + str(ServingCSCF) + ", but S-CSCF " + str(scscf_on_record) + " is assigned - rejecting", redisClient=self.redisMessaging)
+            if Server_Assignment_Type == 0:
+                return saa(result_code=5012)                                    #DIAMETER_UNABLE_TO_COMPLY
+            avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(scscf_on_record)),'ascii'))
+            return saa(experimental_result_code=5005)                           #DIAMETER_ERROR_IDENTITY_ALREADY_REGISTERED
+
         # TS 29.228 clause 6.1.2: on a RE_REGISTRATION the HSS only downloads the
         # user profile when User-Data-Already-Available says the S-CSCF has none.
         # This used to send Cx-User-Data unconditionally, so an S-CSCF that reported
@@ -3319,11 +3382,8 @@ class Diameter:
         except Exception:
             user_data_already_available = 0
 
-        if requested_assignment_type == 2 and user_data_already_available == 1:
-            self.logTool.log(service='HSS', level='debug',
-                             message="Cx SAR: RE_REGISTRATION with USER_DATA_ALREADY_AVAILABLE; omitting Cx-User-Data",
-                             redisClient=self.redisMessaging)
-        else:
+        def add_user_data():
+            nonlocal avp
             #Cx-User-Data (XML)
             try:
                 xmlbody = self.build_cx_user_data(ims_subscriber_details)
@@ -3331,87 +3391,84 @@ class Diameter:
                 self.logTool.log(service='HSS', level='error', message="Failed to load iFC template", redisClient=self.redisMessaging)
                 raise
             avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(xmlbody)),'ascii'))
-        
+
         #Charging Information
         #avp += self.generate_vendor_avp(618, "c0", 10415, "0000026dc000001b000028af7072695f6363665f6164647265737300")
-        #avp += self.generate_avp(268, 40, "000007d1")                                                   #DIAMETER_SUCCESS
 
-        #Determine SAR Type & Store
-        Server_Assignment_Type_Hex = self.get_avp_data(avps, 614)[0]
-        Server_Assignment_Type = self.hex_to_int(Server_Assignment_Type_Hex)
-        self.logTool.log(service='HSS', level='debug', message="Server-Assignment-Type is: " + str(Server_Assignment_Type), redisClient=self.redisMessaging)
-        ServingCSCF = self.get_avp_data(avps, 602)[0]                          #Get OriginHost from AVP
-        ServingCSCF = binascii.unhexlify(ServingCSCF).decode('utf-8')      #Format it
-        self.logTool.log(service='HSS', level='debug', message="Subscriber is served by S-CSCF " + str(ServingCSCF), redisClient=self.redisMessaging)
-        if (Server_Assignment_Type == 1) or (Server_Assignment_Type == 2):
-            self.logTool.log(service='HSS', level='debug', message="SAR is Register / Re-Register", redisClient=self.redisMessaging)
-            remote_peer = remote_peer + ";" + str(config['hss']['OriginHost'])
-            self.database.Update_Serving_CSCF(imsi, serving_cscf=ServingCSCF, scscf_realm=OriginRealm, scscf_peer=remote_peer)
-        else:
-            self.logTool.log(service='HSS', level='debug', message="SAR is not Register", redisClient=self.redisMessaging)
-            #Sometimes we may get a Server Assignment Request for a Deregister for a S-CSCF that no longer serves a subscriber, but that subscriber is now served by another S-CSCF
-            #So we need to check the current S-CSCF from DB == the S-CSCF sending the SAR Deregister before clearing the S-CSCF from the DB
-            username = self.get_avp_data(avps, 601)[0] 
-            ims_subscriber_details = self.Get_IMS_Subscriber_Details_from_AVP(username)   
-            scscf_on_record = ims_subscriber_details.get('scscf', None)
-            if scscf_on_record == ServingCSCF:
-                self.logTool.log(service='HSS', level='debug', message="Subscriber is served by S-CSCF " + str(ServingCSCF) + " and matches S-CSCF on record - Clearing Registration" + str(scscf_on_record), redisClient=self.redisMessaging)
-                self.database.Update_Serving_CSCF(imsi, serving_cscf=None)
+        # State handling per Server-Assignment-Type, TS 29.228 section 6.1.2.1
+        # step 5. The user profile is only downloaded for NO_ASSIGNMENT,
+        # REGISTRATION, RE_REGISTRATION and UNREGISTERED_USER (Table 6.1.2.2).
+        if Server_Assignment_Type in (1, 2, 3):
+            if Server_Assignment_Type == 2 and user_data_already_available == 1:
+                self.logTool.log(service='HSS', level='debug',
+                                 message="Cx SAR: RE_REGISTRATION with USER_DATA_ALREADY_AVAILABLE; omitting Cx-User-Data",
+                                 redisClient=self.redisMessaging)
             else:
-                self.logTool.log(service='HSS', level='debug', message="Subscriber is served by S-CSCF " + str(ServingCSCF) + " but does not match S-CSCF on record - Ignoring request to clear registration" + str(scscf_on_record), redisClient=self.redisMessaging)
+                add_user_data()
+            # UNREGISTERED_USER: the S-CSCF serves a terminating request for a
+            # user without a registration. It is stored, and the state becomes
+            # Unregistered, also from Registered: that S-CSCF has no binding left.
+            new_state = IMS_UNREGISTERED if Server_Assignment_Type == 3 else IMS_REGISTERED
+            self.logTool.log(service='HSS', level='debug', message="SAR is Register / Re-Register / Unregistered-User, new state " + str(new_state), redisClient=self.redisMessaging)
+            remote_peer = remote_peer + ";" + str(config['hss']['OriginHost'])
+            self.database.Update_Serving_CSCF(imsi, serving_cscf=ServingCSCF, scscf_realm=OriginRealm, scscf_peer=remote_peer, scscf_state=new_state)
+            return saa(result_code=2001)
 
-        avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))                                 #Result Code (DIAMETER_SUCCESS (2001))
+        if Server_Assignment_Type in (4, 5, 8, 11):
+            # TIMEOUT_, USER_, ADMINISTRATIVE_DEREGISTRATION, DEREGISTRATION_TOO_MUCH_DATA
+            if scscf_on_record:
+                self.logTool.log(service='HSS', level='debug', message="SAR is a de-registration from the assigned S-CSCF " + str(ServingCSCF) + " - Clearing Registration", redisClient=self.redisMessaging)
+                self.database.Update_Serving_CSCF(imsi, serving_cscf=None)
+            return saa(result_code=2001)
 
-        response = self.generate_diameter_packet("01", "40", 301, 16777216, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
-        return response    
+        if Server_Assignment_Type in (6, 7):
+            # *_DEREGISTRATION_STORE_SERVER_NAME: the HSS decides whether the
+            # S-CSCF stays assigned. Only an assigned S-CSCF can stay.
+            keep_scscf = config.get('hss', {}).get('cx', {}).get('keep_scscf_on_deregistration', False)
+            if keep_scscf and scscf_on_record:
+                if registration_state != IMS_UNREGISTERED:
+                    self.database.Update_Serving_CSCF(imsi, serving_cscf=scscf_on_record, scscf_realm=ims_subscriber_details.get('scscf_realm'), scscf_peer=ims_subscriber_details.get('scscf_peer'), scscf_state=IMS_UNREGISTERED)
+                return saa(result_code=2001)
+            if scscf_on_record:
+                self.database.Update_Serving_CSCF(imsi, serving_cscf=None)
+            return saa(experimental_result_code=2004)                           #DIAMETER_SUCCESS_SERVER_NAME_NOT_STORED
+
+        if Server_Assignment_Type == 0:
+            # NO_ASSIGNMENT: download only
+            add_user_data()
+            return saa(result_code=2001)
+
+        if Server_Assignment_Type in (9, 10):
+            # AUTHENTICATION_FAILURE / AUTHENTICATION_TIMEOUT keep the state. The
+            # S-CSCF name is only cleared in state Not Registered, where none is stored.
+            return saa(result_code=2001)
+
+        # AAA_USER_DATA_REQUEST, PGW_UPDATE, RESTORATION and unknown values:
+        # not supported. TS 29.228 section 8.1.3.
+        self.logTool.log(service='HSS', level='info', message="Cx SAR: Server-Assignment-Type " + str(Server_Assignment_Type) + " is not supported", redisClient=self.redisMessaging)
+        return saa(experimental_result_code=5007)                               #DIAMETER_ERROR_IN_ASSIGNMENT_TYPE
 
     def _ifc_has_unregistered_services(self, ims_subscriber_details) -> bool:
-        """Check whether the subscriber's iFC template contains any rule with
-        SessionCase=2 (TERMINATING_UNREGISTERED), which indicates services for
-        unregistered users (e.g. voicemail, CFNR).
+        """Whether the subscriber has services for the unregistered state, which
+        decides between DIAMETER_UNREGISTERED_SERVICE (2003) and
+        DIAMETER_ERROR_IDENTITY_NOT_REGISTERED (5003) in the LIA (TS 29.228
+        section 6.1.4.1).
 
-        Per 3GPP TS 29.228 Section 6.1.2 the HSS must distinguish between
-        DIAMETER_UNREGISTERED_SERVICE (5005) and
-        DIAMETER_ERROR_IDENTITY_NOT_REGISTERED (5003) based on this.
+        Answered per iFC template, see
+        template_cache.ifc_template_has_unregistered_services(): the profile is
+        not rendered for it.
         """
         try:
-            details = dict(ims_subscriber_details)
-            details['mnc'] = self.MNC.zfill(3)
-            details['mcc'] = self.MCC.zfill(3)
-
-            template = None
-            if self.ifcCacheEnabled:
-                template = self.ifcTemplateCache.get_template(details, config, self.database)
-            else:
-                if self.ifcUseDatabase and details.get('ifc_template_id'):
-                    template_data = self.database.GetObj(IFC_TEMPLATE, details['ifc_template_id'])
-                    if template_data and 'template_content' in template_data:
-                        template = jinja2.Template(template_data['template_content'])
-                if template is None:
-                    ifc_path = details.get('ifc_path') or self.ifcDefaultTemplatePath
-                    templateLoader = jinja2.FileSystemLoader(searchpath="../")
-                    templateEnv = jinja2.Environment(loader=templateLoader)
-                    template = templateEnv.get_template(ifc_path)
-
-            if template is None:
-                return False
-
-            xmlbody = template.render(iFC_vars=details)
-            return '<SessionCase>2</SessionCase>' in xmlbody
+            cache = self.ifcTemplateCache
+            if not self.ifcCacheEnabled:
+                # Caching is switched off: nothing is kept between requests.
+                cache = IfcTemplateCache(self.logTool, self.redisMessaging)
+            return cache.has_unregistered_services(ims_subscriber_details, config, self.database)
         except Exception as e:
             self.logTool.log(service='HSS', level='warning',
                              message=f"Failed to check iFC for unregistered services: {e}",
                              redisClient=self.redisMessaging)
             return False
-
-    def _get_scscf_from_pool(self) -> str:
-        """Pick an S-CSCF URI from the configured pool or generate a default."""
-        if 'scscf_pool' in config['hss']:
-            try:
-                return random.choice(config['hss']['scscf_pool'])
-            except Exception:
-                pass
-        return "sip:scscf.ims.mnc" + str(self.MNC).zfill(3) + ".mcc" + str(self.MCC).zfill(3) + ".3gppnetwork.org"
 
     #3GPP Cx Location Information Answer
     def Answer_16777216_302(self, packet_vars, avps):
@@ -3432,20 +3489,20 @@ class Diameter:
                 avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(str(ims_subscriber_details['scscf']))),'ascii'))
             else:
                 # Subscriber exists but is not registered (no S-CSCF assigned).
-                # Per 3GPP TS 29.228 Section 6.1.2:
-                #   - If the user has services for unregistered state (iFC with
-                #     SessionCase=2), return DIAMETER_UNREGISTERED_SERVICE (5005)
-                #     with a Server-Name from the pool so the I-CSCF can route
-                #     to an S-CSCF for unregistered service execution.
-                #   - Otherwise return DIAMETER_ERROR_IDENTITY_NOT_REGISTERED (5003)
-                #     without Server-Name (no S-CSCF needed).
+                # Per 3GPP TS 29.228 Section 6.1.4.1:
+                #   - If the user has services for the unregistered state, return
+                #     DIAMETER_UNREGISTERED_SERVICE (2003). "The Server-Name AVP
+                #     shall not be present": the I-CSCF selects the S-CSCF, which
+                #     then sends SAR UNREGISTERED_USER. Server-Capabilities are
+                #     optional and not sent.
+                #   - Otherwise return DIAMETER_ERROR_IDENTITY_NOT_REGISTERED (5003).
+                # A subscriber in state Unregistered has an S-CSCF and is handled
+                # above like a registered one.
                 if self._ifc_has_unregistered_services(ims_subscriber_details):
-                    scscf_uri = self._get_scscf_from_pool()
-                    avp += self.generate_vendor_avp(602, "c0", 10415, str(binascii.hexlify(str.encode(scscf_uri)),'ascii'))
                     self.logTool.log(service='HSS', level='info',
-                                     message="Subscriber not registered but has unregistered services - returning DIAMETER_UNREGISTERED_SERVICE (5005)",
+                                     message="Subscriber not registered but has unregistered services - returning DIAMETER_UNREGISTERED_SERVICE (2003)",
                                      redisClient=self.redisMessaging)
-                    result_code = 5005
+                    result_code = 2003
                 else:
                     self.logTool.log(service='HSS', level='info',
                                      message="Subscriber not registered and no unregistered services - returning DIAMETER_ERROR_IDENTITY_NOT_REGISTERED (5003)",
@@ -3754,6 +3811,23 @@ class Diameter:
         # Generate auth vectors — SWx uses sip_auth (same as Cx) to get RAND/AUTN/XRES/CK/IK
         vector_dict = self.database.Get_Vectors_AuC(subscriber_details['auc_id'], "sip_auth", plmn=plmn)
 
+        if auth_scheme == "EAP-AKA'":
+            # TS 29.273 section 8.2.2.1: for EAP-AKA' the answer carries CK' and IK',
+            # derived with the access network identity of the request. The raw CK/IK
+            # used to be returned, which no UE's own derivation can match.
+            # ANID is AVP 1504 (TS 29.273 section 5.2.3.7); AAA servers up to 0.1.22
+            # sent the identity under code 1263.
+            anid = self.get_avp_data(avps, 1504) or self.get_avp_data(avps, 1263)
+            if not anid:
+                self.logTool.log(service='HSS', level='warning',
+                                 message="SWx MAR: EAP-AKA' requested for IMSI " + str(imsi) + " without ANID; rejecting with 5005",
+                                 redisClient=self.redisMessaging)
+                avp += self.generate_avp(268, 40, self.int_to_hex(5005, 4))                              #Result-Code: DIAMETER_MISSING_AVP
+                return self.generate_diameter_packet("01", "40", 303, 16777265, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)
+            autn = vector_dict['SIP_Authenticate'][16:]
+            vector_dict['ck'], vector_dict['ik'] = self.eap_aka_prime_ck_ik(
+                vector_dict['ck'], vector_dict['ik'], binascii.unhexlify(anid[0]), autn)
+
         avp_SIP_Item_Number = self.generate_vendor_avp(613, "c0", 10415, format(int(0),"x").zfill(8))
         avp_SIP_Authentication_Scheme = self.generate_vendor_avp(608, "c0", 10415, str(binascii.hexlify(auth_scheme.encode('utf-8')),'ascii'))
         avp_SIP_Authenticate = self.generate_vendor_avp(609, "c0", 10415, str(binascii.hexlify(vector_dict['SIP_Authenticate']),'ascii'))
@@ -4008,9 +4082,12 @@ class Diameter:
 
     def _sh_ims_user_state(self, subscriber_details):
         """TS 29.328 section 7.6.4 - IMSUserState (Data-Reference 11)"""
-        scscf = subscriber_details.get('scscf', None)
-        if scscf is not None:
+        state = ims_registration_state(subscriber_details)
+        if state == IMS_REGISTERED:
             return '<IMSUserState>REGISTERED</IMSUserState>'
+        if state == IMS_UNREGISTERED:
+            # Cx state Unregistered: an S-CSCF is assigned for unregistered services
+            return '<IMSUserState>REGISTERED_UNREG_SERVICES</IMSUserState>'
         return '<IMSUserState>NOT_REGISTERED</IMSUserState>'
 
     def _sh_scscf_name(self, subscriber_details):
@@ -4104,12 +4181,12 @@ class Diameter:
         Assembled from current registration/location state."""
         mme = subscriber_details.get('serving_mme', None)
         msc = subscriber_details.get('serving_msc', None)
-        scscf = subscriber_details.get('scscf', None)
         ue_srvcc = subscriber_details.get('ue_srvcc_capability', None)
 
         ps_registered = mme is not None
         cs_registered = msc is not None
-        voice_over_ps = ps_registered and scscf is not None
+        # An S-CSCF assigned for unregistered services is not an IMS registration.
+        voice_over_ps = ps_registered and ims_registration_state(subscriber_details) == IMS_REGISTERED
 
         last_activity = subscriber_details.get('serving_mme_timestamp', None) or subscriber_details.get('last_location_update_timestamp', None)
 
@@ -4309,8 +4386,9 @@ class Diameter:
         subscriber_details['mnc'] = self.MNC.zfill(3)
         subscriber_details['mcc'] = self.MCC.zfill(3)
 
-        scscf = subscriber_details.get('scscf', None)
-        subscriber_details['imsUserState'] = 1 if scscf is not None else 0
+        # TS 29.328 tIMSUserState: 0 NOT_REGISTERED, 1 REGISTERED, 2 REGISTERED_UNREG_SERVICES;
+        # the values of the Cx registration state map onto them one to one.
+        subscriber_details['imsUserState'] = ims_registration_state(subscriber_details)
 
         subscriberShProfile = subscriber_details.get('sh_profile', '') or subscriber_details.get('xcap_profile', '') or ''
 
@@ -4489,6 +4567,22 @@ class Diameter:
         self.redisMessaging.deleteHashKey(name=self._sh_subscription_key(ims_subscriber_id),
                                           key=origin_host)
 
+    def purge_subscriber_state(self, subscriber_ids=(), ims_subscriber_ids=()):
+        """Drop the Sh and Rx subscription state that this node's Redis holds for
+        deleted subscribers and return the number of keys removed.
+
+        An Sh subscription has no expiry of its own (TS 29.328 section 6.1.3), so
+        the deletion of the subscriber is the only thing that ends it. The Rx
+        keys would expire by themselves; they are removed here for every APN
+        that exists, as an Rx key is named after the subscriber and the APN.
+        """
+        keys = [self._sh_subscription_key(int(ims_subscriber_id)) for ims_subscriber_id in ims_subscriber_ids]
+        if subscriber_ids:
+            apn_ids = [apn['apn_id'] for apn in self.database.GetAll(APN)]
+            keys += [self._rx_af_subscription_key(int(subscriber_id), apn_id)
+                     for subscriber_id in subscriber_ids for apn_id in apn_ids]
+        return self.redisMessaging.deleteKeys(keys)
+
     def sh_get_subscriptions(self, ims_subscriber_id):
         """Return {origin_host: {originRealm, serviceIndications, timestamp}} for a subscriber."""
         subscriptions = self.redisMessaging.getAllHashData(name=self._sh_subscription_key(ims_subscriber_id))
@@ -4630,12 +4724,27 @@ class Diameter:
         # Mirrors sh_subscriptions:<id>.
         return f"af_subscriptions:{subscriber_id}:{apn_id}"
 
+    # Seconds a subscription key outlives its last session. The entries are
+    # already ignored once expired, the margin only keeps Redis from dropping
+    # the key in the very second its last session ends.
+    RX_AF_SUBSCRIPTION_KEY_TTL_MARGIN = 60
+
     def rx_store_af_subscription(self, subscriber_id, apn_id, af_session_id, af_peer, af_realm, af_session_expires):
-        """Record an AF's Rx subscription to the IMS signalling bearer (TS 29.214)."""
-        expires_at = int(time.time()) + int(af_session_expires)
+        """Record an AF's Rx subscription to the IMS signalling bearer (TS 29.214).
+
+        Every re-registration opens a new Rx session, and nothing else reads the
+        hash of a subscriber that never detaches. So the write itself drops the
+        sessions that ran out without an STR, and the key expires with its last
+        session: the state of a deleted or silent subscriber goes away by itself.
+        """
+        now = int(time.time())
+        expires_at = now + int(af_session_expires)
         value = json.dumps({"af_peer": af_peer, "af_realm": af_realm, "af_session_expires": expires_at})
+        active = self.rx_get_af_subscriptions(subscriber_id, apn_id)
+        last_expiry = max([expires_at] + [data.get('af_session_expires', 0) for data in active.values()])
         self.redisMessaging.setHashValue(name=self._rx_af_subscription_key(subscriber_id, apn_id),
-                                         key=af_session_id, value=value)
+                                         key=af_session_id, value=value,
+                                         keyExpiry=last_expiry - now + self.RX_AF_SUBSCRIPTION_KEY_TTL_MARGIN)
 
     def rx_remove_af_subscription(self, subscriber_id, apn_id, af_session_id):
         self.redisMessaging.deleteHashKey(name=self._rx_af_subscription_key(subscriber_id, apn_id),

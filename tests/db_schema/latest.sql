@@ -134,6 +134,7 @@ CREATE TABLE ims_subscriber (
 	scscf VARCHAR(512),
 	scscf_peer VARCHAR(512),
 	scscf_realm VARCHAR(512),
+	scscf_state SMALLINT,
 	scscf_timestamp DATETIME,
 	sh_profile TEXT,
 	sh_template_path VARCHAR(512),
@@ -289,4 +290,5 @@ CREATE TABLE tft (
 );
 CREATE INDEX ix_subscriber_msisdn ON subscriber (msisdn);
 CREATE INDEX ix_ims_subscriber_imsi ON ims_subscriber (imsi);
+CREATE INDEX ix_ims_subscriber_pcscf_active_session ON ims_subscriber (pcscf_active_session);
 COMMIT;

@@ -107,4 +107,4 @@ def test_upgrade_adds_lookup_indexes(tmp_path):
     inspector = sqlalchemy.inspect(engine)
     assert "ix_ims_subscriber_imsi" in [index["name"] for index in inspector.get_indexes("ims_subscriber")]
     assert "ix_subscriber_msisdn" in [index["name"] for index in inspector.get_indexes("subscriber")]
-    assert DatabaseSchema.latest == 5
+    assert DatabaseSchema.latest == 6

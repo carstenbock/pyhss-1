@@ -29,6 +29,10 @@ class MetricService:
         self.registry = CollectorRegistry(auto_describe=True)
         self.logTool.log(service='Metric', level='info', message=f"{self.banners.metricService()}", redisClient=self.redisMessaging)
         self.hostname = socket.gethostname()
+        # The HSS and Diameter services queue their metrics under the Diameter
+        # Origin-Host, every other service under the system hostname.
+        self.metricKeys = [self.redisMessaging.handlePrefix(key='metric', usePrefix=True, prefixHostname=hostname, prefixServiceName='metric')
+                           for hostname in dict.fromkeys([self.hostname, config.get('hss', {}).get('OriginHost', 'hss01')])]
         self.influxEnabled = config.get('influxdb', {}).get('enabled', None)
         self.influxDatabase = config.get('influxdb', {}).get('database', None)
         self.influxUser = config.get('influxdb', {}).get('username', None)
@@ -72,7 +76,7 @@ class MetricService:
             actions = {'inc': 'inc', 'dec': 'dec', 'set':'set'}
             prometheusTypes = {'counter': Counter, 'gauge': Gauge, 'histogram': Histogram, 'summary': Summary}
 
-            metric = self.redisMessaging.awaitMessage(key='metric', usePrefix=True, prefixHostname=self.hostname, prefixServiceName='metric')[1]
+            metric = self.redisMessaging.redisClient.blpop(self.metricKeys)[1].decode()
 
             self.logTool.log(service='Metric', level='debug', message=f"[Metric] [handleMetrics] Received Metric: {metric}", redisClient=self.redisMessaging)
             prometheusJsonList = json.loads(metric)

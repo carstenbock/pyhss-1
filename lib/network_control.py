@@ -148,6 +148,26 @@ def push_clr_and_relay(diameter_client, imsi: str, clr: dict, relay) -> dict:
     }
 
 
+def purge_subscriber_state_and_relay(diameter_client, relay, subscriber_ids=(), ims_subscriber_ids=(),
+                                     log_tool=None, redis_messaging=None) -> None:
+    """Remove the Sh and Rx subscription state of deleted subscribers from Redis.
+
+    The state lives in the Redis of whichever node handled the SNR or AAR. With
+    provisioning and Diameter in separate pods that is a Redis this process
+    cannot reach, so the ids are relayed to every Diameter node as well. The
+    database rows are already gone: a failure is logged, not raised.
+    """
+    payload = {"subscriber_ids": list(subscriber_ids), "ims_subscriber_ids": list(ims_subscriber_ids)}
+    if not payload["subscriber_ids"] and not payload["ims_subscriber_ids"]:
+        return
+    try:
+        diameter_client.purge_subscriber_state(**payload)
+    except Exception as error:
+        _log(log_tool, redis_messaging, "warning",
+             f"[API] Purging subscriber state from the local Redis failed: {error}")
+    relay("/geored/purge_subscriber_state", payload)
+
+
 def _send_cx_rtr(
     diameter_client,
     ims_subscriber_info: dict,

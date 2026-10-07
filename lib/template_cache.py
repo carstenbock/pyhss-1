@@ -7,11 +7,32 @@ Provides thread-safe caching of compiled Jinja2 templates for both
 database-based and file-based IFC templates.
 """
 
+import re
 import threading
 import jinja2
 import os
 from typing import Optional, Dict, Any
 from database import IFC_TEMPLATE
+
+
+def ifc_template_has_unregistered_services(source: str, shared_ifc_sets) -> bool:
+    """Whether an iFC template gives its subscribers services in the
+    unregistered state: an iFC with SessionCase 2 (TERMINATING_UNREGISTERED) in
+    the template itself, or a reference to a shared iFC set that is configured
+    as containing one. Shared iFC sets are provisioned in the S-CSCF and not
+    known to the HSS (TS 29.228 Annex B), so their content cannot be inspected
+    here.
+
+    The template source is scanned, not a rendered profile: the answer is the
+    same for every subscriber of the template and is needed on every LIR for a
+    subscriber that is not registered. Comments are ignored; an iFC inside a
+    Jinja condition counts as present."""
+    source = re.sub(r'<!--.*?-->', '', source, flags=re.S)
+    source = re.sub(r'\{#.*?#\}', '', source, flags=re.S)
+    if re.search(r'<SessionCase>\s*2\s*</SessionCase>', source):
+        return True
+    wanted = {str(set_id).strip() for set_id in (shared_ifc_sets or [])}
+    return any(set_id in wanted for set_id in re.findall(r'<SharedIFCSetID>\s*(\d+)\s*</SharedIFCSetID>', source))
 
 
 class IfcTemplateCache:
@@ -35,6 +56,10 @@ class IfcTemplateCache:
             redisMessaging: Redis messaging instance for pub/sub invalidation
         """
         self._cache: Dict[str, jinja2.Template] = {}
+        # Template source and "has unregistered services" per cache key, kept
+        # and dropped together with the compiled template.
+        self._sources: Dict[str, str] = {}
+        self._unregistered: Dict[str, bool] = {}
         self._lock = threading.Lock()
         self.logTool = logTool
         self.redisMessaging = redisMessaging
@@ -83,6 +108,7 @@ class IfcTemplateCache:
                 
                 with self._lock:
                     self._cache[cache_key] = compiled_template
+                    self._sources[cache_key] = template_content
                 
                 self._log('debug', f"Template {template_id} compiled and cached")
                 return compiled_template
@@ -121,9 +147,11 @@ class IfcTemplateCache:
             
             env = jinja2.Environment(loader=self._file_loaders[search_path])
             template = env.get_template(file_path)
+            source = self._file_loaders[search_path].get_source(env, file_path)[0]
             
             with self._lock:
                 self._cache[cache_key] = template
+                self._sources[cache_key] = source
             
             self._log('debug', f"Template {file_path} compiled and cached")
             return template
@@ -164,6 +192,34 @@ class IfcTemplateCache:
         ifc_path = subscriber_details.get('ifc_path') or default_template_path
         return self.get_template_from_file(ifc_path)
     
+    def has_unregistered_services(self, subscriber_details: Dict[str, Any], config: Dict[str, Any], database=None) -> bool:
+        """
+        Whether the template get_template() selects for this subscriber gives
+        services in the unregistered state, see
+        ifc_template_has_unregistered_services(). The result is cached with the
+        template.
+        """
+        ifc_config = config.get('hss', {}).get('ifc_templates', {})
+        cache_key = None
+
+        if ifc_config.get('use_database', False):
+            template_id = subscriber_details.get('ifc_template_id')
+            if template_id and database and self.get_template_from_db(template_id, database):
+                cache_key = self._get_cache_key_db(template_id)
+
+        if cache_key is None:
+            ifc_path = subscriber_details.get('ifc_path') or ifc_config.get('default_template_path', 'default_ifc.xml')
+            if self.get_template_from_file(ifc_path) is None:
+                return False
+            cache_key = self._get_cache_key_file(ifc_path)
+
+        with self._lock:
+            if cache_key not in self._unregistered:
+                self._unregistered[cache_key] = ifc_template_has_unregistered_services(
+                    self._sources.get(cache_key, ''),
+                    ifc_config.get('unregistered_shared_ifc_sets', [1]))
+            return self._unregistered[cache_key]
+
     def invalidate(self, cache_key: str) -> bool:
         """
         Invalidate a specific template from the cache.
@@ -177,6 +233,8 @@ class IfcTemplateCache:
         with self._lock:
             if cache_key in self._cache:
                 del self._cache[cache_key]
+                self._sources.pop(cache_key, None)
+                self._unregistered.pop(cache_key, None)
                 self._log('debug', f"Template cache invalidated: {cache_key}")
                 return True
             return False
@@ -217,6 +275,8 @@ class IfcTemplateCache:
         with self._lock:
             count = len(self._cache)
             self._cache.clear()
+            self._sources.clear()
+            self._unregistered.clear()
             self._log('debug', f"Template cache cleared: {count} templates invalidated")
             return count
     

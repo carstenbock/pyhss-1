@@ -156,6 +156,17 @@ class RedisMessaging:
         except Exception as e:
             return False
 
+    def deleteKeys(self, keys: list, batchSize: int=1000) -> int:
+        """
+        Deletes the given keys (UNLINK, so Redis frees the memory in the background)
+        in batches of batchSize and returns how many of them existed.
+        Errors are raised: the caller must know when state was left behind.
+        """
+        deleted = 0
+        for start in range(0, len(keys), batchSize):
+            deleted += self.redisClient.unlink(*keys[start:start + batchSize])
+        return deleted
+
     def setValue(self, key: str, value: str, keyExpiry: int=None, usePrefix: bool=False, prefixHostname: str='unknown', prefixServiceName: str='common') -> str:
         """
         Stores a value under a given key and sets an expiry (in seconds) if provided.
@@ -253,7 +264,7 @@ class RedisMessaging:
             name = self.handlePrefix(key=name, usePrefix=usePrefix, prefixHostname=prefixHostname, prefixServiceName=prefixServiceName)
             self.redisClient.hset(name=name, key=key, value=value)
             if keyExpiry is not None:
-                self.redisClient.expire(key, int(keyExpiry))
+                self.redisClient.expire(name, int(keyExpiry))
             return f'{value} stored in {key} successfully.'
         except Exception as e:
             return e
