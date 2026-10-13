@@ -35,6 +35,28 @@ class SwxIdentityTest(TestCase):
     def test_username_without_realm_is_the_imsi(self):
         self.assertEqual(IMSI, Diameter.imsi_from_eap_nai(IMSI))
 
+    def test_permanent_identity_of_a_test_plmn_imsi_is_tried_as_is(self):
+        # S6b: the AAA server asks with "<IMSI>@<realm>", no method digit. For
+        # an MCC 001 IMSI the leading 0 belongs to the IMSI; with only the
+        # shortened reading the HSS answered 5001 and the PGW rejected every
+        # VoWiFi session of such a subscriber (GTP cause 125 at the ePDG).
+        self.assertEqual(["01010000000001", "001010000000001"],
+                         Diameter.imsi_candidates_from_eap_nai("001010000000001" + REALM))
+
+    def test_lookup_takes_the_reading_that_is_a_subscriber(self):
+        class _Db:
+            def Get_Subscriber(self, imsi):
+                if imsi != "001010000000001":
+                    raise ValueError("unknown")
+                return {"imsi": imsi}
+
+        hss = Diameter.__new__(Diameter)
+        hss.database = _Db()
+        self.assertEqual(("001010000000001", {"imsi": "001010000000001"}),
+                         hss.swx_subscriber("001010000000001" + REALM))
+        with self.assertRaises(ValueError):
+            hss.swx_subscriber("0999990000000001" + REALM)
+
 
 class EapAkaPrimeKeysTest(TestCase):
     """For EAP-AKA' the SWx answer carries CK' and IK', not CK and IK (TS 33.402

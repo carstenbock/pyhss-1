@@ -2276,6 +2276,23 @@ class Database:
         finally:
             self.safe_close(session)
 
+    def Get_Stale_Serving_APN_Ids(self, subscriber_routing) -> list:
+        """
+        Returns the ids of the SERVING_APNs that hold the given subscriber_routing (IP Address), or none at all.
+        The database selects them: this runs for every PDN session that is set up, and loading the whole
+        table here made the cost of one session grow with the number of sessions that exist.
+        """
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        try:
+            rows = session.query(SERVING_APN.serving_apn_id).filter(
+                sqlalchemy.or_(SERVING_APN.subscriber_routing == subscriber_routing,
+                               SERVING_APN.subscriber_routing == None,
+                               SERVING_APN.subscriber_routing == '')).all()
+            return [row[0] for row in rows]
+        finally:
+            self.safe_close(session)
+
     def Update_Serving_APN(self, imsi, apn, pcrf_session_id, serving_pgw, subscriber_routing, serving_pgw_realm=None, serving_pgw_peer=None, serving_pgw_timestamp=None, propagate=True):
         """
         (1). A given UE should only ever have one IP per PDN connection.
@@ -2313,16 +2330,12 @@ class Database:
         """
         try:
             if serving_pgw and subscriber_routing:
-                servingApns = self.GetAll(SERVING_APN)
-                for servingApn in servingApns:
-                    """
-                    If the provided subscriber_routing(IP Address) matches any of the existing SERVING_APNs, the existing SERVING_APN is deleted (1).
-                    If the stored subscriber_routing is False or equivalent, the SERVING_APN is also deleted.
-                    """
-                    servingApnSubscriberRouting = servingApn.get('subscriber_routing', '')
-                    if (servingApnSubscriberRouting == subscriber_routing) or (not servingApnSubscriberRouting):
-                        servingApnId = servingApn.get('serving_apn_id', None)
-                        self.DeleteObj(SERVING_APN, int(servingApnId), True)
+                """
+                If the provided subscriber_routing(IP Address) matches any of the existing SERVING_APNs, the existing SERVING_APN is deleted (1).
+                If the stored subscriber_routing is False or equivalent, the SERVING_APN is also deleted.
+                """
+                for servingApnId in self.Get_Stale_Serving_APN_Ids(subscriber_routing):
+                    self.DeleteObj(SERVING_APN, int(servingApnId), True)
         except Exception as e:
             self.logTool.log(service='Database', level='warning', message=f"Error handling subscriber_routing duplicate check: {traceback.format_exc()}", redisClient=self.redisMessaging)
 

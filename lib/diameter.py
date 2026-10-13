@@ -356,14 +356,41 @@ class Diameter:
         also a bare IMSI of an MCC 6xx network) and is left alone; "0" keeps
         being removed there as before.
         """
+        return Diameter.imsi_candidates_from_eap_nai(username)[0]
+
+    @staticmethod
+    def imsi_candidates_from_eap_nai(username):
+        """IMSIs the User-Name of an SWx request can stand for, likeliest first.
+
+        Two readings exist for a user part of exactly 15 digits that starts
+        with "0": the EAP-AKA prefix and a 14-digit IMSI, or a complete IMSI of
+        an MCC 0xx network (001-01 test PLMNs). The AAA server sends the second
+        form when the PGW asks over S6b: it passes on the permanent identity
+        "<IMSI>@<realm>" without method digit. Removing the "0" there made the
+        HSS answer DIAMETER_ERROR_USER_UNKNOWN and the PGW reject the session.
+        The caller takes the first candidate that is a known subscriber.
+        """
         user = username.split('@')[0]
         if '@' not in username:
-            return user
+            return [user]
         if len(user) > 15 and user[0] in ('0', '6'):
-            return user[1:]
+            return [user[1:]]
         if user.startswith('0'):
-            return user[1:]
-        return user
+            if len(user) == 15:
+                return [user[1:], user]
+            return [user[1:]]
+        return [user]
+
+    def swx_subscriber(self, username):
+        """(imsi, subscriber) for the User-Name of an SWx request; raises like
+        Get_Subscriber when none of its readings is a known subscriber."""
+        last = None
+        for imsi in self.imsi_candidates_from_eap_nai(username):
+            try:
+                return imsi, self.database.Get_Subscriber(imsi=imsi)
+            except Exception as e:
+                last = e
+        raise last
 
     @staticmethod
     def eap_aka_prime_ck_ik(ck, ik, access_network_id, autn):
@@ -3756,9 +3783,8 @@ class Diameter:
             username = binascii.unhexlify(username).decode('utf-8')
             self.logTool.log(service='HSS', level='debug', message="SWx MAR for user: " + str(username), redisClient=self.redisMessaging)
 
-            imsi = self.imsi_from_eap_nai(username)
-
-            subscriber_details = self.database.Get_Subscriber(imsi=imsi)
+            imsi = self.imsi_from_eap_nai(username)   # named in the log if the lookup fails
+            imsi, subscriber_details = self.swx_subscriber(username)
             if not subscriber_details.get('enabled', True):
                 self.logTool.log(service='HSS', level='info',
                                  message="SWx MAR: IMSI " + str(imsi) + " is disabled; rejecting with 5003",
@@ -3862,9 +3888,7 @@ class Diameter:
         try:
             username = self.get_avp_data(avps, 1)[0]
             username = binascii.unhexlify(username).decode('utf-8')
-            imsi = self.imsi_from_eap_nai(username)
-
-            subscriber_details = self.database.Get_Subscriber(imsi=imsi)
+            imsi, subscriber_details = self.swx_subscriber(username)
         except:
             self.logTool.log(service='HSS', level='debug', message="SWx SAR subscriber unknown", redisClient=self.redisMessaging)
             experimental_result = self.generate_avp(298, 40, self.int_to_hex(5001, 4))
