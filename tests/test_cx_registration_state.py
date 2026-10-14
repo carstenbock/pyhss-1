@@ -107,6 +107,9 @@ class Answer:
         self.experimental_result_code = self._int(node, 298)
         self.server_name = self._str(node, 602)
         self.user_data = self._str(node, 606)
+        restoration_info = node.get_grouped_avp_payloads(self.avps, 639)
+        self.restoration_info = restoration_info[0] if restoration_info else None
+        self.restoration_announced = node.cx_ims_restoration_supported(self.avps)
 
     def _int(self, node, code):
         data = node.get_avp_data(self.avps, code)
@@ -117,8 +120,16 @@ class Answer:
         return binascii.unhexlify(data[0]).decode() if data else None
 
 
-def sar(node, assignment_type, scscf=SCSCF, impu=IMPU, user_data_already_available=0, with_user_name=True):
+def sar(node, assignment_type, scscf=SCSCF, impu=IMPU, user_data_already_available=0, with_user_name=True,
+        feature_list=None, restoration_info=None):
     avps = node.generate_vendor_avp(601, "c0", 10415, node.string_to_hex(impu))
+    if feature_list is not None:
+        features = node.generate_vendor_avp(266, 40, 10415, '')
+        features += node.generate_vendor_avp(629, 80, 10415, node.int_to_hex(1, 4))
+        features += node.generate_vendor_avp(630, 80, 10415, node.int_to_hex(feature_list, 4))
+        avps += node.generate_vendor_avp(628, "80", 10415, features)
+    if restoration_info is not None:
+        avps += node.generate_vendor_avp(639, "80", 10415, restoration_info)
     avps += node.generate_vendor_avp(602, "c0", 10415, node.string_to_hex(scscf))
     avps += node.generate_vendor_avp(614, "c0", 10415, node.int_to_hex(assignment_type, 4))
     avps += node.generate_vendor_avp(624, "c0", 10415, node.int_to_hex(user_data_already_available, 4))
@@ -549,7 +560,7 @@ def test_upgrade_adds_the_state_column_without_touching_rows(tmp_path):
     engine = sqlalchemy.create_engine(f"sqlite:///{path}")
     schema = DatabaseSchema(LogTool(config), Base, engine, main_service=True)
 
-    assert schema.get_version() == DatabaseSchema.latest == 6
+    assert schema.get_version() == DatabaseSchema.latest
     assert schema.column_exists("ims_subscriber", "scscf_state")
     with engine.connect() as conn:
         row = conn.execute(sqlalchemy.text("SELECT scscf, scscf_state FROM ims_subscriber")).fetchone()
@@ -584,7 +595,199 @@ def test_upgrade_indexes_the_pcscf_session_lookup(tmp_path):
 
         schema = DatabaseSchema(LogTool(config), Base, engine, main_service=True)
 
-        assert schema.get_version() == 6
+        assert schema.get_version() == DatabaseSchema.latest
         assert "ix_ims_subscriber_pcscf_active_session" in indexes(engine)
         assert schema.column_exists("ims_subscriber", "scscf_state")
         engine.dispose()
+
+
+# --- IMS restoration (TS 23.380 clause 4) -----------------------------------------
+#
+# An S-CSCF that restarted has lost every registration, while the HSS still
+# holds the subscribers as registered. Without restoration each of them is
+# unreachable until its UE re-registers on its own timer, up to the full
+# registration lifetime. With it, the S-CSCF stores what it needs to deliver a
+# request (Contact, Path, Call-ID, CSeq) with every registration SAR and gets it
+# back with the first request for the subscriber after the restart.
+
+RESTORATION = 1 << 2    # IMSRestorationInd, Feature-List-ID 1 (TS 29.229 table 7.1.1)
+
+
+def restoration_info(node, contact="<sip:ue@10.45.0.2:5060>;+sip.instance=\"<urn:gsma:imei:35-209900-176148-1>\"",
+                     path="<sip:term@pcscf.ims.example;lr>", call_id="abc@10.45.0.2", cseq=7, expires_at=1791000000):
+    """Payload of an SCSCF-Restoration-Info AVP as the S-CSCF builds it."""
+    info = node.generate_vendor_avp(640, "80", 10415, node.string_to_hex(path))           # Path
+    info += node.generate_vendor_avp(641, "80", 10415, node.string_to_hex(contact))       # Contact
+    info += node.generate_vendor_avp(654, "80", 10415, node.int_to_hex(cseq, 4))          # Initial-CSeq-Sequence-Number
+    info += node.generate_vendor_avp(643, "80", 10415, node.string_to_hex(call_id))       # Call-ID-SIP-Header
+    payload = node.generate_avp(1, 40, node.string_to_hex(IMSI + "@ims.example"))         # User-Name
+    payload += node.generate_vendor_avp(649, "80", 10415, info)                           # Restoration-Info
+    payload += node.generate_vendor_avp(661, "80", 10415, node.int_to_hex(expires_at + 2208988800, 4))  # Registration-Time-Out
+    payload += node.generate_vendor_avp(608, "c0", 10415, node.string_to_hex("Digest-AKAv1-MD5"))  # SIP-Authentication-Scheme
+    return payload
+
+
+@pytest.fixture
+def restoration(hss, monkeypatch):
+    monkeypatch.setitem(config["hss"], "cx", {"ims_restoration": True})
+    return hss
+
+
+def stored_restoration_info(node):
+    return node.database.Get_IMS_Subscriber(imsi=IMSI).get("scscf_restoration_info")
+
+
+def test_restarted_scscf_gets_the_registration_back_on_a_terminating_request(restoration):
+    """The case the feature exists for (TS 23.380 4.3.2): the S-CSCF asks for
+    unregistered services because it has no binding, and is given the
+    registration instead. The subscriber stays Registered; dropping it to
+    Unregistered, as without restoration, would make the HSS contradict the UE."""
+    info = restoration_info(restoration)
+    assert sar(restoration, 1, feature_list=RESTORATION, restoration_info=info).result_code == 2001
+
+    answer = sar(restoration, 3, feature_list=RESTORATION)
+    assert answer.experimental_result_code == 5007, "DIAMETER_ERROR_IN_ASSIGNMENT_TYPE carries the restoration"
+    assert answer.restoration_info == info, "returned exactly as the S-CSCF stored it"
+    assert "<IMSSubscription>" in answer.user_data, "the registered services need the profile"
+    assert answer.restoration_announced
+    assert stored(restoration) == (IMS_REGISTERED, SCSCF)
+
+
+def test_restoration_updates_the_diameter_peer_of_the_scscf(restoration):
+    """The S-CSCF instance that restores the registration answers RTR and PPR
+    from now on; the one that registered it is gone after a restart."""
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=restoration_info(restoration))
+    with restoration.database.engine.connect() as conn:
+        conn.execute(sqlalchemy.text("UPDATE ims_subscriber SET scscf_peer = 'scscf-gone;hss01'"))
+        conn.commit()
+    sar(restoration, 3, feature_list=RESTORATION)
+    assert restoration.database.Get_IMS_Subscriber(imsi=IMSI)["scscf_peer"] == "scscf-0.scscf.ims.example;hss01"
+
+
+def test_no_assignment_returns_the_registration_for_an_originating_request(restoration):
+    """TS 23.380 4.4.2: a request from the UE reaches the restarted S-CSCF,
+    which downloads the profile with NO_ASSIGNMENT and gets the registration
+    with it. Nothing about the state changes."""
+    info = restoration_info(restoration)
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=info)
+    answer = sar(restoration, 0, feature_list=RESTORATION)
+    assert answer.result_code == 2001
+    assert answer.restoration_info == info
+    assert stored(restoration) == (IMS_REGISTERED, SCSCF)
+
+
+def test_registered_without_stored_information_falls_back_to_unregistered(restoration):
+    """TS 23.380 4.5.2: there is nothing to restore when the S-CSCF never sent
+    any (for example registered before the feature was switched on), so the
+    request is served as for an unregistered user."""
+    sar(restoration, 1, feature_list=RESTORATION)
+    answer = sar(restoration, 3, feature_list=RESTORATION)
+    assert answer.result_code == 2001
+    assert answer.restoration_info is None
+    assert stored(restoration) == (IMS_UNREGISTERED, SCSCF)
+
+
+def test_scscf_without_the_feature_gets_neither_the_feature_nor_the_information(restoration):
+    """TS 29.229 table 7.1.1: an S-CSCF that does not announce IMS Restoration
+    must not be sent the information. It would not know what to do with a 5007
+    to UNREGISTERED_USER and would fail the call."""
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=restoration_info(restoration))
+    answer = sar(restoration, 3)
+    assert answer.result_code == 2001
+    assert answer.restoration_info is None and not answer.restoration_announced
+    assert stored(restoration) == (IMS_UNREGISTERED, SCSCF)
+
+
+def test_hss_without_the_feature_ignores_it(hss):
+    """hss.cx.ims_restoration off (the default): an S-CSCF that announces the
+    feature gets today's behaviour and nothing is stored."""
+    sar(hss, 1, feature_list=RESTORATION, restoration_info=restoration_info(hss))
+    assert stored_restoration_info(hss) is None
+    answer = sar(hss, 3, feature_list=RESTORATION)
+    assert answer.result_code == 2001 and answer.restoration_info is None
+    assert not answer.restoration_announced
+
+
+def test_re_registration_keeps_or_replaces_the_information(restoration):
+    """TS 29.228 table 6.1.2.1: the S-CSCF only sends it again when it changed,
+    so a refresh without it must not lose it."""
+    first = restoration_info(restoration, cseq=7)
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=first)
+    sar(restoration, 2, user_data_already_available=1, feature_list=RESTORATION)
+    assert stored_restoration_info(restoration) == first
+    changed = restoration_info(restoration, contact="<sip:ue@10.45.0.9:5060>")
+    sar(restoration, 2, user_data_already_available=1, feature_list=RESTORATION, restoration_info=changed)
+    assert stored_restoration_info(restoration) == changed
+
+
+def test_new_registration_without_information_drops_the_old_one(restoration):
+    """A registration from an S-CSCF that does not send the information must not
+    leave the previous registration's contact behind to be restored later."""
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=restoration_info(restoration))
+    sar(restoration, 1)
+    assert stored_restoration_info(restoration) is None
+
+
+@pytest.mark.parametrize("assignment_type", [4, 5, 8, 11])
+def test_deregistration_clears_the_information(restoration, assignment_type):
+    """A de-registered UE must not be resurrected by the next call: the stored
+    contact belongs to a registration that has ended (TS 29.228 6.1.2.1)."""
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=restoration_info(restoration))
+    sar(restoration, assignment_type, feature_list=RESTORATION)
+    assert stored_restoration_info(restoration) is None
+    answer = sar(restoration, 3, feature_list=RESTORATION)
+    assert answer.result_code == 2001 and answer.restoration_info is None
+
+
+def test_store_server_name_deregistration_clears_the_information(restoration, monkeypatch):
+    """The HSS keeps the S-CSCF assigned but the subscriber becomes Unregistered,
+    which has no registration to restore."""
+    monkeypatch.setitem(config["hss"], "cx", {"ims_restoration": True, "keep_scscf_on_deregistration": True})
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=restoration_info(restoration))
+    assert sar(restoration, 6, feature_list=RESTORATION).result_code == 2001
+    assert stored(restoration) == (IMS_UNREGISTERED, SCSCF)
+    assert stored_restoration_info(restoration) is None
+
+
+def test_network_initiated_deregistration_clears_the_information(restoration):
+    """RTR and the API de-register through Update_Serving_CSCF(None)."""
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=restoration_info(restoration))
+    restoration.database.Update_Serving_CSCF(imsi=IMSI, serving_cscf=None)
+    assert stored_restoration_info(restoration) is None
+
+
+def test_geored_carries_the_restoration_information(restoration, geored):
+    """Another HSS node may get the SAR of the restarted S-CSCF."""
+    info = restoration_info(restoration)
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=info)
+    assert geored[-1]["scscf_restoration_info"] == info
+    sar(restoration, 5, feature_list=RESTORATION)
+    assert geored[-1]["scscf_restoration_info"] is None
+
+
+def test_geored_update_from_a_node_without_the_column_keeps_the_information(restoration):
+    """During the rollout a node of the previous version sends no
+    scscf_restoration_info with a refresh."""
+    info = restoration_info(restoration)
+    sar(restoration, 1, feature_list=RESTORATION, restoration_info=info)
+    body = {"imsi": IMSI, "scscf": SCSCF, "scscf_timestamp": "2099-01-01T00:00:00Z", "scscf_state": IMS_REGISTERED}
+    assert restoration.database.Update_Serving_CSCF(
+        imsi=body["imsi"], serving_cscf=body["scscf"], scscf_timestamp=body["scscf_timestamp"],
+        propagate=False, scscf_state=body["scscf_state"]) is True
+    assert stored_restoration_info(restoration) == info
+
+
+def test_upgrade_adds_the_restoration_column(tmp_path):
+    """Schema version 7. Existing rows read as "nothing stored"."""
+    engine = sqlalchemy.create_engine(f"sqlite:///{tmp_path}/v6.db")
+    Base.metadata.create_all(engine)
+    with engine.connect() as conn:
+        conn.execute(sqlalchemy.text("ALTER TABLE ims_subscriber DROP COLUMN scscf_restoration_info"))
+        conn.execute(sqlalchemy.text("INSERT INTO database_schema_version (upgrade_id, comment) VALUES (6, 'test')"))
+        conn.commit()
+
+    schema = DatabaseSchema(LogTool(config), Base, engine, main_service=True)
+
+    assert schema.get_version() == DatabaseSchema.latest == 7
+    assert schema.column_exists("ims_subscriber", "scscf_restoration_info")
+    engine.dispose()

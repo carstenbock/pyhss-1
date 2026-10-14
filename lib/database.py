@@ -203,6 +203,7 @@ class IMS_SUBSCRIBER(Base):
     scscf_realm = Column(String(512), doc='Realm of SCSCF')
     scscf_peer = Column(String(512), doc='Diameter peer used to reach SCSCF')
     scscf_state = Column(SmallInteger, doc='Cx registration state (TS 29.228): 0=Not Registered, 1=Registered, 2=Unregistered (S-CSCF assigned for unregistered services). NULL with scscf set means Registered', nullable=True)
+    scscf_restoration_info = Column(Text, doc='S-CSCF Restoration Information (TS 23.380, TS 29.228 7.21): payload of the SCSCF-Restoration-Info AVP the S-CSCF stored, hex encoded. Only kept while Registered', nullable=True)
     sh_template_path = Column(String(512), doc='Path to template file for the Sh Profile')
     stn_sr = Column(String(64), doc='Session Transfer Number for SRVCC (TS 23.003)', nullable=True)
     ue_srvcc_capability = Column(Integer, doc='UE SRVCC Capability (TS 29.328 7.6.17): 0=not-supported, 1=supported', nullable=True)
@@ -213,6 +214,9 @@ class IMS_SUBSCRIBER(Base):
 IMS_NOT_REGISTERED = 0
 IMS_REGISTERED = 1
 IMS_UNREGISTERED = 2
+
+# Update_Serving_CSCF(): leave the stored S-CSCF restoration information as it is.
+RESTORATION_INFO_KEEP = object()
 
 def ims_registration_state(ims_subscriber) -> int:
     """Cx registration state of an IMS subscriber row (dict).
@@ -2203,7 +2207,7 @@ class Database:
         finally:
             self.safe_close(session)
 
-    def Update_Serving_CSCF(self, imsi, serving_cscf, scscf_realm=None, scscf_peer=None, scscf_timestamp=None, propagate=True, scscf_state=None):
+    def Update_Serving_CSCF(self, imsi, serving_cscf, scscf_realm=None, scscf_peer=None, scscf_timestamp=None, propagate=True, scscf_state=None, scscf_restoration_info=RESTORATION_INFO_KEEP):
         """Store or clear the S-CSCF of an IMS subscriber together with its Cx
         registration state.
 
@@ -2213,7 +2217,13 @@ class Database:
         node that made it and is only passed for a geored update: an update
         older than what this node holds is dropped (last writer wins), since
         updates of different Diameter nodes arrive in no particular order.
-        Returns False when the update was dropped for that reason."""
+        Returns False when the update was dropped for that reason.
+
+        scscf_restoration_info is the hex payload of the SCSCF-Restoration-Info
+        AVP to store, None to clear it, or RESTORATION_INFO_KEEP. It is only
+        kept while Registered: TS 29.228 6.1.2.1 clears it with every change to
+        Unregistered or Not Registered, so it is cleared there whatever is
+        passed."""
         self.logTool.log(service='Database', level='debug', message="Update_Serving_CSCF for sub " + str(imsi) + " to SCSCF " + str(serving_cscf) + " with realm " + str(scscf_realm) + " and peer " + str(scscf_peer), redisClient=self.redisMessaging)
         Session = sessionmaker(bind = self.engine)
         session = Session()
@@ -2246,6 +2256,10 @@ class Database:
                 result.scscf_realm = scscf_realm
                 result.scscf_peer = str(scscf_peer)
                 result.scscf_state = IMS_UNREGISTERED if scscf_state == IMS_UNREGISTERED else IMS_REGISTERED
+                if result.scscf_state == IMS_UNREGISTERED:
+                    result.scscf_restoration_info = None
+                elif scscf_restoration_info is not RESTORATION_INFO_KEEP:
+                    result.scscf_restoration_info = scscf_restoration_info or None
             else:
                 #Clear values
                 self.logTool.log(service='Database', level='debug', message="Clearing serving CSCF", redisClient=self.redisMessaging)
@@ -2253,6 +2267,7 @@ class Database:
                 result.scscf_realm = None
                 result.scscf_peer = None
                 result.scscf_state = IMS_NOT_REGISTERED
+                result.scscf_restoration_info = None
             # Kept when the S-CSCF is cleared: it is the time of the last state
             # change, which the geored ordering above depends on.
             result.scscf_timestamp = change_time
@@ -2265,7 +2280,7 @@ class Database:
             if propagate == True:
                 if 'IMS' in config['geored']['sync_actions'] and self.georedEnabled == True:
                     self.logTool.log(service='Database', level='debug', message="Propagate IMS changes to Geographic PyHSS instances", redisClient=self.redisMessaging)
-                    self.handleGeored({"imsi": str(imsi), "scscf": result.scscf, "scscf_realm": result.scscf_realm, "scscf_timestamp": scscf_timestamp_string, "scscf_peer": result.scscf_peer, "scscf_state": result.scscf_state})
+                    self.handleGeored({"imsi": str(imsi), "scscf": result.scscf, "scscf_realm": result.scscf_realm, "scscf_timestamp": scscf_timestamp_string, "scscf_peer": result.scscf_peer, "scscf_state": result.scscf_state, "scscf_restoration_info": result.scscf_restoration_info})
                 else:
                     self.logTool.log(service='Database', level='debug', message="Config does not allow sync of IMS events", redisClient=self.redisMessaging)
             return True

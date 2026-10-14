@@ -117,6 +117,12 @@ hss:
     # True keeps the S-CSCF assigned (state Unregistered), False clears it and
     # answers DIAMETER_SUCCESS_SERVER_NAME_NOT_STORED. Default: False
     keep_scscf_on_deregistration: False
+    # IMS Restoration Procedures (TS 23.380 clause 4): store the S-CSCF
+    # restoration information an S-CSCF sends with REGISTRATION and
+    # RE_REGISTRATION, and return it on UNREGISTERED_USER and NO_ASSIGNMENT
+    # while the subscriber is registered. Only towards an S-CSCF that announces
+    # IMSRestorationInd (Feature-List-ID 1, bit 2). Default: False
+    ims_restoration: False
 
   # Enable Zn Interface for GBA (Generic Bootstrapping Architecture)
   # Zn-Interface connects BSF (Bootstrapping Server Function) to HSS

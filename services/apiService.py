@@ -431,6 +431,7 @@ GeoRed_model = api.model('GeoRed', {
     'scscf_peer' : fields.String(description=IMS_SUBSCRIBER.scscf_peer.doc),
     'scscf_timestamp' : fields.String(description=IMS_SUBSCRIBER.scscf_timestamp.doc),
     'scscf_state' : fields.Integer(description=IMS_SUBSCRIBER.scscf_state.doc),
+    'scscf_restoration_info' : fields.String(description=IMS_SUBSCRIBER.scscf_restoration_info.doc),
     'xcap_profile' : fields.String(description=IMS_SUBSCRIBER.xcap_profile.doc),
     'imei' : fields.String(description=EIR.imei.doc),
     'match_response_code' : fields.String(description=EIR.match_response_code.doc),
@@ -2618,7 +2619,9 @@ class PyHSS_Geored(Resource):
                     json_data['scscf_timestamp'] = None
                 # scscf_state is absent in an update from a node older than schema
                 # version 6; Update_Serving_CSCF then stores Registered with an S-CSCF.
-                response_data.append(databaseClient.Update_Serving_CSCF(imsi=str(json_data['imsi']), serving_cscf=json_data['scscf'], scscf_realm=json_data['scscf_realm'], scscf_peer=json_data['scscf_peer'], scscf_timestamp=json_data['scscf_timestamp'], propagate=False, scscf_state=json_data.get('scscf_state')))
+                # scscf_restoration_info is absent from a node older than schema
+                # version 7, which then leaves the stored one alone.
+                response_data.append(databaseClient.Update_Serving_CSCF(imsi=str(json_data['imsi']), serving_cscf=json_data['scscf'], scscf_realm=json_data['scscf_realm'], scscf_peer=json_data['scscf_peer'], scscf_timestamp=json_data['scscf_timestamp'], propagate=False, scscf_state=json_data.get('scscf_state'), scscf_restoration_info=json_data.get('scscf_restoration_info', database.RESTORATION_INFO_KEEP)))
                 redisMessaging.sendMetric(serviceName='api', metricName='prom_flask_http_geored_endpoints',
                                     metricType='counter', metricAction='inc', 
                                     metricValue=1.0, metricHelp='Number of Geored Pushes Received',

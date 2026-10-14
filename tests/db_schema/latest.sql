@@ -134,6 +134,7 @@ CREATE TABLE ims_subscriber (
 	scscf VARCHAR(512),
 	scscf_peer VARCHAR(512),
 	scscf_realm VARCHAR(512),
+	scscf_restoration_info TEXT,
 	scscf_state SMALLINT,
 	scscf_timestamp DATETIME,
 	sh_profile TEXT,

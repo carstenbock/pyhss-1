@@ -8,7 +8,7 @@ from sqlalchemy_utils import database_exists, create_database
 
 
 class DatabaseSchema:
-    latest = 6
+    latest = 7
 
     def __init__(self, logTool, base, engine: Engine, main_service: bool):
         self.logTool = logTool
@@ -282,6 +282,15 @@ class DatabaseSchema:
         self.add_index("ims_subscriber", "pcscf_active_session")
         self.set_version(6)
 
+    def upgrade_add_scscf_restoration_info(self):
+        if self.get_version() >= 7:
+            return
+        self.upgrade_msg(7)
+        # S-CSCF restoration information (TS 23.380). NULL for every existing
+        # row, which is what an S-CSCF that never stored any leaves too.
+        self.add_column("ims_subscriber", "scscf_restoration_info", "TEXT")
+        self.set_version(7)
+
     def upgrade_all(self):
         self.upgrade_from_20240603_release_1_0_1()
         self.upgrade_add_ifc_template()
@@ -289,3 +298,4 @@ class DatabaseSchema:
         self.upgrade_add_sh_srvcc_columns()
         self.upgrade_add_lookup_indexes()
         self.upgrade_add_scscf_state()
+        self.upgrade_add_scscf_restoration_info()
