@@ -90,6 +90,7 @@ class Diameter:
         self.useDraFallback = config.get('hss', {}).get('use_dra_fallback', False)
         self.emergency_subscriber_expiry = config.get('hss', {}).get('emergency_subscriber_expiry', 3600)
         self.sendDsrOnMmeChange = config.get('hss', {}).get('send_dsr_on_mme_change', False)
+        self.cancelLocationOnMmeChange = config.get('hss', {}).get('CancelLocationRequest_Enabled', False) == True
         self.dsrExternalIdentifier = config.get('hss', {}).get('dsr_external_identifier', "subscriber")
         self.ignorePurgeUeRequest = config.get('hss', {}).get('ignore_purge_ue_request', False)
 
@@ -1551,48 +1552,66 @@ class Diameter:
         return True
 
 
+    def sendCancelLocationOnMmeChange(self, imsi, subscriberDetails, newMme, ulrFlags=0) -> bool:
+        """
+        Sends a CLR to the MME that served the subscriber before newMme
+        (TS 29.272 5.2.1.1.3). subscriberDetails must be the subscriber as read
+        before the new MME was stored. Returns True if a CLR was queued.
+        """
+        oldMme = subscriberDetails.get('serving_mme')
+        oldMmeRealm = subscriberDetails.get('serving_mme_realm')
+        oldMmePeer = str(subscriberDetails.get('serving_mme_peer') or '').split(';')[0]
+        if not oldMme or not oldMmeRealm or oldMme == newMme:
+            return False
+        # ULR-Flags bit 5: Initial-Attach-Indicator (TS 29.272 7.3.7).
+        if ulrFlags & (1 << 5):
+            cancellationType = 4    # INITIAL_ATTACH_PROCEDURE
+        else:
+            cancellationType = 0    # MME_UPDATE_PROCEDURE
+        sent = self.sendDiameterRequest(
+            requestType='CLR',
+            hostname=oldMmePeer or oldMme,
+            imsi=imsi,
+            DestinationHost=oldMme,
+            DestinationRealm=oldMmeRealm,
+            CancellationType=cancellationType,
+            immediateReattach=False,
+        )
+        if sent:
+            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [sendCancelLocationOnMmeChange] MME for {imsi} changed from {oldMme} to {newMme}: sent CLR (Cancellation-Type {cancellationType})", redisClient=self.redisMessaging)
+            return True
+        self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [sendCancelLocationOnMmeChange] MME for {imsi} changed from {oldMme} to {newMme}, but no CLR could be sent to {oldMmePeer or oldMme}", redisClient=self.redisMessaging)
+        return False
+
     def deregisterIms(self, imsi=None, msisdn=None) -> bool:
         """
         Revokes a given UE's IMS registration, and sends a RTR to the SCSCF (if defined).
         Does not revoke the pgw session, or notify the mme.
+
+        Uses the same RTR path as the OAM teardown (network_control._send_cx_rtr),
+        which addresses the S-CSCF by its Diameter identity. Returns False when
+        the subscriber is unknown or the RTR could not be sent.
         """
+        # Imported here: network_control is a helper of the services and is not
+        # needed by the rest of this module.
+        from network_control import _send_cx_rtr, get_ims_domain
         try:
             if imsi is None and msisdn is None:
                 return False
 
             if imsi is not None:
-                imsSubscriberDetails = self.database.Get_Subscriber(imsi=imsi)
-            if msisdn is not None:
-                imsSubscriberDetails = self.database.Get_Subscriber(msisdn=msisdn)
-        
-            if imsSubscriberDetails is None:
+                imsSubscriberDetails = self.database.Get_IMS_Subscriber(imsi=imsi)
+            else:
+                imsSubscriberDetails = self.database.Get_IMS_Subscriber(msisdn=msisdn)
+            imsi = imsSubscriberDetails.get('imsi')
+            if not imsi:
                 return False
-            
-            servingScscf = imsSubscriberDetails.get('scscf', None)
-            servingScscfPeer = imsSubscriberDetails.get('scscf_peer', None)
-            servingScscfRealm = imsSubscriberDetails.get('scscf_realm', None)
 
-            if servingScscfPeer is not None and servingScscfRealm is not None and servingScscf is not None:
-                if ';' in servingScscfPeer:
-                    servingScscfPeer = servingScscfPeer.split(';')[0]
-                servingScscf = servingScscf.replace('sip:', '')
-                if ';' in servingScscf:
-                    servingScscf = servingScscf.split(';')[0]
-                self.sendDiameterRequest(
-                requestType='RTR',
-                hostname=servingScscfPeer,
-                imsi=imsi,
-                destinationHost=servingScscf, 
-                destinationRealm=servingScscfRealm, 
-                domain=servingScscfRealm
-                )
-
-            if imsi is not None:
-                self.database.Update_Serving_CSCF(imsi=imsi, serving_cscf=None)
-            elif msisdn is not None:
-                self.database.Update_Serving_CSCF(msisdn=msisdn, serving_cscf=None)
-            
-            return True
+            warnings = []
+            _send_cx_rtr(self, imsSubscriberDetails, imsi, get_ims_domain(self.MCC, self.MNC),
+                         warnings, self.logTool, self.redisMessaging)
+            self.database.Update_Serving_CSCF(imsi=imsi, serving_cscf=None)
+            return not warnings
         except Exception as e:
             self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [deregisterIms] Error deregistering subscriber from IMS: {traceback.format_exc()}", redisClient=self.redisMessaging)
             return False
@@ -2341,6 +2360,17 @@ class Diameter:
         #     subscription_data += self.generate_vendor_avp(1427, "C0", 10415, self.string_to_hex(str(subscriber_details['APN_OI_replacement'])))
 
         avp += self.generate_vendor_avp(1400, "c0", 10415, subscription_data)                            #Subscription-Data
+
+        # TS 29.272 5.2.1.1.3: on an ULR from a new MME the HSS sends a CLR to
+        # the previous MME (MME_UPDATE_PROCEDURE, or INITIAL_ATTACH_PROCEDURE when
+        # the ULR's Initial-Attach-Indicator is set).
+        if self.cancelLocationOnMmeChange:
+            try:
+                ulrFlags = self.get_avp_data(avps, 1405)
+                ulrFlags = int(ulrFlags[0], 16) if ulrFlags else 0
+            except Exception:
+                ulrFlags = 0
+            self.sendCancelLocationOnMmeChange(imsi, subscriber_details, OriginHost, ulrFlags)
 
         # Send DSR to Old MME if enabled
         if self.sendDsrOnMmeChange == True:

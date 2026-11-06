@@ -110,11 +110,11 @@ CREATE TABLE emergency_subscriber (
 	PRIMARY KEY (emergency_subscriber_id)
 );
 CREATE TABLE ifc_template (
-	ifc_template_id INTEGER NOT NULL,
-	name VARCHAR(256) NOT NULL,
 	description VARCHAR(1024),
-	template_content TEXT NOT NULL,
+	ifc_template_id INTEGER NOT NULL,
 	last_modified VARCHAR(100),
+	name VARCHAR(256) NOT NULL,
+	template_content TEXT NOT NULL,
 	PRIMARY KEY (ifc_template_id),
 	UNIQUE (name)
 );
@@ -176,7 +176,6 @@ CREATE TABLE operation_log (
 	FOREIGN KEY(serving_apn_id) REFERENCES serving_apn (serving_apn_id),
 	FOREIGN KEY(auc_id) REFERENCES auc (auc_id),
 	FOREIGN KEY(subscriber_id) REFERENCES subscriber (subscriber_id),
-	FOREIGN KEY(ifc_template_id) REFERENCES ifc_template (ifc_template_id),
 	FOREIGN KEY(ims_subscriber_id) REFERENCES ims_subscriber (ims_subscriber_id),
 	FOREIGN KEY(roaming_rule_id) REFERENCES roaming_rule (roaming_rule_id),
 	FOREIGN KEY(roaming_network_id) REFERENCES roaming_network (roaming_network_id),
@@ -185,7 +184,8 @@ CREATE TABLE operation_log (
 	FOREIGN KEY(tft_id) REFERENCES tft (tft_id),
 	FOREIGN KEY(eir_id) REFERENCES eir (eir_id),
 	FOREIGN KEY(imsi_imei_history_id) REFERENCES eir_history (imsi_imei_history_id),
-	FOREIGN KEY(subscriber_attributes_id) REFERENCES subscriber_attributes (subscriber_attributes_id)
+	FOREIGN KEY(subscriber_attributes_id) REFERENCES subscriber_attributes (subscriber_attributes_id),
+	FOREIGN KEY(ifc_template_id) REFERENCES ifc_template (ifc_template_id)
 );
 CREATE TABLE roaming_network (
 	last_modified VARCHAR(100),

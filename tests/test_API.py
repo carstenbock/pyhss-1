@@ -255,8 +255,9 @@ class Subscriber_Tests(unittest.TestCase):
         r2 = requests.delete(str(base_url) + '/auc/' + str(self.__class__.template_data['auc_id']))
         r3 = requests.delete(str(base_url) + '/apn/' + str(self.__class__.template_data['default_apn']))
         r3 = requests.delete(str(base_url) + '/apn/' + str(int(self.__class__.template_data['default_apn'])+1))
-        xres = {"Result": "OK"}
-        self.assertEqual(xres, r.json(), "JSON body should match " + str(xres))
+        # The delete may carry teardown warnings (tests/config.yaml names no AAA
+        # server, so the SWx RTR is skipped); only the result matters here.
+        self.assertEqual("OK", r.json().get("Result"), "Result should be OK: " + str(r.json()))
 
 class IMS_Subscriber(unittest.TestCase):
     ims_subscriber_id = 0
@@ -290,6 +291,11 @@ class IMS_Subscriber(unittest.TestCase):
         self.__class__.template_data['scscf_timestamp'] = None
         self.__class__.template_data['sh_template_path'] = None
         self.__class__.template_data['xcap_profile'] = None
+        self.__class__.template_data['stn_sr'] = None
+        self.__class__.template_data['ue_srvcc_capability'] = None
+        self.__class__.template_data['ifc_template_id'] = None
+        self.__class__.template_data['scscf_state'] = None
+        self.__class__.template_data['scscf_restoration_info'] = None
 
         payload = payload_without_last_modified(r.json())
         self.assertEqual(self.__class__.template_data, payload, "JSON body should match input")
@@ -626,8 +632,9 @@ class GeoRed_MME(unittest.TestCase):
         r = requests.delete(str(base_url) + '/subscriber/' + str(self.__class__.subscriber_id))
         r2 = requests.delete(str(base_url) + '/auc/' + str(self.__class__.subscriber_template_data['auc_id']))
         r3 = requests.delete(str(base_url) + '/apn/' + str(self.__class__.subscriber_template_data['default_apn']))
-        xres = {"Result": "OK"}
-        self.assertEqual(xres, r.json(), "JSON body should match " + str(xres))
+        # The delete may carry teardown warnings (tests/config.yaml names no AAA
+        # server, so the SWx RTR is skipped); only the result matters here.
+        self.assertEqual("OK", r.json().get("Result"), "Result should be OK: " + str(r.json()))
 
 class GeoRed_PCRF(unittest.TestCase):
     subscriber_id = 0
@@ -696,8 +703,9 @@ class GeoRed_PCRF(unittest.TestCase):
         r = requests.delete(str(base_url) + '/subscriber/' + str(self.__class__.subscriber_id))
         r2 = requests.delete(str(base_url) + '/auc/' + str(self.__class__.subscriber_template_data['auc_id']))
         r3 = requests.delete(str(base_url) + '/apn/' + str(self.__class__.subscriber_template_data['default_apn']))
-        xres = {"Result": "OK"}
-        self.assertEqual(xres, r.json(), "JSON body should match " + str(xres))
+        # The delete may carry teardown warnings (tests/config.yaml names no AAA
+        # server, so the SWx RTR is skipped); only the result matters here.
+        self.assertEqual("OK", r.json().get("Result"), "Result should be OK: " + str(r.json()))
 
 
 class GeoRed_IMS(unittest.TestCase):
@@ -732,6 +740,11 @@ class GeoRed_IMS(unittest.TestCase):
         self.__class__.ims_template_data['scscf_timestamp'] = None
         self.__class__.ims_template_data['sh_template_path'] = None
         self.__class__.ims_template_data['xcap_profile'] = None
+        self.__class__.ims_template_data['stn_sr'] = None
+        self.__class__.ims_template_data['ue_srvcc_capability'] = None
+        self.__class__.ims_template_data['ifc_template_id'] = None
+        self.__class__.ims_template_data['scscf_state'] = None
+        self.__class__.ims_template_data['scscf_restoration_info'] = None
 
         payload = payload_without_last_modified(r.json())
         self.assertEqual(self.__class__.ims_template_data, payload, "JSON body should match input")
@@ -750,6 +763,9 @@ class GeoRed_IMS(unittest.TestCase):
         #Add Subscriber ID into Template for Validating
         self.__class__.ims_template_data['ims_subscriber_id'] = self.__class__.ims_subscriber_id
         self.__class__.ims_template_data['scscf'] = "test1234"
+        # An S-CSCF assignment replicated by geored means the user is Registered
+        # (TS 29.228 registration state 1).
+        self.__class__.ims_template_data['scscf_state'] = 1
 
         # FIXME: Update_Serving_CSCF() has str(scscf_peer)
         self.__class__.ims_template_data['scscf_peer'] = "None"
@@ -788,9 +804,13 @@ class GeoRed_IMS(unittest.TestCase):
         #Add Subscriber ID into Template for Validating
         self.__class__.ims_template_data['ims_subscriber_id'] = self.__class__.ims_subscriber_id
         self.__class__.ims_template_data['scscf'] = None
-        self.__class__.ims_template_data['scscf_timestamp'] = None
         self.__class__.ims_template_data['scscf_peer'] = None
+        # Clearing the S-CSCF means Not Registered (state 0). The time of the
+        # clear is kept: geored applies S-CSCF updates last-writer-wins on it.
+        self.__class__.ims_template_data['scscf_state'] = 0
         payload = payload_without_last_modified(r.json())
+        self.assertIsNotNone(payload.get('scscf_timestamp'), "the clear must carry its time for last-writer-wins")
+        self.__class__.ims_template_data['scscf_timestamp'] = payload['scscf_timestamp']
         self.assertEqual(self.__class__.ims_template_data, payload, "JSON body should match input")
 
     def test_W_GeoRed_IMS_Delete_IMS_Subscriber(self):

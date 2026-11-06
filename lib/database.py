@@ -2068,42 +2068,9 @@ class Database:
         session = Session()
         try:
             result = session.query(SUBSCRIBER).filter_by(imsi=imsi).one()
-            if config['hss']['CancelLocationRequest_Enabled'] == True:
-                self.logTool.log(service='Database', level='debug', message="Evaluating if we should trigger sending a CLR.", redisClient=self.redisMessaging)
-                if result.serving_mme != None:
-                    serving_hss = str(result.serving_mme_peer).split(';',1)[1]
-                    serving_mme_peer = str(result.serving_mme_peer).split(';',1)[0]
-                    self.logTool.log(service='Database', level='debug', message="Subscriber is currently served by serving_mme: " + str(result.serving_mme) + " at realm " + str(result.serving_mme_realm) + " through Diameter peer " + str(result.serving_mme_peer), redisClient=self.redisMessaging)
-                    self.logTool.log(service='Database', level='debug', message="Subscriber is now       served by serving_mme: " + str(serving_mme) + " at realm " + str(serving_mme_realm) + " through Diameter peer " + str(serving_mme_peer), redisClient=self.redisMessaging)
-                    #Evaluate if we need to send a CLR to the old MME
-                    if str(result.serving_mme) == str(serving_mme):
-                        self.logTool.log(service='Database', level='debug', message="This MME is unchanged (" + str(serving_mme) + ") - so no need to send a CLR", redisClient=self.redisMessaging)
-                    elif (str(result.serving_mme) != str(serving_mme)):
-                        self.logTool.log(service='Database', level='debug', message="There is a difference in serving MME, old MME is '" + str(result.serving_mme) + "' new MME is '" + str(serving_mme) + "' - We need to trigger sending a CLR", redisClient=self.redisMessaging)
-                        if serving_hss != config['hss']['OriginHost']:
-                            self.logTool.log(service='Database', level='debug', message="This subscriber is not served by this HSS it is served by HSS at " + serving_hss + " - We need to trigger sending a CLR on " + str(serving_hss), redisClient=self.redisMessaging)
-                            URL = 'http://' + serving_hss + '.' + config['hss']['OriginRealm'] + ':8080/push/clr/' + str(imsi)
-                        else:
-                            self.logTool.log(service='Database', level='debug', message="This subscriber is served by this HSS we need to send a CLR to old MME from this HSS", redisClient=self.redisMessaging)
-                        
-                        URL = 'http://' + serving_hss + '.' + config['hss']['OriginRealm'] + ':8080/push/clr/' + str(imsi)
-                        self.logTool.log(service='Database', level='debug', message="Sending CLR to API at " + str(URL), redisClient=self.redisMessaging)
-
-                        clrBody = {
-                            "imsi": str(imsi), 
-                            "DestinationRealm": result.serving_mme_realm,
-                            "DestinationHost": result.serving_mme,
-                            "cancellationType": 2,
-                            "diameterPeer": serving_mme_peer,
-                            }
-                        
-                        self.logTool.log(service='Database', level='debug', message="Pushing CLR to API on " + str(URL) + " with JSON body: " + str(clrBody), redisClient=self.redisMessaging)
-                        transaction_id = str(uuid.uuid4())
-                        self.handleGeored(clrBody, asymmetric=True, asymmetricUrls=[URL])
-                else:
-                    #No currently serving MME - No action to take
-                    self.logTool.log(service='Database', level='debug', message="No currently serving MME - No need to send CLR", redisClient=self.redisMessaging)
-
+            # The CLR to a previous MME is sent by the ULR handler
+            # (Diameter.Answer_16777251_316), not here: this method also runs for
+            # every geored update and every clear, on every node.
             if type(serving_mme) == str:
                 self.logTool.log(service='Database', level='debug', message="Updating serving MME & Timestamp", redisClient=self.redisMessaging)
                 result.serving_mme = serving_mme

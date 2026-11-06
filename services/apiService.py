@@ -6,6 +6,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import sys
 import json
+import binascii
+import yaml
 from flask import Flask, request, jsonify, Response
 from flask_restx import Api, Resource, fields, reqparse, abort
 from database import geored_check_updated_endpoints
@@ -259,6 +261,9 @@ def push_ims_profile_and_relay(ims_subscriber):
     if imsi:
         relay_to_diameter_nodes('/geored/push_ims_profile', {'imsi': imsi})
     return warnings
+
+
+def notify_subscribed_application_servers(ims_subscriber_data):
     """Send PNRs for subscriptions held locally and relay the change to any
     configured remote PyHSS nodes that hold their own subscriptions."""
     send_pnr_for_local_subscriptions(ims_subscriber_data)
@@ -1617,70 +1622,16 @@ class PyHSS_OAM_Deregister(Resource):
 
             warnings = teardown_subscriber_and_relay(imsi, ['pcrf', 'epc', 'ims', 'swx'])
 
-            # If a subscriber has an active serving apn, grab the pcrf session id for that apn and send a CCR-T, then a Registration Termination Request to the serving pgw peer.
+            # The Gx sessions were released by the 'pcrf' teardown above: RAR with
+            # Session-Release-Cause, then the PCEF's CCR-T (TS 29.212 4.5.9.6).
+            # An earlier block here sent a Gx CCR and a Cx RTR to the PGW, which a
+            # PCRF must not send; a variable mix-up kept the targeted pair from
+            # running, while its broadcasts went out without a Destination-Host.
+            # Only the serving-APN clean-up is kept.
             if subscriberId is not None:
                 servingApns = databaseClient.Get_Serving_APNs(subscriber_id=subscriberId)
-                if len(servingApns.get('apns', {})) > 0:
-                    for apnKey, apnDict in servingApns['apns'].items():
-                        pcrfSessionId = None
-                        servingPgwPeer = None
-                        servingPgwRealm = None
-                        servingPgw = None
-                        for apnDataKey, apnDataValue in servingApns['apns'][apnKey].items():
-                            if apnDataKey == 'pcrf_session_id':
-                                pcrfSessionId = apnDataValue
-                            if apnDataKey == 'serving_pgw_peer':
-                                servingPgwPeer = apnDataValue
-                            if apnDataKey == 'serving_pgw_realm':
-                                servingPgwRealm = apnDataValue
-                            if apnDataKey == 'serving_pgw':
-                                servingPgwRealm = apnDataValue
-                            
-                        if pcrfSessionId is not None and servingPgwPeer is not None and servingPgwRealm is not None and servingPgw is not None:
-                            if ';' in servingPgwPeer:
-                                servingPgwPeer = servingPgwPeer.split(';')[0]
-
-                            diameterClient.sendDiameterRequest(
-                            requestType='CCR',
-                            hostname=servingPgwPeer,
-                            imsi=imsi,
-                            destinationHost=servingPgw, 
-                            destinationRealm=servingPgwRealm,
-                            ccr_type=3,
-                            sessionId=pcrfSessionId,
-                            domain=servingPgwRealm
-                            )
-
-                            diameterClient.sendDiameterRequest(
-                            requestType='RTR',
-                            hostname=servingPgwPeer,
-                            imsi=imsi,
-                            destinationHost=servingPgw, 
-                            destinationRealm=servingPgwRealm, 
-                            domain=servingPgwRealm
-                            )
-                        
-                        diameterClient.broadcastDiameterRequest(
-                            requestType='CCR',
-                            peerType='PGW',
-                            imsi=imsi,
-                            destinationHost=servingPgw, 
-                            destinationRealm=servingPgwRealm,
-                            ccr_type=3,
-                            sessionId = pcrfSessionId,
-                            domain=servingPgwRealm
-                            )
-                        
-                        diameterClient.broadcastDiameterRequest(
-                        requestType='RTR',
-                        peerType='PGW',
-                        imsi=imsi,
-                        destinationHost=servingPgw, 
-                        destinationRealm=servingPgwRealm, 
-                        domain=servingPgwRealm
-                        )
-
-                        databaseClient.Update_Serving_APN(imsi=imsi, apn=apnKey, pcrf_session_id=None, serving_pgw=None, subscriber_routing='')
+                for apnKey in (servingApns.get('apns') or {}):
+                    databaseClient.Update_Serving_APN(imsi=imsi, apn=apnKey, pcrf_session_id=None, serving_pgw=None, subscriber_routing='')
 
             subscriberInfo = databaseClient.Get_Subscriber(imsi=str(imsi))
             imsSubscriberInfo = databaseClient.Get_IMS_Subscriber(imsi=str(imsi))

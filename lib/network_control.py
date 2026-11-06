@@ -29,14 +29,19 @@ def normalize_peer_hostname(peer_field: Optional[str]) -> Optional[str]:
     return str(peer_field).split(";")[0]
 
 
-def normalize_scscf_destination(scscf: Optional[str]) -> Optional[str]:
-    """Normalize stored S-CSCF name to a Diameter Destination-Host."""
-    if not scscf:
-        return None
-    host = str(scscf).replace("sip:", "")
-    if ";" in host:
-        host = host.split(";")[0]
-    return host
+def scscf_diameter_destination(ims_subscriber: dict) -> Optional[str]:
+    """Diameter identity of the serving S-CSCF, for Cx RTR/PPR Destination-Host.
+
+    ``scscf`` holds the SIP Server-Name from the SAR (e.g. ``sip:scscf.<domain>``),
+    which every S-CSCF pod shares and no Diameter peer carries as Origin-Host.
+    ``scscf_peer`` holds the S-CSCF's own Diameter identity (from the SAR's
+    Route-Record or Origin-Host) plus ``;<HSS Origin-Host>``. TS 29.228 §6.1.3
+    and §6.1.4: RTR and PPR go to the S-CSCF assigned to the user, so they must
+    name that identity; RFC 6733 §6.1.5 lets a relay forward on Destination-Host
+    only when it names a known peer. With the Server-Name the DRA fell back to
+    the Cx route, which points at the HSS, and the request was never answered.
+    """
+    return normalize_peer_hostname(ims_subscriber.get("scscf_peer"))
 
 
 def build_public_identities(ims_subscriber: dict, domain: str) -> List[str]:
@@ -177,43 +182,47 @@ def _send_cx_rtr(
     log_tool=None,
     redis_messaging=None,
 ) -> None:
-    serving_scscf = ims_subscriber_info.get("scscf")
     serving_scscf_realm = ims_subscriber_info.get("scscf_realm")
-    serving_scscf_peer = normalize_peer_hostname(ims_subscriber_info.get("scscf_peer"))
-    destination_host = normalize_scscf_destination(serving_scscf)
+    serving_scscf_peer = scscf_diameter_destination(ims_subscriber_info)
     public_identities = build_public_identities(ims_subscriber_info, ims_domain)
 
-    if serving_scscf_peer and serving_scscf_realm and destination_host:
-        try:
-            diameter_client.sendDiameterRequest(
-                requestType="RTR",
-                hostname=serving_scscf_peer,
-                imsi=imsi,
-                domain=ims_domain,
-                destinationHost=destination_host,
-                destinationRealm=serving_scscf_realm,
-                publicIdentities=public_identities,
-            )
-            _log(log_tool, redis_messaging, "info", f"[network_control] Sent targeted Cx RTR for IMSI {imsi} to {serving_scscf_peer}")
-        except Exception as exc:
-            msg = f"Cx RTR to serving S-CSCF failed for IMSI {imsi}: {exc}"
+    if not (serving_scscf_peer and serving_scscf_realm):
+        # Without the S-CSCF's Diameter identity the RTR cannot be addressed: a
+        # request without a usable Destination-Host follows the DRA's Cx route
+        # back to the HSS.
+        if ims_subscriber_info.get("scscf"):
+            msg = f"Cx RTR for IMSI {imsi} not sent: no S-CSCF Diameter identity on record"
             warnings.append(msg)
-            _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
+            _log(log_tool, redis_messaging, "warning", f"[network_control] {msg}")
+        return
 
+    sent = ""
     try:
-        diameter_client.broadcastDiameterRequest(
+        sent = diameter_client.sendDiameterRequest(
             requestType="RTR",
-            peerType="SCSCF",
+            hostname=serving_scscf_peer,
             imsi=imsi,
             domain=ims_domain,
-            destinationHost=destination_host,
+            destinationHost=serving_scscf_peer,
             destinationRealm=serving_scscf_realm,
             publicIdentities=public_identities,
         )
     except Exception as exc:
-        msg = f"Cx RTR broadcast to S-CSCF peers failed for IMSI {imsi}: {exc}"
+        msg = f"Cx RTR to serving S-CSCF failed for IMSI {imsi}: {exc}"
         warnings.append(msg)
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
+        return
+
+    if sent:
+        _log(log_tool, redis_messaging, "info", f"[network_control] Sent targeted Cx RTR for IMSI {imsi} to {serving_scscf_peer}")
+        return
+
+    # sendDiameterRequest returns empty without raising when neither the S-CSCF
+    # nor a DRA is in this process's peer table (always so in the API service;
+    # the Diameter nodes send it from /geored/network_teardown).
+    msg = f"Cx RTR for IMSI {imsi} was not sent from this node: peer {serving_scscf_peer} is not connected"
+    warnings.append(msg)
+    _log(log_tool, redis_messaging, "warning", f"[network_control] {msg}")
 
 
 def _aaa_rtr_destination_hosts(diameter_client, imsi: str) -> List[str]:
@@ -467,12 +476,10 @@ def push_ims_profile(
     """
     warnings: List[str] = []
     imsi = ims_subscriber.get("imsi")
-    serving_scscf = ims_subscriber.get("scscf")
     serving_scscf_realm = ims_subscriber.get("scscf_realm")
-    serving_scscf_peer = normalize_peer_hostname(ims_subscriber.get("scscf_peer"))
-    destination_host = normalize_scscf_destination(serving_scscf)
+    serving_scscf_peer = scscf_diameter_destination(ims_subscriber)
 
-    if not imsi or not serving_scscf_peer or not serving_scscf_realm or not destination_host:
+    if not imsi or not serving_scscf_peer or not serving_scscf_realm:
         _log(
             log_tool,
             redis_messaging,
@@ -500,7 +507,7 @@ def push_ims_profile(
             hostname=serving_scscf_peer,
             imsi=imsi,
             domain=ims_domain,
-            destinationHost=destination_host,
+            destinationHost=serving_scscf_peer,
             destinationRealm=serving_scscf_realm,
             cxUserData=cx_user_data,
         )
