@@ -6226,9 +6226,8 @@ class Diameter:
         identities = publicIdentities if publicIdentities else [f"sip:{imsi}@{domain}"]
         for public_identity in identities:
             avp += self.generate_vendor_avp(601, "c0", 10415, self.string_to_hex(str(public_identity)))
-
-        avp += self.generate_vendor_avp(602, "c0", 10415, self.ProductName)
-        avp += self.generate_avp(282, "40", self.OriginHost)
+        # TS 29.229 6.1.9: the RTR has no Server-Name. RFC 6733 6.7.1: Route-Record
+        # is added by relays, not by the originator (the DRA adds this node's).
 
         response = self.generate_diameter_packet("01", "c0", 304, 16777216, self.generate_id(4), self.generate_id(4), avp)
         return response
@@ -6250,7 +6249,7 @@ class Diameter:
         user_name = str(imsi) + "@" + str(domain)
         avp += self.generate_avp(1, 40, self.string_to_hex(user_name))
         avp += self.generate_vendor_avp(606, "c0", 10415, str(binascii.hexlify(str.encode(cxUserData)),'ascii'))
-        avp += self.generate_avp(282, "40", self.OriginHost)
+        # RFC 6733 6.7.1: Route-Record is added by relays, not by the originator.
 
         response = self.generate_diameter_packet("01", "c0", 305, 16777216, self.generate_id(4), self.generate_id(4), avp)
         return response

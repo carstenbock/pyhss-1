@@ -791,3 +791,29 @@ def test_upgrade_adds_the_restoration_column(tmp_path):
     assert schema.get_version() == DatabaseSchema.latest == 7
     assert schema.column_exists("ims_subscriber", "scscf_restoration_info")
     engine.dispose()
+
+
+def avp_codes(node, packet_hex):
+    _, avps = node.decode_diameter_packet(bytes.fromhex(packet_hex))
+    return [int(avp["avp_code"]) for avp in avps]
+
+
+def test_rtr_names_every_public_identity_and_nothing_a_relay_adds(hss):
+    # TS 29.229 6.1.9: *[ Public-Identity ], no Server-Name. RFC 6733 6.7.1:
+    # Route-Record is added by relays; with the HSS adding its own, the S-CSCF
+    # received the HSS identity twice once the DRA had added it as well.
+    impus = [IMPU, "tel:+" + MSISDN, "sip:" + IMSI + "@ims.example"]
+    codes = avp_codes(hss, hss.Request_16777216_304(IMSI, "ims.example", "scscf-0.scscf.ims.example",
+                                                     "ims.example", publicIdentities=impus))
+
+    assert codes.count(601) == 3
+    assert 602 not in codes
+    assert 282 not in codes
+    assert codes.count(293) == 1
+
+
+def test_ppr_carries_no_route_record_of_its_own(hss):
+    codes = avp_codes(hss, hss.Request_16777216_305(IMSI, "ims.example", "scscf-0.scscf.ims.example",
+                                                    "ims.example", "<IMSSubscription/>"))
+
+    assert 282 not in codes
