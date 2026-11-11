@@ -11,6 +11,7 @@ import uuid
 import os
 import random
 import ipaddress
+from typing import Optional
 import jinja2
 from database import Database, APN, ROAMING_NETWORK, ROAMING_RULE, EMERGENCY_SUBSCRIBER, IMS_SUBSCRIBER, geored_check_updated_endpoints, IFC_TEMPLATE
 from database import ims_registration_state, IMS_NOT_REGISTERED, IMS_REGISTERED, IMS_UNREGISTERED, RESTORATION_INFO_KEEP
@@ -88,6 +89,9 @@ class Diameter:
         self.diameterRequestTimeout = int(config.get('hss', {}).get('diameter_request_timeout', 10))
         self.diameterPeerKey = config.get('hss', {}).get('diameter_peer_key', 'diameterPeers')
         self.useDraFallback = config.get('hss', {}).get('use_dra_fallback', False)
+        # Hostname of the peer (usually a DRA) the request being handled arrived
+        # from; set by the HSS worker per message (KI-74).
+        self.ingressPeerHostname = None
         self.emergency_subscriber_expiry = config.get('hss', {}).get('emergency_subscriber_expiry', 3600)
         self.sendDsrOnMmeChange = config.get('hss', {}).get('send_dsr_on_mme_change', False)
         self.cancelLocationOnMmeChange = config.get('hss', {}).get('CancelLocationRequest_Enabled', False) == True
@@ -1102,7 +1106,23 @@ class Diameter:
             self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [getConnectedPeersByType] Failed to find get connected peers by type {peerType}, {traceback.format_exc()}", redisClient=self.redisMessaging)
             return []
 
-    def getPeerByHostname(self, hostname: str) -> Peer:
+    @staticmethod
+    def peerFieldVia(peerField) -> Optional[str]:
+        """Return the DRA a serving-peer field ('<host>;<hss>;<dra>') names, if any."""
+        parts = str(peerField or '').split(';')
+        return parts[2] if len(parts) > 2 and parts[2] and parts[2] != parts[0] else None
+
+    def ingressDra(self, originHost: str) -> Optional[str]:
+        """The relay the current request came through, or None if it came directly."""
+        ingress = getattr(self, 'ingressPeerHostname', None)
+        if ingress and ingress.lower() != str(originHost).lower():
+            return ingress
+        return None
+
+    def getPeerByHostname(self, hostname: str, via: Optional[str] = None) -> Peer:
+        """Return the connected peer named hostname. Otherwise, with DRA fallback,
+        a connected DRA: the one named via if it is connected (the DRA the
+        destination's own requests came through, KI-74), else the first."""
         self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [getPeerByHostname] Looking for peer with hostname {hostname}", redisClient=self.redisMessaging)
         try:
             hostname = hostname.lower()
@@ -1120,6 +1140,11 @@ class Diameter:
                 if self.useDraFallback == True:
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [getPeerByHostname] {hostname} not found, attempting to use DRA fallback", redisClient=self.redisMessaging)
                     connectedDraPeers = self.getDraPeers()
+                    if via:
+                        for draPeer in connectedDraPeers:
+                            if draPeer.Hostname.lower() == via.lower():
+                                return draPeer
+                        self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [getPeerByHostname] DRA {via} for {hostname} is not connected, using another DRA", redisClient=self.redisMessaging)
                     if len(connectedDraPeers) > 0:
                         return connectedDraPeers[0]
                     else:
@@ -1236,9 +1261,10 @@ class Diameter:
                 continue
         return response
 
-    def sendDiameterRequest(self, requestType: str, hostname: str, **kwargs) -> str:
+    def sendDiameterRequest(self, requestType: str, hostname: str, via: Optional[str] = None, **kwargs) -> str:
         """
         Sends a given diameter request of requestType to the provided peer hostname, if the peer is connected.
+        via: the DRA to prefer when hostname is not a direct peer (see getPeerByHostname).
         """
         try:
             request = ''
@@ -1250,7 +1276,7 @@ class Diameter:
                     assert(requestType == diameterApplication["requestAcronym"])
                 except Exception as e:
                     continue
-                connectedPeer = self.getPeerByHostname(hostname=hostname)
+                connectedPeer = self.getPeerByHostname(hostname=hostname, via=via)
                 peerIp = None
                 peerPort = None
 
@@ -1561,6 +1587,7 @@ class Diameter:
         oldMme = subscriberDetails.get('serving_mme')
         oldMmeRealm = subscriberDetails.get('serving_mme_realm')
         oldMmePeer = str(subscriberDetails.get('serving_mme_peer') or '').split(';')[0]
+        oldMmeVia = self.peerFieldVia(subscriberDetails.get('serving_mme_peer'))
         if not oldMme or not oldMmeRealm or oldMme == newMme:
             return False
         # ULR-Flags bit 5: Initial-Attach-Indicator (TS 29.272 7.3.7).
@@ -1571,6 +1598,7 @@ class Diameter:
         sent = self.sendDiameterRequest(
             requestType='CLR',
             hostname=oldMmePeer or oldMme,
+            via=oldMmeVia,
             imsi=imsi,
             DestinationHost=oldMme,
             DestinationRealm=oldMmeRealm,
@@ -2163,6 +2191,11 @@ class Diameter:
         except:     #If we don't have a record-route set, we'll send the response to the OriginHost
             remote_peer = OriginHost
         remote_peer = remote_peer + ";" + str(config['hss']['OriginHost'])
+        # Third part: the DRA this ULR came through. An MME attached to one DRA
+        # only is reachable only through that DRA (KI-74).
+        ingressDra = self.ingressDra(OriginHost)
+        if ingressDra:
+            remote_peer = remote_peer + ";" + ingressDra
         self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777251_316] [ULA] Remote Peer is " + str(remote_peer), redisClient=self.redisMessaging)
 
         self.database.Update_Serving_MME(imsi=imsi, serving_mme=OriginHost, serving_mme_peer=remote_peer, serving_mme_realm=OriginRealm)
@@ -2386,6 +2419,7 @@ class Diameter:
                         self.sendDiameterRequest(
                                             requestType='DSR',
                                             hostname=servingMmePeer,
+                                            via=self.peerFieldVia(maybeServingMmePeer),
                                             imsi=imsi,
                                             DestinationHost=servingMme, 
                                             DestinationRealm=servingMmeRealm,
@@ -2711,6 +2745,20 @@ class Diameter:
         sends the Rx ASR. Mirrors the Sh sh_notify relay: each endpoint hostname
         is resolved to all A/AAAA records so a single headless-service URL fans out
         to every node, and nodes without a matching subscription no-op."""
+        self._rx_relay('/geored/rx_terminate_af_subscriptions', {'imsi': imsi, 'apn': apn}, 'rx_relay_terminate')
+
+    def rx_relay_forget_af_session(self, subscriber_id, apn_id, af_session_id):
+        """Relay an ended Rx session (STR) to every PyHSS Diameter node.
+
+        A re-registration's AAR can reach another node than the first one, so
+        several nodes may hold the same session; an STR received by one node
+        removed only its own copy, and a later Gx CCR-T made the others send an
+        ASR for a session the AF had already ended (KI-84, TS 29.214 4.4.4)."""
+        self._rx_relay('/geored/rx_forget_af_session',
+                       {'subscriber_id': subscriber_id, 'apn_id': apn_id, 'af_session_id': af_session_id},
+                       'rx_relay_forget_af_session')
+
+    def _rx_relay(self, path, payload, label):
         endpoints = config.get('hss', {}).get('rx_notify_endpoints', []) or []
         if not endpoints:
             return
@@ -2723,16 +2771,16 @@ class Diameter:
             try:
                 addresses = sorted({addrinfo[4][0] for addrinfo in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
             except Exception as e:
-                self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [rx_relay_terminate] failed to resolve {host}: {e}", redisClient=self.redisMessaging)
+                self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [{label}] failed to resolve {host}: {e}", redisClient=self.redisMessaging)
                 continue
             for address in addresses:
                 urlHost = f"[{address}]" if ':' in address else address
-                url = f"{parsed.scheme}://{urlHost}:{port}/geored/rx_terminate_af_subscriptions"
+                url = f"{parsed.scheme}://{urlHost}:{port}{path}"
                 try:
-                    requests.post(url, json={'imsi': imsi, 'apn': apn}, timeout=2)
-                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [rx_relay_terminate] sent to {url} for IMSI {imsi} APN {apn}", redisClient=self.redisMessaging)
+                    requests.post(url, json=payload, timeout=2)
+                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [{label}] sent to {url}: {payload}", redisClient=self.redisMessaging)
                 except Exception as e:
-                    self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [rx_relay_terminate] relay to {url} failed: {e}", redisClient=self.redisMessaging)
+                    self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [{label}] relay to {url} failed: {e}", redisClient=self.redisMessaging)
 
 
     #3GPP Gx Credit Control Answer
@@ -5493,6 +5541,7 @@ class Diameter:
                 apnId = (self.database.Get_APN_by_Name(apn="ims")).get('apn_id', None)
                 if self.rx_remove_af_subscription(subscriber_id=subscriberId, apn_id=apnId, af_session_id=sessionId):
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] Removed AF Subscription for subscriber: {subscriberId}", redisClient=self.redisMessaging)
+                self.rx_relay_forget_af_session(subscriber_id=subscriberId, apn_id=apnId, af_session_id=sessionId)
                 servingApn = self.database.Get_Serving_APN(subscriber_id=subscriberId, apn_id=apnId)
                 try:
                     if not servingApn or servingApn == None or servingApn == 'None':

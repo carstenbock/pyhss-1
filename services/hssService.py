@@ -72,6 +72,9 @@ class HssService:
                     for buffered_diameter_message in buffered_diameter_messages:
                         self.logTool.log(service='HSS', level='debug', message=f"[HSS] [handleQueue] Processing message ({messageNumber} of {len(buffered_diameter_messages)}): {buffered_diameter_message}", redisClient=self.redisMessaging)
 
+                        # The peer this message came from (usually a DRA); handlers
+                        # record it to route their own requests back (KI-74).
+                        self.diameterLibrary.ingressPeerHostname = None
                         try:
                             diameterPeers = self.redisMessaging.getAllHashData(self.diameterPeerKey, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
                             if diameterPeers:
@@ -79,6 +82,7 @@ class HssService:
                                     diameterPeer = Peer.model_validate(pydantic_core.from_json(json.dumps(diameterPeerValue)))
                                     # If this is a message from a stored peer, increment prom_diam_request_count_host by 1.
                                     if diameterPeer.IpAddress == inboundData.SenderIp and diameterPeer.Port == inboundData.SenderPort:
+                                        self.diameterLibrary.ingressPeerHostname = diameterPeer.Hostname
                                         self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_request_count_host',
                                                     metricType='gauge', metricAction='inc',
                                                     metricLabels={

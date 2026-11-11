@@ -34,6 +34,7 @@ from network_control import (
     push_clr_and_relay,
     purge_subscriber_state_and_relay,
     teardown_subscriber,
+    serving_state_snapshot,
     push_ims_profile,
     ims_profile_push_fields_changed,
     push_ppr_for_ifc_template_subscribers,
@@ -221,7 +222,10 @@ def relay_to_diameter_nodes(path, payload):
 
 
 def teardown_subscriber_and_relay(imsi, domains):
-    # Keep serving-node fields until Diameter pods have sent CLR/RTR.
+    # Keep serving-node fields until Diameter pods have sent CLR/RTR. The
+    # Diameter pods read their own database replica, so the relay carries the
+    # serving-node fields read here from the primary (KI-38).
+    serving_state = serving_state_snapshot(databaseClient, imsi)
     warnings = teardown_subscriber(
         diameterClient,
         databaseClient,
@@ -234,7 +238,7 @@ def teardown_subscriber_and_relay(imsi, domains):
         log_tool=logTool,
         redis_messaging=redisMessaging,
     )
-    relay_to_diameter_nodes('/geored/network_teardown', {'imsi': imsi, 'domains': list(domains)})
+    relay_to_diameter_nodes('/geored/network_teardown', {'imsi': imsi, 'domains': list(domains), 'serving_state': serving_state})
     if 'epc' in domains:
         try:
             databaseClient.Update_Serving_MME(imsi=imsi, serving_mme=None)
@@ -2348,6 +2352,7 @@ class PyHSS_Geored_Network_Teardown(Resource):
                 clear_serving_state=False,
                 log_tool=logTool,
                 redis_messaging=redisMessaging,
+                serving_state=json_data.get('serving_state'),
             )
             return {'result': 'OK', 'warnings': warnings}, 200
         except Exception as E:
@@ -2437,6 +2442,25 @@ class PyHSS_Geored_Purge_Subscriber_State(Resource):
                 ims_subscriber_ids=json_data.get('ims_subscriber_ids') or [],
             )
             return {'result': 'OK', 'deleted': deleted, 'node': originHostname}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_geored.route('/rx_forget_af_session')
+class PyHSS_Geored_Rx_Forget_Af_Session(Resource):
+    @ns_geored.doc('Receive an ended Rx session (STR) and drop this node\'s copy of its AF subscription')
+    @no_auth_required
+    def post(self):
+        '''Remove the given Rx session from this node's AF subscriptions, so no ASR is sent for it later'''
+        try:
+            json_data = request.get_json(force=True)
+            subscriber_id = json_data.get('subscriber_id')
+            apn_id = json_data.get('apn_id')
+            af_session_id = json_data.get('af_session_id')
+            if subscriber_id is None or apn_id is None or not af_session_id:
+                return {'error': 'subscriber_id, apn_id and af_session_id are required'}, 400
+            diameterClient.rx_remove_af_subscription(subscriber_id=subscriber_id, apn_id=apn_id, af_session_id=af_session_id)
+            return {'result': 'OK'}, 200
         except Exception as E:
             print(E)
             return handle_exception(E)

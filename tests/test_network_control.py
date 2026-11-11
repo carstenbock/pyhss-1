@@ -1,6 +1,6 @@
 # Copyright 2026 volte.io
 # SPDX-License-Identifier: AGPL-3.0-or-later
-from network_control import _send_cx_rtr, push_clr_and_relay, push_ims_profile
+from network_control import _send_cx_rtr, push_clr_and_relay, push_ims_profile, serving_state_snapshot, teardown_subscriber
 
 IMSI = "001010000000001"
 CLR = {
@@ -201,3 +201,63 @@ def test_deregister_ims_reports_an_rtr_that_was_not_sent():
 
     assert hss.deregisterIms(imsi=IMSI) is False
     assert database.cleared == [(IMSI, None)]
+
+
+class FakeReplica:
+    """A Diameter node's own database copy, which may lack the registration."""
+
+    def __init__(self, subscriber=None, ims_subscriber=None):
+        self.subscriber = subscriber or {}
+        self.ims_subscriber = ims_subscriber or {}
+
+    def Get_Subscriber(self, **kwargs):
+        return dict(self.subscriber)
+
+    def Get_IMS_Subscriber(self, **kwargs):
+        return dict(self.ims_subscriber)
+
+
+UNREGISTERED_COPY = {key: value for key, value in IMS_SUBSCRIBER.items()
+                     if key not in ("scscf", "scscf_realm", "scscf_peer")}
+
+
+def test_teardown_uses_relayed_scscf_when_the_node_copy_lacks_it():
+    # KI-38: /oam/deregister cleared the HSS, but no Diameter node sent the RTR,
+    # because each node read its own database copy, which had no S-CSCF. The
+    # API relays what it read from the primary, so the S-CSCF is still told.
+    primary = FakeReplica(ims_subscriber=IMS_SUBSCRIBER)
+    node = FakeCxDiameter(connected_peers=[SCSCF_POD])
+
+    warnings = teardown_subscriber(
+        node, FakeReplica(ims_subscriber=UNREGISTERED_COPY), IMSI, domains=["ims"],
+        mcc="001", mnc="01", clear_serving_state=False,
+        serving_state=serving_state_snapshot(primary, IMSI),
+    )
+
+    assert warnings == []
+    assert [(sent[0], sent[2]["destinationHost"]) for sent in node.sent] == [("RTR", SCSCF_POD)]
+
+
+def test_teardown_without_relayed_state_cannot_address_the_rtr():
+    # The failure the relayed state fixes: from its own copy alone the node
+    # does not know an S-CSCF and sends nothing.
+    node = FakeCxDiameter(connected_peers=[SCSCF_POD])
+
+    teardown_subscriber(node, FakeReplica(ims_subscriber=UNREGISTERED_COPY), IMSI, domains=["ims"],
+                        mcc="001", mnc="01", clear_serving_state=False)
+
+    assert node.sent == []
+
+
+def test_relayed_state_does_not_override_the_node_copy():
+    # A node that has the registration itself (it may have handled a newer SAR)
+    # keeps its own S-CSCF; the relayed state only fills gaps.
+    other_pod = "cnaas-scscf-9.scscf.ims.mnc001.mcc001.3gppnetwork.org"
+    stale = dict(IMS_SUBSCRIBER, scscf_peer=other_pod)
+    node = FakeCxDiameter(connected_peers=[SCSCF_POD, other_pod])
+
+    teardown_subscriber(node, FakeReplica(ims_subscriber=IMS_SUBSCRIBER), IMSI, domains=["ims"],
+                        mcc="001", mnc="01", clear_serving_state=False,
+                        serving_state=serving_state_snapshot(FakeReplica(ims_subscriber=stale), IMSI))
+
+    assert [sent[2]["destinationHost"] for sent in node.sent] == [SCSCF_POD]

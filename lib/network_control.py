@@ -29,6 +29,12 @@ def normalize_peer_hostname(peer_field: Optional[str]) -> Optional[str]:
     return str(peer_field).split(";")[0]
 
 
+def peer_via(peer_field: Optional[str]) -> Optional[str]:
+    """The DRA a serving-peer field '<host>;<hss>;<dra>' names (KI-74), if any."""
+    parts = str(peer_field or "").split(";")
+    return parts[2] if len(parts) > 2 and parts[2] and parts[2] != parts[0] else None
+
+
 def scscf_diameter_destination(ims_subscriber: dict) -> Optional[str]:
     """Diameter identity of the serving S-CSCF, for Cx RTR/PPR Destination-Host.
 
@@ -87,6 +93,7 @@ def _send_clr(
             diameter_client.sendDiameterRequest(
                 requestType="CLR",
                 hostname=serving_mme_peer,
+                via=peer_via(subscriber_info.get("serving_mme_peer")),
                 imsi=imsi,
                 DestinationHost=serving_mme,
                 DestinationRealm=serving_mme_realm,
@@ -194,6 +201,8 @@ def _send_cx_rtr(
             msg = f"Cx RTR for IMSI {imsi} not sent: no S-CSCF Diameter identity on record"
             warnings.append(msg)
             _log(log_tool, redis_messaging, "warning", f"[network_control] {msg}")
+        else:
+            _log(log_tool, redis_messaging, "info", f"[network_control] No Cx RTR for IMSI {imsi}: no serving S-CSCF on record")
         return
 
     sent = ""
@@ -378,6 +387,42 @@ def _send_gx_session_release(
             _log(log_tool, redis_messaging, "error", f"[network_control] {traceback.format_exc()}")
 
 
+# Serving-node fields the teardown needs to address CLR and RTR.
+SERVING_FIELDS = {
+    "subscriber": ("serving_mme", "serving_mme_realm", "serving_mme_peer"),
+    "ims_subscriber": ("scscf", "scscf_realm", "scscf_peer"),
+}
+
+
+def serving_state_snapshot(database_client, imsi: str) -> dict:
+    """Read the serving-node fields of a subscriber, for the teardown relay.
+
+    The API reads the primary database. A Diameter node reads its own replica,
+    which can lack a registration the primary already has (KI-38), so the relay
+    carries what the API read.
+    """
+    readers = {"subscriber": database_client.Get_Subscriber, "ims_subscriber": database_client.Get_IMS_Subscriber}
+    snapshot = {}
+    for table, fields in SERVING_FIELDS.items():
+        try:
+            row = readers[table](imsi=str(imsi)) or {}
+        except Exception:
+            row = {}
+        snapshot[table] = {field: row.get(field) for field in fields if row.get(field)}
+    return snapshot
+
+
+def _fill_missing(local: dict, snapshot: Optional[dict]) -> dict:
+    """Return local with the snapshot's values where local has none."""
+    if not snapshot:
+        return local
+    merged = dict(local or {})
+    for field, value in snapshot.items():
+        if value and not merged.get(field):
+            merged[field] = value
+    return merged
+
+
 def teardown_subscriber(
     diameter_client,
     database_client,
@@ -389,11 +434,14 @@ def teardown_subscriber(
     clear_serving_state: bool = True,
     log_tool=None,
     redis_messaging=None,
+    serving_state: Optional[dict] = None,
 ) -> List[str]:
     """
     Send HSS-initiated teardown messages for the given IMSI.
 
     domains: subset of 'pcrf', 'epc', 'ims', 'swx' (default: all four).
+    serving_state: serving-node fields read by the caller (see
+    serving_state_snapshot); they fill fields this node's database lacks.
     Returns a list of non-fatal warning strings.
     """
     warnings: List[str] = []
@@ -411,6 +459,10 @@ def teardown_subscriber(
         ims_subscriber_info = database_client.Get_IMS_Subscriber(imsi=str(imsi))
     except Exception:
         ims_subscriber_info = {}
+
+    serving_state = serving_state or {}
+    subscriber_info = _fill_missing(subscriber_info, serving_state.get("subscriber"))
+    ims_subscriber_info = _fill_missing(ims_subscriber_info, serving_state.get("ims_subscriber"))
 
     resolved_mcc = mcc or getattr(diameter_client, "MCC", "999")
     resolved_mnc = mnc or getattr(diameter_client, "MNC", "999")

@@ -106,3 +106,31 @@ def test_cancel_location_is_off_unless_configured(hss):
     ulr(hss, MME2)
 
     assert clrs(hss) == []
+
+
+DRA0 = "dra-0.mnc001.mcc001.3gppnetwork.org"
+DRA1 = "dra-1.mnc001.mcc001.3gppnetwork.org"
+
+
+def test_clr_goes_through_the_dra_the_previous_mme_used(hss):
+    # KI-74: a DRA delivers by Destination-Host only to peers attached to
+    # itself. An MME attached to DRA-1 only never got the CLR when the HSS
+    # sent it to DRA-0, so the CLR names the DRA the old MME's ULR came through.
+    hss.ingressPeerHostname = DRA1
+    ulr(hss, MME1)
+    hss.ingressPeerHostname = DRA0
+
+    ulr(hss, MME2)
+
+    assert clrs(hss)[0][1]["via"] == DRA1
+
+
+def test_clr_to_a_directly_connected_mme_names_no_dra(hss):
+    hss.ingressPeerHostname = MME1   # MME1 is a direct peer of this HSS
+    ulr(hss, MME1)
+
+    ulr(hss, MME2)
+
+    hostname, kwargs = clrs(hss)[0]
+    assert hostname == MME1
+    assert kwargs["via"] is None
