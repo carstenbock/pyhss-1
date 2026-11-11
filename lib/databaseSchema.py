@@ -8,7 +8,7 @@ from sqlalchemy_utils import database_exists, create_database
 
 
 class DatabaseSchema:
-    latest = 7
+    latest = 8
 
     def __init__(self, logTool, base, engine: Engine, main_service: bool):
         self.logTool = logTool
@@ -291,6 +291,51 @@ class DatabaseSchema:
         self.add_column("ims_subscriber", "scscf_restoration_info", "TEXT")
         self.set_version(7)
 
+    def add_foreign_key(self, table, column, ref_table, ref_column):
+        """Add a foreign key to an existing table, after clearing values that
+        point at no row (the constraint would refuse them). Not possible on
+        SQLite, which cannot add a constraint to an existing table."""
+        inspector = sqlalchemy.inspect(self.engine)
+        if any(fk["constrained_columns"] == [column] and fk["referred_table"] == ref_table
+               for fk in inspector.get_foreign_keys(table)):
+            return
+        dangling_filter = (f"{column} IS NOT NULL AND {column} NOT IN "
+                           f"(SELECT {ref_column} FROM {ref_table})")
+        with self.engine.connect() as conn:
+            dangling = conn.execute(sqlalchemy.text(f"SELECT COUNT(*) FROM {table} WHERE {dangling_filter}")).scalar()
+        if dangling:
+            self.logTool.log(
+                service="Database",
+                level="warning",
+                message=f"{dangling} rows of {table} point at a {ref_table} that does not exist; "
+                        f"setting their {column} to NULL before adding the foreign key",
+            )
+            self.execute(f"UPDATE {table} SET {column} = NULL WHERE {dangling_filter}")
+        # MariaDB's IF NOT EXISTS keeps the replicated statement harmless on a
+        # replica that has the constraint already.
+        guard = "IF NOT EXISTS " if self.engine.name == "mysql" and self.engine.dialect.is_mariadb else ""
+        self.execute(f"ALTER TABLE {table} ADD CONSTRAINT fk_{table}_{column} "
+                     f"FOREIGN KEY {guard}({column}) REFERENCES {ref_table} ({ref_column})")
+
+    def upgrade_add_ifc_template_foreign_keys(self):
+        if self.get_version() >= 8:
+            return
+        self.upgrade_msg(8)
+        # Upgrade 2 added both ifc_template_id columns without the foreign keys
+        # a new database has, so an iFC template still in use could be deleted
+        # (KI-65).
+        if self.engine.name == "sqlite":
+            self.logTool.log(
+                service="Database",
+                level="info",
+                message="SQLite cannot add a foreign key to an existing table; "
+                        "ifc_template_id stays without one on this upgraded database",
+            )
+        else:
+            self.add_foreign_key("ims_subscriber", "ifc_template_id", "ifc_template", "ifc_template_id")
+            self.add_foreign_key("operation_log", "ifc_template_id", "ifc_template", "ifc_template_id")
+        self.set_version(8)
+
     def upgrade_all(self):
         self.upgrade_from_20240603_release_1_0_1()
         self.upgrade_add_ifc_template()
@@ -299,3 +344,4 @@ class DatabaseSchema:
         self.upgrade_add_lookup_indexes()
         self.upgrade_add_scscf_state()
         self.upgrade_add_scscf_restoration_info()
+        self.upgrade_add_ifc_template_foreign_keys()

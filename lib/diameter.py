@@ -903,6 +903,40 @@ class Diameter:
 
         return processed_avps
 
+    # Rx/Gx Flow-Status values (TS 29.214 5.3.11, used unchanged on Gx).
+    FLOW_STATUS_ENABLED = 2
+    FLOW_STATUS_REMOVED = 4
+
+    def rx_media_components(self, avps) -> list:
+        """The Media-Component-Descriptions of an Rx AAR (TS 29.214 5.3.16).
+
+        The packet decoder flattens all descendants of a grouped AVP into one
+        list, which loses the level a Flow-Status sits on. Each component is
+        therefore decoded again from its raw payload, one level at a time:
+        [{'number', 'media_type', 'flow_status', 'sub_components': [{'flow_status', 'flow_usage'}]}].
+        """
+        components = []
+        for payload in self.get_grouped_avp_payloads(avps, 517):
+            component = {'number': None, 'media_type': None, 'flow_status': None, 'sub_components': []}
+            for child in self.decodeAvpPacket(payload):
+                code = int(child['avp_code'])
+                if code == 518:
+                    component['number'] = int(child['misc_data'], 16)
+                elif code == 520:
+                    component['media_type'] = int(child['misc_data'], 16)
+                elif code == 511:
+                    component['flow_status'] = int(child['misc_data'], 16)
+                elif code == 519:
+                    sub = {'flow_status': None, 'flow_usage': None}
+                    for grandchild in child.get('sub_avps', []):
+                        if int(grandchild['avp_code']) == 511:
+                            sub['flow_status'] = int(grandchild['misc_data'], 16)
+                        elif int(grandchild['avp_code']) == 512:
+                            sub['flow_usage'] = int(grandchild['misc_data'], 16)
+                    component['sub_components'].append(sub)
+            components.append(component)
+        return components
+
     def get_grouped_avp_payloads(self, avps, avp_code):
         """Undecoded payloads (hex) of the top-level grouped AVPs with this code."""
         return [avpObject['grouped_data'] for avpObject in avps
@@ -1812,7 +1846,15 @@ class Diameter:
                 Flow_Description = self.generate_vendor_avp(507, "c0", 10415, str(binascii.hexlify(str.encode(tft['tft_string'])),'ascii'))
                 Flow_Information += self.generate_vendor_avp(1058, "80", 10415, Flow_Direction + Flow_Description)
 
-            Flow_Status = self.generate_vendor_avp(511, "c0", 10415, self.int_to_hex(2, 4))
+            # Flow-Status of the media component (KI-70): hold gives
+            # ENABLED-UPLINK/-DOWNLINK or DISABLED; ENABLED unless the AF says otherwise.
+            # SPEC-DEVIATION: TS 29.213 6.2 -- RTCP flows should stay ENABLED while
+            # the RTP flows are held, but RTP and RTCP share one PCC rule here,
+            # because Open5GS adds one dedicated bearer per rule name.
+            flowStatus = ChargingRules.get('flow_status')
+            if flowStatus is None:
+                flowStatus = self.FLOW_STATUS_ENABLED
+            Flow_Status = self.generate_vendor_avp(511, "c0", 10415, self.int_to_hex(int(flowStatus), 4))
             self.logTool.log(service='HSS', level='debug', message="Defined Flow_Status: " + str(Flow_Status), redisClient=self.redisMessaging)
 
             self.logTool.log(service='HSS', level='debug', message="Defining QoS information", redisClient=self.redisMessaging)
@@ -5216,7 +5258,7 @@ class Diameter:
                             # only when subscriberId is unavailable (e.g. emergency).
                             rule_name = "GBR-Voice_" + str(subscriberId if subscriberId else aarSessionID)
                             charging_rule_id = 1000
-                        elif (int(mediaType, 16) == 4):
+                        elif (int(mediaType, 16) == 1):
                             #Video
                             ulBandwidth = 512000
                             dlBandwidth = 512000
@@ -5400,16 +5442,33 @@ class Diameter:
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Updating Emergency Subscriber: {updatedEmergencySubscriberData}", redisClient=self.redisMessaging)
                             self.database.Update_Emergency_Subscriber(subscriberIp=ueIp, subscriberData=updatedEmergencySubscriberData, imsi=imsi)
 
-                        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAR Generated to be sent to serving PGW: {servingPgw} via peer {servingPgwPeer}", redisClient=self.redisMessaging)
-                        reAuthAnswer = self.awaitDiameterRequestAndResponse(
-                                requestType='RAR',
-                                hostname=servingPgwPeer,
-                                sessionId=pcrfSessionId,
-                                chargingRules=chargingRule,
-                                ueIp=ueIp,
-                                servingPgw=servingPgw,
-                                servingRealm=servingPgwRealm
-                        )
+                        # Flow-Status of the call's media component (TS 29.213 6.2, 6.3):
+                        # a held stream gates its flows, a removed one (port 0) loses its rule.
+                        callComponent = next((component for component in self.rx_media_components(avps)
+                                              if component['media_type'] == int(mediaType, 16)), None)
+                        rxFlowStatus = callComponent['flow_status'] if callComponent else None
+                        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAR Generated to be sent to serving PGW: {servingPgw} via peer {servingPgwPeer}, Flow-Status {rxFlowStatus}", redisClient=self.redisMessaging)
+                        if rxFlowStatus == self.FLOW_STATUS_REMOVED:
+                            reAuthAnswer = self.awaitDiameterRequestAndResponse(
+                                    requestType='RAR',
+                                    hostname=servingPgwPeer,
+                                    sessionId=pcrfSessionId,
+                                    servingPgw=servingPgw,
+                                    servingRealm=servingPgwRealm,
+                                    chargingRuleName=rule_name,
+                                    chargingRuleAction='remove'
+                            )
+                        else:
+                            chargingRule['flow_status'] = rxFlowStatus
+                            reAuthAnswer = self.awaitDiameterRequestAndResponse(
+                                    requestType='RAR',
+                                    hostname=servingPgwPeer,
+                                    sessionId=pcrfSessionId,
+                                    chargingRules=chargingRule,
+                                    ueIp=ueIp,
+                                    servingPgw=servingPgw,
+                                    servingRealm=servingPgwRealm
+                            )
 
                         if not len(reAuthAnswer) > 0:
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAA Timeout: {reAuthAnswer}", redisClient=self.redisMessaging)

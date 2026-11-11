@@ -788,7 +788,7 @@ def test_upgrade_adds_the_restoration_column(tmp_path):
 
     schema = DatabaseSchema(LogTool(config), Base, engine, main_service=True)
 
-    assert schema.get_version() == DatabaseSchema.latest == 7
+    assert schema.get_version() == DatabaseSchema.latest == 8
     assert schema.column_exists("ims_subscriber", "scscf_restoration_info")
     engine.dispose()
 
