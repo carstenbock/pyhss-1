@@ -356,6 +356,8 @@ def test_rx_rar_encoding(pcrf):
     assert bytes.fromhex(pcrf.get_avp_data(avps, 283)[0]).decode() == REALM
     assert int(pcrf.get_avp_data(avps, 258)[0], 16) == 16777236
     assert [int(value, 16) for value in pcrf.get_avp_data(avps, 513)] == [FAILED_RESOURCES_ALLOCATION]
+    # Re-Auth-Request-Type is mandatory in the base RAR; the P-CSCF answered 5005 without it.
+    assert [int(value, 16) for value in pcrf.get_avp_data(avps, 285)] == [0]
 
 
 def ccr_terminate(node, imsi, apn):

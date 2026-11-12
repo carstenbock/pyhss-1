@@ -7052,6 +7052,9 @@ class Diameter:
         avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin-Realm
         avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))                          #Destination-Realm
         avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))                           #Destination-Host
+        # Re-Auth-Request-Type AUTHORIZE_ONLY: mandatory in the base RAR (RFC 6733
+        # 8.3.1); the P-CSCF's stack refused the RAR without it with 5005.
+        avp += self.generate_avp(285, 40, self.int_to_hex(0, 4))                                         #Re-Auth-Request-Type
         for specificAction in specificActions:
             avp += self.generate_vendor_avp(513, "c0", 10415, self.int_to_hex(int(specificAction), 4))   #Specific-Action
         for mediaComponent in mediaComponents:
