@@ -15,7 +15,7 @@ from banners import Banners
 from logtool import LogTool
 from pyhss_config import config
 from database import geored_check_updated_endpoints
-from geored_routing import push_targets
+from geored_routing import push_targets, expand_endpoints
 
 class GeoredService:
     """
@@ -349,6 +349,8 @@ class GeoredService:
                 async with socketSession as session:
                     self.georedPeers = geored_check_updated_endpoints(config)
                     targets, fallback = push_targets(georedBody, self.georedPeers, self.georedPrimary)
+                    # Headless-Service endpoints become one URL per current pod (KI-139).
+                    targets, fallback = expand_endpoints(targets), expand_endpoints(fallback)
                     for remotePeer in targets:
                         georedTasks.append(self.sendGeored(asyncSession=session, url=remotePeer+'/geored/', operation=georedOperation, body=georedBody))
                     accepted = await asyncio.gather(*georedTasks)

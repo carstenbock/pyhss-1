@@ -93,3 +93,33 @@ def test_push_reports_whether_the_endpoint_took_it():
         return ok, failed, refused
 
     assert asyncio.run(run()) == (True, False, False)
+
+
+def test_headless_endpoint_reaches_pods_added_later():
+    # KI-139: the endpoint list was fixed at pod start, so pods the HPA added
+    # later never got the serving APN, emergency, EIR or XCAP pushes. The chart
+    # now names the pods by their headless Service, resolved at push time.
+    import geored_routing
+    geored_routing._resolved.clear()
+    pods = {"hss-headless": ["10.0.0.1", "10.0.0.2"]}
+    clock = [0.0]
+    resolve = lambda host, port: pods[host]
+    urls = ["http://hss-headless:8080"]
+
+    assert geored_routing.expand_endpoints(urls, own={"10.0.0.1"}, resolve=resolve, now=lambda: clock[0]) == \
+        ["http://10.0.0.2:8080"]
+
+    pods["hss-headless"] = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]                 # HPA adds a pod
+    clock[0] += geored_routing.RESOLVE_TTL + 0.1
+    assert geored_routing.expand_endpoints(urls, own={"10.0.0.1"}, resolve=resolve, now=lambda: clock[0]) == \
+        ["http://10.0.0.2:8080", "http://10.0.0.3:8080"]
+
+
+def test_unresolvable_endpoint_is_kept_so_the_failure_is_logged():
+    import geored_routing
+    geored_routing._resolved.clear()
+
+    def fail(host, port):
+        raise OSError("no such host")
+
+    assert geored_routing.expand_endpoints(["http://gone:8080"], own=set(), resolve=fail) == ["http://gone:8080"]
