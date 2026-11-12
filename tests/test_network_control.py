@@ -378,3 +378,58 @@ def test_pcrf_push_from_a_diameter_node_sends_the_rule_to_the_pgw():
 def test_pcrf_push_without_a_gx_session():
     from network_control import push_charging_rule
     assert push_charging_rule(FakeDiameter(), FakePcrfDatabase(None), IMSI, 3, 1)["result"] == "NoSession"
+
+
+def test_targeted_clr_is_not_broadcast_as_well():
+    # KI-154: the CLR went to the MME's DRA targeted and once more as a
+    # broadcast to every MME-type peer.
+    node = FakeS6aDiameter(connected_peers=[MME])
+
+    teardown_subscriber(node, FakeReplica(subscriber=ATTACHED), IMSI, domains=["epc"], clear_serving_state=False)
+
+    assert [sent[1] for sent in node.sent if sent[0] == "CLR"] == [MME]
+
+
+def test_deregistration_sends_one_clr_however_many_nodes():
+    # KI-154: the provisioning node relayed the teardown to every Diameter node
+    # and each sent it: one /oam/deregister gave the MME ten CLRs from five pods.
+    from network_control import relay_teardown_domains
+    nodes = {f"http://pod-{i}/geored/network_teardown": FakeS6aDiameter(connected_peers=[MME]) for i in range(5)}
+
+    def post(url, payload):
+        report = {}
+        teardown_subscriber(nodes[url], FakeReplica(subscriber=ATTACHED), payload["imsi"], domains=payload["domains"],
+                            clear_serving_state=False, report=report)
+        return {"result": "OK", "handled": report}
+
+    unsent = relay_teardown_domains(post, list(nodes), {"imsi": IMSI}, ["epc", "ims", "swx"])
+
+    assert unsent == []
+    assert sum(len(clrs(node)) for node in nodes.values()) == 1
+
+
+def test_teardown_moves_on_to_a_node_that_can_send():
+    from network_control import relay_teardown_domains
+    nodes = {"http://pod-0/x": FakeS6aDiameter(), "http://pod-1/x": FakeS6aDiameter(connected_peers=[MME])}
+    asked = []
+
+    def post(url, payload):
+        asked.append((url, payload["domains"]))
+        report = {}
+        teardown_subscriber(nodes[url], FakeReplica(subscriber=ATTACHED), IMSI, domains=payload["domains"],
+                            clear_serving_state=False, report=report)
+        return {"result": "OK", "handled": report}
+
+    assert relay_teardown_domains(post, list(nodes), {"imsi": IMSI}, ["epc"]) == []
+    assert asked == [("http://pod-0/x", ["epc"]), ("http://pod-1/x", ["epc"])]
+    assert len(clrs(nodes["http://pod-1/x"])) == 1
+
+
+def test_node_without_a_report_is_taken_to_have_sent_everything():
+    # A Diameter node older than the fix sends every domain and reports nothing.
+    from network_control import relay_teardown_domains
+    asked = []
+    post = lambda url, payload: asked.append(url) or {"result": "OK", "warnings": []}
+
+    assert relay_teardown_domains(post, ["a", "b"], {"imsi": IMSI}, ["epc", "ims"]) == []
+    assert asked == ["a"]

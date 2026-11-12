@@ -30,6 +30,7 @@ from messaging import RedisMessaging
 from baseModels import SubscriberInfo
 import database
 from network_control import (
+    relay_teardown_domains,
     send_clr,
     push_charging_rule,
     push_charging_rule_and_relay,
@@ -227,11 +228,41 @@ def relay_to_diameter_nodes(path, payload, until=None):
     return results
 
 
+def diameter_node_urls(path):
+    """The URLs of path on every HSS Diameter node (SH_NOTIFY_ENDPOINTS, each
+    host name resolved to all its addresses), as relay_to_diameter_nodes uses."""
+    urls = []
+    for endpoint in config.get('hss', {}).get('sh_notify_endpoints', []) or []:
+        parsed = urlparse(endpoint)
+        host, port = parsed.hostname, parsed.port or 8080
+        try:
+            addresses = sorted({addrinfo[4][0] for addrinfo in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+        except Exception as e:
+            logTool.log(service='API', level='warning', message=f"[API] Diameter relay: failed to resolve {host}: {e}", redisClient=redisMessaging)
+            continue
+        for address in addresses:
+            urlHost = f"[{address}]" if ':' in address else address
+            urls.append(f"{parsed.scheme}://{urlHost}:{port}{path}")
+    return urls
+
+
+def post_to_diameter_node(url, payload):
+    try:
+        resp = requests.post(url, json=payload, timeout=5)
+        if resp.status_code < 400:
+            return resp.json()
+        logTool.log(service='API', level='warning', message=f"[API] Diameter relay to {url} returned HTTP {resp.status_code}: {resp.text[:200]}", redisClient=redisMessaging)
+    except Exception as e:
+        logTool.log(service='API', level='warning', message=f"[API] Diameter relay to {url} failed: {e}", redisClient=redisMessaging)
+    return None
+
+
 def teardown_subscriber_and_relay(imsi, domains, immediate_reattach=False):
     # Keep serving-node fields until Diameter pods have sent CLR/RTR. The
     # Diameter pods read their own database replica, so the relay carries the
     # serving-node fields read here from the primary (KI-38).
     serving_state = serving_state_snapshot(databaseClient, imsi)
+    report = {}
     warnings = teardown_subscriber(
         diameterClient,
         databaseClient,
@@ -244,9 +275,17 @@ def teardown_subscriber_and_relay(imsi, domains, immediate_reattach=False):
         log_tool=logTool,
         redis_messaging=redisMessaging,
         immediate_reattach=immediate_reattach,
+        report=report,
+        defer_unsent=True,
     )
-    relay_to_diameter_nodes('/geored/network_teardown', {'imsi': imsi, 'domains': list(domains), 'serving_state': serving_state,
-                                                         'immediate_reattach': immediate_reattach})
+    # One node sends each message: the next node gets only what no earlier one
+    # could send (KI-154: every node sent everything, ten CLRs per deregister).
+    unsent = relay_teardown_domains(
+        post_to_diameter_node, diameter_node_urls('/geored/network_teardown'),
+        {'imsi': imsi, 'serving_state': serving_state, 'immediate_reattach': immediate_reattach},
+        [domain for domain in domains if not report.get(domain)])
+    if unsent:
+        warnings.append(f"No HSS node could send the teardown for domains {unsent} of IMSI {imsi}")
     if 'epc' in domains:
         try:
             databaseClient.Update_Serving_MME(imsi=imsi, serving_mme=None)
@@ -2332,6 +2371,7 @@ class PyHSS_Geored_Network_Teardown(Resource):
             if not imsi:
                 return {'error': 'imsi is required'}, 400
             domains = json_data.get('domains') or ['pcrf', 'epc', 'ims', 'swx']
+            report = {}
             warnings = teardown_subscriber(
                 diameterClient,
                 databaseClient,
@@ -2346,8 +2386,9 @@ class PyHSS_Geored_Network_Teardown(Resource):
                 serving_state=json_data.get('serving_state'),
                 # A relay from an older API without the field keeps the old CLR.
                 immediate_reattach=bool(json_data.get('immediate_reattach', False)),
+                report=report,
             )
-            return {'result': 'OK', 'warnings': warnings}, 200
+            return {'result': 'OK', 'warnings': warnings, 'handled': report, 'node': originHostname}, 200
         except Exception as E:
             print(E)
             return handle_exception(E)

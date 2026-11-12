@@ -84,18 +84,24 @@ def _send_clr(
     log_tool=None,
     redis_messaging=None,
     immediate_reattach: bool = False,
-) -> None:
-    # Cancellation-Type stays SUBSCRIPTION_WITHDRAWAL; the CLR-Flags bit
-    # Reattach-Required (TS 29.272 7.3.152) makes the MME send the Detach
-    # Request as "re-attach required" (TS 24.301 5.5.2.3.1), so the UE attaches
-    # again at once instead of staying detached until its radio is reset (KI-132).
+) -> bool:
+    """Send the teardown CLR from this node. Returns True when the CLR went out
+    (or there was nobody to send it to), False when this node had no route.
+
+    Cancellation-Type stays SUBSCRIPTION_WITHDRAWAL; the CLR-Flags bit
+    Reattach-Required (TS 29.272 7.3.152) makes the MME send the Detach Request
+    as "re-attach required" (TS 24.301 5.5.2.3.1), so the UE attaches again at
+    once instead of staying detached until its radio is reset (KI-132).
+    The broadcast to MME-type peers is only the fallback for a CLR that could
+    not be addressed: sent as well, it reached the MME a second time (KI-154).
+    """
     serving_mme = subscriber_info.get("serving_mme")
     serving_mme_realm = subscriber_info.get("serving_mme_realm")
     serving_mme_peer = normalize_peer_hostname(subscriber_info.get("serving_mme_peer"))
 
     if serving_mme_peer and serving_mme_realm and serving_mme:
         try:
-            diameter_client.sendDiameterRequest(
+            sent = diameter_client.sendDiameterRequest(
                 requestType="CLR",
                 hostname=serving_mme_peer,
                 via=peer_via(subscriber_info.get("serving_mme_peer")),
@@ -105,14 +111,19 @@ def _send_clr(
                 CancellationType=2,
                 immediateReattach=immediate_reattach,
             )
-            _log(log_tool, redis_messaging, "info", f"[network_control] Sent targeted CLR for IMSI {imsi} to {serving_mme_peer}")
+            if sent:
+                _log(log_tool, redis_messaging, "info", f"[network_control] Sent targeted CLR for IMSI {imsi} to {serving_mme_peer}")
+                return True
         except Exception as exc:
             msg = f"CLR to serving MME failed for IMSI {imsi}: {exc}"
             warnings.append(msg)
             _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
 
+    if not serving_mme:
+        # Nobody to address: nothing for any node to do.
+        return True
     try:
-        diameter_client.broadcastDiameterRequest(
+        peers = diameter_client.broadcastDiameterRequest(
             requestType="CLR",
             peerType="MME",
             imsi=imsi,
@@ -121,10 +132,14 @@ def _send_clr(
             CancellationType=2,
             immediateReattach=immediate_reattach,
         )
+        if isinstance(peers, list) and peers:
+            return True
     except Exception as exc:
         msg = f"CLR broadcast to MME peers failed for IMSI {imsi}: {exc}"
         warnings.append(msg)
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
+    warnings.append(f"CLR for IMSI {imsi} was not sent from this node: no route to {serving_mme_peer}")
+    return False
 
 
 def send_clr(diameter_client, imsi: str, clr: dict) -> bool:
@@ -163,6 +178,29 @@ def push_clr_and_relay(diameter_client, imsi: str, clr: dict, relay) -> dict:
         "relayed": len(node_results) > 0,
         "nodes_sent": nodes_sent,
     }
+
+
+def relay_teardown_domains(post, node_urls, payload: dict, domains) -> List[str]:
+    """Hand a teardown to the Diameter nodes one at a time (KI-154).
+
+    Every node sent every message of the teardown, so one /oam/deregister gave
+    the MME ten CLRs. Now a node gets only the domains no earlier node could
+    send, and the relay stops when none is left. post(url, payload) returns the
+    node's JSON body or None; a node older than HSS 1.7.35 has no 'handled'
+    and is taken to have sent everything. Returns the domains nobody sent.
+    """
+    remaining = list(domains)
+    for url in node_urls:
+        if not remaining:
+            break
+        body = post(url, dict(payload, domains=list(remaining)))
+        if body is None:
+            continue
+        handled = body.get("handled")
+        if handled is None:
+            return []
+        remaining = [domain for domain in remaining if not handled.get(domain)]
+    return remaining
 
 
 def push_charging_rule(diameter_client, database_client, imsi: str, apn_id, charging_rule_id) -> dict:
@@ -237,7 +275,7 @@ def _send_cx_rtr(
     warnings: List[str],
     log_tool=None,
     redis_messaging=None,
-) -> None:
+) -> bool:
     serving_scscf_realm = ims_subscriber_info.get("scscf_realm")
     serving_scscf_peer = scscf_diameter_destination(ims_subscriber_info)
     public_identities = build_public_identities(ims_subscriber_info, ims_domain)
@@ -252,7 +290,7 @@ def _send_cx_rtr(
             _log(log_tool, redis_messaging, "warning", f"[network_control] {msg}")
         else:
             _log(log_tool, redis_messaging, "info", f"[network_control] No Cx RTR for IMSI {imsi}: no serving S-CSCF on record")
-        return
+        return True
 
     sent = ""
     try:
@@ -269,11 +307,11 @@ def _send_cx_rtr(
         msg = f"Cx RTR to serving S-CSCF failed for IMSI {imsi}: {exc}"
         warnings.append(msg)
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
-        return
+        return False
 
     if sent:
         _log(log_tool, redis_messaging, "info", f"[network_control] Sent targeted Cx RTR for IMSI {imsi} to {serving_scscf_peer}")
-        return
+        return True
 
     # sendDiameterRequest returns empty without raising when neither the S-CSCF
     # nor a DRA is in this process's peer table (always so in the API service;
@@ -281,6 +319,7 @@ def _send_cx_rtr(
     msg = f"Cx RTR for IMSI {imsi} was not sent from this node: peer {serving_scscf_peer} is not connected"
     warnings.append(msg)
     _log(log_tool, redis_messaging, "warning", f"[network_control] {msg}")
+    return False
 
 
 def _aaa_rtr_destination_hosts(diameter_client, imsi: str) -> List[str]:
@@ -325,7 +364,7 @@ def _send_swx_rtr(
     warnings: List[str],
     log_tool=None,
     redis_messaging=None,
-) -> None:
+) -> bool:
     dest_hosts = _aaa_rtr_destination_hosts(diameter_client, imsi)
     if not dest_hosts:
         msg = (
@@ -334,7 +373,7 @@ def _send_swx_rtr(
         )
         warnings.append(msg)
         _log(log_tool, redis_messaging, "warning", f"[network_control] {msg}")
-        return
+        return True
     try:
         sent = 0
         for dest_host in dest_hosts:
@@ -358,10 +397,12 @@ def _send_swx_rtr(
                 warnings.append(f"SWx RTR to {dest_host} found no AAA/DRA peers for IMSI {imsi}")
         if not sent:
             warnings.append(f"SWx RTR broadcast found no AAA/DRA peers for IMSI {imsi}")
+        return bool(sent)
     except Exception as exc:
         msg = f"SWx RTR broadcast failed for IMSI {imsi}: {exc}"
         warnings.append(msg)
         _log(log_tool, redis_messaging, "error", f"[network_control] {msg}\n{traceback.format_exc()}")
+    return False
 
 
 def _send_gx_session_release(
@@ -372,7 +413,8 @@ def _send_gx_session_release(
     warnings: List[str],
     log_tool=None,
     redis_messaging=None,
-) -> None:
+    defer_unsent: bool = False,
+) -> bool:
     """Release every active Gx IP-CAN session for the subscriber.
 
     TS 29.212 §4.5.9.6 (PCRF-initiated IP-CAN Session Termination): the PCRF
@@ -385,14 +427,15 @@ def _send_gx_session_release(
     """
     subscriber_id = subscriber_info.get("subscriber_id")
     if subscriber_id is None:
-        return
+        return True
 
     try:
         serving_apns = database_client.Get_Serving_APNs(subscriber_id=subscriber_id)
     except Exception as exc:
         warnings.append(f"Failed to list serving APNs for IMSI {imsi}: {exc}")
-        return
+        return True
 
+    handled = True
     for apn_name, apn_data in (serving_apns.get("apns") or {}).items():
         if not apn_data:
             continue
@@ -426,6 +469,10 @@ def _send_gx_session_release(
             )
             continue
 
+        if defer_unsent:
+            # Another node (the relay that follows) may reach the PGW.
+            handled = False
+            continue
         # The PGW peer is not connected, so no CCR-T will arrive to trigger the
         # Rx ASR. Abort the AF sessions directly instead of leaking them.
         warnings.append(f"Gx peer {serving_pgw_peer} not connected for IMSI {imsi} APN {apn_name}; aborting Rx sessions directly")
@@ -434,6 +481,7 @@ def _send_gx_session_release(
         except Exception as exc:
             warnings.append(f"Rx ASR fallback for IMSI {imsi} APN {apn_name} failed: {exc}")
             _log(log_tool, redis_messaging, "error", f"[network_control] {traceback.format_exc()}")
+    return handled
 
 
 # Serving-node fields the teardown needs to address CLR and RTR.
@@ -485,6 +533,8 @@ def teardown_subscriber(
     redis_messaging=None,
     serving_state: Optional[dict] = None,
     immediate_reattach: bool = False,
+    report: Optional[dict] = None,
+    defer_unsent: bool = False,
 ) -> List[str]:
     """
     Send HSS-initiated teardown messages for the given IMSI.
@@ -492,6 +542,11 @@ def teardown_subscriber(
     domains: subset of 'pcrf', 'epc', 'ims', 'swx' (default: all four).
     serving_state: serving-node fields read by the caller (see
     serving_state_snapshot); they fill fields this node's database lacks.
+    report: filled with {domain: True when this node sent its messages (or
+    there was nothing to send), False when it had no route}, so the caller
+    can hand only the rest to another node (KI-154).
+    defer_unsent: leave what this node cannot send to the next node instead
+    of using the Rx ASR fallback for an unreachable PGW.
     immediate_reattach: set Reattach-Required in the S6a CLR. True for an
     operator deregistration of a subscriber who keeps the subscription; False
     for a subscriber delete or barring, where the UE must not come back.
@@ -525,8 +580,9 @@ def teardown_subscriber(
     # Runs first: releasing the IP-CAN session lets the P-CSCF tear an in-progress
     # call down cleanly (via the Rx ASR the CCR-T triggers) before the S6a CLR
     # detaches the UE and the Cx RTR force-deregisters the S-CSCF.
+    report = report if report is not None else {}
     if "pcrf" in active_domains:
-        _send_gx_session_release(
+        report["pcrf"] = _send_gx_session_release(
             diameter_client,
             database_client,
             subscriber_info,
@@ -534,11 +590,12 @@ def teardown_subscriber(
             warnings,
             log_tool,
             redis_messaging,
+            defer_unsent=defer_unsent,
         )
 
     if "epc" in active_domains:
-        _send_clr(diameter_client, subscriber_info, imsi, warnings, log_tool, redis_messaging,
-                  immediate_reattach=immediate_reattach)
+        report["epc"] = _send_clr(diameter_client, subscriber_info, imsi, warnings, log_tool, redis_messaging,
+                                  immediate_reattach=immediate_reattach)
         if clear_serving_state:
             try:
                 database_client.Update_Serving_MME(imsi=imsi, serving_mme=None)
@@ -546,7 +603,7 @@ def teardown_subscriber(
                 warnings.append(f"Failed to clear serving MME for IMSI {imsi}: {exc}")
 
     if "ims" in active_domains:
-        _send_cx_rtr(
+        report["ims"] = _send_cx_rtr(
             diameter_client,
             ims_subscriber_info,
             imsi,
@@ -561,8 +618,9 @@ def teardown_subscriber(
             except Exception as exc:
                 warnings.append(f"Failed to clear serving S-CSCF for IMSI {imsi}: {exc}")
 
-    if "swx" in active_domains and resolved_realm:
-        _send_swx_rtr(diameter_client, imsi, resolved_realm, warnings, log_tool, redis_messaging)
+    if "swx" in active_domains:
+        report["swx"] = (_send_swx_rtr(diameter_client, imsi, resolved_realm, warnings, log_tool, redis_messaging)
+                         if resolved_realm else True)
 
     return warnings
 
