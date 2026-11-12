@@ -221,7 +221,7 @@ def relay_to_diameter_nodes(path, payload):
     return results
 
 
-def teardown_subscriber_and_relay(imsi, domains):
+def teardown_subscriber_and_relay(imsi, domains, immediate_reattach=False):
     # Keep serving-node fields until Diameter pods have sent CLR/RTR. The
     # Diameter pods read their own database replica, so the relay carries the
     # serving-node fields read here from the primary (KI-38).
@@ -237,8 +237,10 @@ def teardown_subscriber_and_relay(imsi, domains):
         clear_serving_state=False,
         log_tool=logTool,
         redis_messaging=redisMessaging,
+        immediate_reattach=immediate_reattach,
     )
-    relay_to_diameter_nodes('/geored/network_teardown', {'imsi': imsi, 'domains': list(domains), 'serving_state': serving_state})
+    relay_to_diameter_nodes('/geored/network_teardown', {'imsi': imsi, 'domains': list(domains), 'serving_state': serving_state,
+                                                         'immediate_reattach': immediate_reattach})
     if 'epc' in domains:
         try:
             databaseClient.Update_Serving_MME(imsi=imsi, serving_mme=None)
@@ -1624,7 +1626,8 @@ class PyHSS_OAM_Deregister(Resource):
             imsSubscriberInfo = databaseClient.Get_IMS_Subscriber(imsi=str(imsi))
             subscriberId = subscriberInfo.get('subscriber_id', None)
 
-            warnings = teardown_subscriber_and_relay(imsi, ['pcrf', 'epc', 'ims', 'swx'])
+            # The subscriber keeps the subscription: the UE is asked to attach again (KI-132).
+            warnings = teardown_subscriber_and_relay(imsi, ['pcrf', 'epc', 'ims', 'swx'], immediate_reattach=True)
 
             # The Gx sessions were released by the 'pcrf' teardown above: RAR with
             # Session-Release-Cause, then the PCEF's CCR-T (TS 29.212 4.5.9.6).
@@ -2353,6 +2356,8 @@ class PyHSS_Geored_Network_Teardown(Resource):
                 log_tool=logTool,
                 redis_messaging=redisMessaging,
                 serving_state=json_data.get('serving_state'),
+                # A relay from an older API without the field keeps the old CLR.
+                immediate_reattach=bool(json_data.get('immediate_reattach', False)),
             )
             return {'result': 'OK', 'warnings': warnings}, 200
         except Exception as E:

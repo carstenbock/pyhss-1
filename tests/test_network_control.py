@@ -261,3 +261,57 @@ def test_relayed_state_does_not_override_the_node_copy():
                         serving_state=serving_state_snapshot(FakeReplica(ims_subscriber=stale), IMSI))
 
     assert [sent[2]["destinationHost"] for sent in node.sent] == [SCSCF_POD]
+
+
+MME = "mme01.epc.mnc001.mcc001.3gppnetwork.org"
+ATTACHED = {"imsi": IMSI, "serving_mme": MME, "serving_mme_realm": "epc.mnc001.mcc001.3gppnetwork.org",
+            "serving_mme_peer": f"{MME};hss01"}
+
+
+class FakeS6aDiameter(FakeDiameter):
+    def broadcastDiameterRequest(self, requestType, peerType, **kwargs):
+        self.sent.append((requestType, peerType, kwargs))
+        return []
+
+
+def clrs(node):
+    return [sent[2] for sent in node.sent if sent[0] == "CLR"]
+
+
+def test_deregistration_asks_the_ue_to_attach_again():
+    # KI-132: /oam/deregister detached test-agent-4's phone with "re-attach not
+    # required", and it stayed off LTE until its radio was reset. A subscriber
+    # who keeps the subscription must be asked to re-attach (CLR-Flags
+    # Reattach-Required, TS 29.272 7.3.152).
+    node = FakeS6aDiameter(connected_peers=[MME])
+
+    teardown_subscriber(node, FakeReplica(subscriber=ATTACHED), IMSI, domains=["epc"],
+                        clear_serving_state=False, immediate_reattach=True)
+
+    assert clrs(node) and all(clr["immediateReattach"] is True for clr in clrs(node))
+    assert all(clr["CancellationType"] == 2 for clr in clrs(node))
+
+
+def test_delete_and_barring_keep_the_ue_detached():
+    # A deleted or barred subscriber must not be asked to come back: that is
+    # the default, used by the subscriber delete and the "enabled: false" PATCH.
+    node = FakeS6aDiameter(connected_peers=[MME])
+
+    teardown_subscriber(node, FakeReplica(subscriber=ATTACHED), IMSI, domains=["epc"], clear_serving_state=False)
+
+    assert clrs(node) and all(clr["immediateReattach"] is False for clr in clrs(node))
+
+
+def test_reattach_flag_is_encoded_in_the_clr():
+    # The flag must reach the wire: CLR-Flags (1638) with bit 1 Reattach-Required.
+    from diameter import Diameter
+    node = Diameter.__new__(Diameter)
+    node.OriginHost, node.OriginRealm = node.string_to_hex("hss01"), node.string_to_hex("epc")
+
+    def clr_flags(immediate):
+        packet = node.Request_16777251_317(IMSI, "epc", MME, CancellationType=2, immediateReattach=immediate)
+        _, avps = node.decode_diameter_packet(bytes.fromhex(packet))
+        return [int(value, 16) for value in node.get_avp_data(avps, 1638)]
+
+    assert clr_flags(True) == [2]
+    assert clr_flags(False) == []

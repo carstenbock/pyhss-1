@@ -23,8 +23,8 @@ def _split_urls(val):
 def _apply_env_overrides(cfg):
     """Overlay Helm / Docker env vars that are not always in config.yaml.template.
 
-    Helm injects ENABLE_GEO_REDUNDANCY, SYNC_ENDPOINTS, SH_NOTIFY_ENDPOINTS,
-    RX_NOTIFY_ENDPOINTS. Docker compose uses GEORED_ENABLED / GEORED_ENDPOINT_N.
+    Helm injects ENABLE_GEO_REDUNDANCY, SYNC_ENDPOINTS, GEORED_PRIMARY_ENDPOINT,
+    SH_NOTIFY_ENDPOINTS, RX_NOTIFY_ENDPOINTS. Docker compose uses GEORED_ENABLED / GEORED_ENDPOINT_N.
     """
     if not isinstance(cfg, dict):
         cfg = {}
@@ -48,6 +48,10 @@ def _apply_env_overrides(cfg):
             endpoints = " ".join(collected)
     if endpoints is not None:
         geored["endpoints"] = _split_urls(endpoints)
+
+    primary = os.environ.get("GEORED_PRIMARY_ENDPOINT")
+    if primary is not None:
+        geored["primary_endpoint"] = primary.strip()
 
     actions = os.environ.get("GEORED_SYNC_ACTIONS")
     if actions:

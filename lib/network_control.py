@@ -83,7 +83,12 @@ def _send_clr(
     warnings: List[str],
     log_tool=None,
     redis_messaging=None,
+    immediate_reattach: bool = False,
 ) -> None:
+    # Cancellation-Type stays SUBSCRIPTION_WITHDRAWAL; the CLR-Flags bit
+    # Reattach-Required (TS 29.272 7.3.152) makes the MME send the Detach
+    # Request as "re-attach required" (TS 24.301 5.5.2.3.1), so the UE attaches
+    # again at once instead of staying detached until its radio is reset (KI-132).
     serving_mme = subscriber_info.get("serving_mme")
     serving_mme_realm = subscriber_info.get("serving_mme_realm")
     serving_mme_peer = normalize_peer_hostname(subscriber_info.get("serving_mme_peer"))
@@ -98,7 +103,7 @@ def _send_clr(
                 DestinationHost=serving_mme,
                 DestinationRealm=serving_mme_realm,
                 CancellationType=2,
-                immediateReattach=False,
+                immediateReattach=immediate_reattach,
             )
             _log(log_tool, redis_messaging, "info", f"[network_control] Sent targeted CLR for IMSI {imsi} to {serving_mme_peer}")
         except Exception as exc:
@@ -114,7 +119,7 @@ def _send_clr(
             DestinationHost=serving_mme,
             DestinationRealm=serving_mme_realm,
             CancellationType=2,
-            immediateReattach=False,
+            immediateReattach=immediate_reattach,
         )
     except Exception as exc:
         msg = f"CLR broadcast to MME peers failed for IMSI {imsi}: {exc}"
@@ -435,6 +440,7 @@ def teardown_subscriber(
     log_tool=None,
     redis_messaging=None,
     serving_state: Optional[dict] = None,
+    immediate_reattach: bool = False,
 ) -> List[str]:
     """
     Send HSS-initiated teardown messages for the given IMSI.
@@ -442,6 +448,9 @@ def teardown_subscriber(
     domains: subset of 'pcrf', 'epc', 'ims', 'swx' (default: all four).
     serving_state: serving-node fields read by the caller (see
     serving_state_snapshot); they fill fields this node's database lacks.
+    immediate_reattach: set Reattach-Required in the S6a CLR. True for an
+    operator deregistration of a subscriber who keeps the subscription; False
+    for a subscriber delete or barring, where the UE must not come back.
     Returns a list of non-fatal warning strings.
     """
     warnings: List[str] = []
@@ -484,7 +493,8 @@ def teardown_subscriber(
         )
 
     if "epc" in active_domains:
-        _send_clr(diameter_client, subscriber_info, imsi, warnings, log_tool, redis_messaging)
+        _send_clr(diameter_client, subscriber_info, imsi, warnings, log_tool, redis_messaging,
+                  immediate_reattach=immediate_reattach)
         if clear_serving_state:
             try:
                 database_client.Update_Serving_MME(imsi=imsi, serving_mme=None)

@@ -15,6 +15,7 @@ from banners import Banners
 from logtool import LogTool
 from pyhss_config import config
 from database import geored_check_updated_endpoints
+from geored_routing import push_targets
 
 class GeoredService:
     """
@@ -34,6 +35,9 @@ class GeoredService:
         self.redisWebhookMessaging = RedisMessagingAsync(host=self.redisHost, port=self.redisPort, useUnixSocket=self.redisUseUnixSocket, unixSocketPath=self.redisUnixSocketPath)
         
         self.georedPeers = geored_check_updated_endpoints(config)
+        # ADR-0040 step 1: replicated state goes to this endpoint only (the
+        # provisioning node); empty keeps the push to every endpoint.
+        self.georedPrimary = config.get('geored', {}).get('primary_endpoint') or None
         self.webhookPeers = config.get('webhooks', {}).get('endpoints', [])
         self.ocsPeers = config.get('ocs', {}).get('endpoints', [])
         self.ocsNotificationsEnabled = config.get('ocs', {}).get('enabled', False)
@@ -65,6 +69,7 @@ class GeoredService:
             
             headers = {"Content-Type": "application/json", "Transaction-Id": str(transactionId), "User-Agent": f"PyHSS/1.0.1 (Geored)"}
 
+            accepted = False
             for attempt in range(retryCount):
                 try:
                     responseStatusCode = None
@@ -80,6 +85,7 @@ class GeoredService:
                             responseStatusCode = response.status
 
                     if 200 <= responseStatusCode <= 299:
+                        accepted = True
                         await(self.logTool.logAsync(service='Geored', level='debug', message=f"[Geored] [sendGeored] Operation {operation} executed successfully on {url}, with body: ({body}) and transactionId {transactionId}. Response code: {responseStatusCode}"))
 
                         asyncio.ensure_future(self.redisGeoredMessaging.sendMetric(serviceName='geored', metricName='prom_http_geored',
@@ -168,7 +174,7 @@ class GeoredService:
             if self.benchmarking:
                 await(self.logTool.logAsync(service='Geored', level='info', message=f"[Geored] [sendGeored] Time taken to send individual geored request to {url}: {round(((time.perf_counter() - startTime)*1000), 3)} ms"))
 
-            return True
+            return accepted
 
     async def sendWebhook(self, asyncSession, url: str, operation: str, body: str, headers: dict, transactionId: str=uuid.uuid4(), retryCount: int=3) -> bool:
             """
@@ -342,9 +348,13 @@ class GeoredService:
                 socketSession = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
                 async with socketSession as session:
                     self.georedPeers = geored_check_updated_endpoints(config)
-                    for remotePeer in self.georedPeers:
+                    targets, fallback = push_targets(georedBody, self.georedPeers, self.georedPrimary)
+                    for remotePeer in targets:
                         georedTasks.append(self.sendGeored(asyncSession=session, url=remotePeer+'/geored/', operation=georedOperation, body=georedBody))
-                    await asyncio.gather(*georedTasks)
+                    accepted = await asyncio.gather(*georedTasks)
+                    if fallback and not all(accepted):
+                        await(self.logTool.logAsync(service='Geored', level='warning', message=f"[Geored] [handleGeoredQueue] {targets} did not accept the update, pushing it to {len(fallback)} node(s) directly"))
+                        await asyncio.gather(*[self.sendGeored(asyncSession=session, url=remotePeer+'/geored/', operation=georedOperation, body=georedBody) for remotePeer in fallback])
                 if self.benchmarking:
                     await(self.logTool.logAsync(service='Geored', level='info', message=f"[Geored] [handleGeoredQueue] Time taken to send geored message to all geored peers: {round(((time.perf_counter() - startTime)*1000), 3)} ms"))
 

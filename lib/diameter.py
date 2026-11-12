@@ -204,6 +204,7 @@ class Diameter:
 
                 # Rx PCEF/P-CSCF
                 {"commandCode": 274, "applicationId": 16777236, "requestMethod": self.Request_16777236_274, "failureResultCode": 5012 ,"requestAcronym": "ASR", "responseAcronym": "ASA", "requestName": "Abort Session Request", "responseName": "Abort Session Answer"},                
+                {"commandCode": 258, "applicationId": 16777236, "requestMethod": self.Request_16777236_258, "failureResultCode": 5012 ,"requestAcronym": "RX_RAR", "responseAcronym": "RX_RAA", "requestName": "Rx Re-Auth Request", "responseName": "Rx Re-Auth Answer"},
 
                 # Sh AS (TS 29.328)
                 {"commandCode": 309, "applicationId": 16777217, "requestMethod": self.Request_16777217_309, "failureResultCode": 5012 ,"requestAcronym": "PNR", "responseAcronym": "PNA", "requestName": "Push Notification Request", "responseName": "Push Notification Answer"},
@@ -936,6 +937,78 @@ class Diameter:
                     component['sub_components'].append(sub)
             components.append(component)
         return components
+
+    # Gx PCC-Rule-Status (TS 29.212 5.3.19) and Rx Specific-Action (TS 29.214 5.3.13).
+    PCC_RULE_STATUS_INACTIVE = 1
+    SPECIFIC_ACTION_INDICATION_OF_FAILED_RESOURCES_ALLOCATION = 9
+
+    def gx_charging_rule_reports(self, avps) -> list:
+        """The Charging-Rule-Reports of a Gx CCR (TS 29.212 5.3.18), decoded one
+        level at a time like rx_media_components:
+        [{'rule_names': [...], 'status': int|None, 'failure_code': int|None}]."""
+        reports = []
+        for payload in self.get_grouped_avp_payloads(avps, 1018):
+            report = {'rule_names': [], 'status': None, 'failure_code': None}
+            for child in self.decodeAvpPacket(payload):
+                code = int(child['avp_code'])
+                if code == 1005:
+                    report['rule_names'].append(bytes.fromhex(child['misc_data']).decode('utf-8', 'replace'))
+                elif code == 1019:
+                    report['status'] = int(child['misc_data'], 16)
+                elif code == 1031:
+                    report['failure_code'] = int(child['misc_data'], 16)
+            reports.append(report)
+        return reports
+
+    def gx_report_failed_call_rules(self, imsi, avps) -> list:
+        """Tell the P-CSCF that the bearer of a call could not be set up (KI-115).
+
+        The PCEF reports a PCC rule it could not install or enforce, e.g. after a
+        rejected Create Bearer Request, with PCC-Rule-Status INACTIVE in a CCR-U
+        (TS 29.212 4.5.12). For the voice and video rules this PCRF installed for
+        an Rx session, the PCRF sends an Rx RAR with Specific-Action
+        INDICATION_OF_FAILED_RESOURCES_ALLOCATION to the AF of that session
+        (TS 29.214 4.4.6). Returns the Rx Session-Ids it sent a RAR for.
+        """
+        reports = [report for report in self.gx_charging_rule_reports(avps)
+                   if report['status'] == self.PCC_RULE_STATUS_INACTIVE]
+        if not reports or not imsi:
+            return []
+        subscriber = self.database.Get_Subscriber(imsi=imsi) or {}
+        subscriberId = subscriber.get('subscriber_id')
+        callRules = {f"GBR-Voice_{subscriberId}", f"GBR-Video_{subscriberId}"}
+        failed = [(name, report['failure_code']) for report in reports
+                  for name in report['rule_names'] if name in callRules]
+        if not failed:
+            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: inactive PCC rules {[r['rule_names'] for r in reports]} belong to no Rx session", redisClient=self.redisMessaging)
+            return []
+        imsSubscriber = self.database.Get_IMS_Subscriber(imsi=imsi) or {}
+        afSessionId = imsSubscriber.get('pcscf_active_session')
+        afHost = imsSubscriber.get('pcscf')
+        afRealm = imsSubscriber.get('pcscf_realm')
+        if not afSessionId or not afHost or not afRealm:
+            self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: PCC rules {failed} failed, but no active Rx session is stored; the P-CSCF is not told", redisClient=self.redisMessaging)
+            return []
+        from network_control import peer_via
+        # SPEC-DEVIATION: TS 29.214 4.4.6 -- the RAR is sent whether or not the AF
+        # subscribed to INDICATION_OF_FAILED_RESOURCES_ALLOCATION in its AAR, and it
+        # carries no Flows AVP: PyHSS keeps neither the subscribed actions nor the
+        # media component numbers of an Rx session. Each call rule covers the
+        # session's only media component of its type, so the session is named whole.
+        sent = self.sendDiameterRequest(
+            requestType='RX_RAR',
+            hostname=afHost,
+            via=peer_via(imsSubscriber.get('pcscf_peer')),
+            sessionId=afSessionId,
+            destinationHost=afHost,
+            destinationRealm=afRealm,
+            specificActions=[self.SPECIFIC_ACTION_INDICATION_OF_FAILED_RESOURCES_ALLOCATION],
+        )
+        if not sent:
+            self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: Rx RAR for session {afSessionId} not sent, no route to {afHost}", redisClient=self.redisMessaging)
+            return []
+        self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: PCC rules {failed} inactive, sent Rx RAR INDICATION_OF_FAILED_RESOURCES_ALLOCATION for session {afSessionId} to {afHost}", redisClient=self.redisMessaging)
+        return [afSessionId]
 
     def get_grouped_avp_payloads(self, avps, avp_code):
         """Undecoded payloads (hex) of the top-level grouped AVPs with this code."""
@@ -3222,6 +3295,13 @@ class Diameter:
 
                     except Exception as E:
                         self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777238_272] [CCA] Error in populating dynamic charging rules: " + str(E), redisClient=self.redisMessaging)
+
+            # CCR - Update Request: rules the PCEF reports as failed (KI-115)
+            elif int(CC_Request_Type) == 2:
+                try:
+                    self.gx_report_failed_call_rules(imsi, avps)
+                except Exception as e:
+                    self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777238_272] [CCA] Failed to handle the Charging-Rule-Report of a CCR-U: {traceback.format_exc()}", redisClient=self.redisMessaging)
 
             # CCR - Termination Request
             elif int(CC_Request_Type) == 3:
@@ -6785,6 +6865,20 @@ class Diameter:
         avp += self.generate_vendor_avp(500, "c0", 10415, self.int_to_hex(abortCause, 4))                     #AVP Vendor ID
         
         response = self.generate_diameter_packet("01", "c0", 274, 16777236, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
+        return response
+
+    #3GPP Rx Re-Auth Request (TS 29.214 5.6.3), PCRF to AF
+    def Request_16777236_258(self, sessionId, destinationHost, destinationRealm, specificActions):
+        avp = ''
+        avp += self.generate_avp(263, 40, self.string_to_hex(sessionId))                                 #Session-Id
+        avp += self.generate_avp(258, 40, format(int(16777236),"x").zfill(8))                            #Auth-Application-Id (Rx)
+        avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin-Host
+        avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin-Realm
+        avp += self.generate_avp(283, 40, self.string_to_hex(destinationRealm))                          #Destination-Realm
+        avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))                           #Destination-Host
+        for specificAction in specificActions:
+            avp += self.generate_vendor_avp(513, "c0", 10415, self.int_to_hex(int(specificAction), 4))   #Specific-Action
+        response = self.generate_diameter_packet("01", "c0", 258, 16777236, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
         return response
 
     # ============================================================================
