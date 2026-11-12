@@ -195,3 +195,28 @@ def test_rx_rar_encoding(pcrf):
     assert bytes.fromhex(pcrf.get_avp_data(avps, 283)[0]).decode() == REALM
     assert int(pcrf.get_avp_data(avps, 258)[0], 16) == 16777236
     assert [int(value, 16) for value in pcrf.get_avp_data(avps, 513)] == [FAILED_RESOURCES_ALLOCATION]
+
+
+def ccr_terminate(node, imsi, apn):
+    avp = node.generate_avp(263, 40, node.string_to_hex("pgw;9;9"))
+    avp += node.generate_avp(264, 40, node.string_to_hex("pgw.epc"))
+    avp += node.generate_avp(296, 40, node.string_to_hex("epc"))
+    avp += node.generate_avp(258, 40, "01000016")
+    avp += node.generate_avp(416, 40, node.int_to_hex(3, 4))
+    avp += node.generate_avp(415, 40, node.int_to_hex(2, 4))
+    avp += node.generate_avp(443, 40, node.generate_avp(450, 40, node.int_to_hex(1, 4))
+                             + node.generate_avp(444, 40, node.string_to_hex(imsi)))
+    avp += node.generate_avp(30, 40, node.string_to_hex(apn))
+    packet = node.generate_diameter_packet("01", "c0", 272, 16777238, "00000007", "00000008", avp)
+    answer = node.Answer_16777238_272(*node.decode_diameter_packet(bytes.fromhex(packet)))
+    _, answer_avps = node.decode_diameter_packet(bytes.fromhex(answer))
+    return int(node.get_avp_data(answer_avps, 268)[0], 16)
+
+
+def test_ccr_t_for_a_deleted_subscriber_or_unprovisioned_apn_succeeds(pcrf):
+    # The CCR-I of such a session is accepted; its CCR-T was answered 5030
+    # (DIAMETER_USER_UNKNOWN) because the lookups for the state to clear raised,
+    # e.g. for a subscriber deleted while attached. There is nothing to clear.
+    assert ccr_terminate(pcrf, "001010000009999", "ims") == 2001
+    assert ccr_terminate(pcrf, IMSI, "temporary-apn") == 2001
+    assert ccr_terminate(pcrf, IMSI, "ims") == 2001

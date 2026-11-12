@@ -31,6 +31,8 @@ from baseModels import SubscriberInfo
 import database
 from network_control import (
     send_clr,
+    push_charging_rule,
+    push_charging_rule_and_relay,
     push_clr_and_relay,
     purge_subscriber_state_and_relay,
     teardown_subscriber,
@@ -177,7 +179,7 @@ def relay_sh_profile_update(ims_subscriber_data):
                 logTool.log(service='API', level='warning', message=f"[API] Sh notify relay to {url} failed: {e}", redisClient=redisMessaging)
 
 
-def relay_to_diameter_nodes(path, payload):
+def relay_to_diameter_nodes(path, payload, until=None):
     """Fan out a Diameter-side action to HSS Diameter API pods.
 
     Provisioning and Diameter run in separate pods with separate Redis, so
@@ -185,6 +187,8 @@ def relay_to_diameter_nodes(path, payload):
     peer table. Uses the same SH_NOTIFY_ENDPOINTS headless-service expansion
     as Sh PNR relay. Diameter nodes must not call this helper (no loop).
     Returns the JSON bodies of the nodes that answered with HTTP < 400.
+    until(body): stop at the first node whose answer it accepts, for a request
+    that one node is to send (e.g. a Gx RAR to the PGW).
     """
     results = []
     endpoints = config.get('hss', {}).get('sh_notify_endpoints', []) or []
@@ -216,6 +220,8 @@ def relay_to_diameter_nodes(path, payload):
                         results.append(resp.json())
                     except ValueError:
                         results.append({})
+                    if until is not None and until(results[-1]):
+                        return results
             except Exception as e:
                 logTool.log(service='API', level='warning', message=f"[API] Diameter relay to {url} failed: {e}", redisClient=redisMessaging)
     return results
@@ -2028,38 +2034,20 @@ class PyHSS_PCRF(Resource):
         '''Push predefined Charging Rule to Subscriber'''
     
         json_data = request.get_json(force=True)
-        #Get IMSI
-        subscriber_data = databaseClient.Get_Subscriber(imsi=str(json_data['imsi']))
-        print("subscriber_data: " + str(subscriber_data))
-
-        #Get PCRF Session
-        servingApn = databaseClient.Get_Serving_APN(subscriber_id=subscriber_data['subscriber_id'], apn_id=json_data['apn_id'])          
-        print("pcrf_session_data: " + str(servingApn))
-
-        #Get Charging Rules
-        ChargingRule = databaseClient.Get_Charging_Rule(json_data['charging_rule_id'])
-        ChargingRule['apn_data'] = databaseClient.Get_APN(json_data['apn_id'])
-        print("Got ChargingRule: " + str(ChargingRule))
-
-        subscriberId = subscriber_data.get('subscriber_id', None)
-        servingPgwPeer = servingApn.get('serving_pgw_peer', None).split(';')[0]
-        servingPgw = servingApn.get('serving_pgw', None)
-        servingPgwRealm = servingApn.get('serving_pgw_realm', None)
-        pcrfSessionId = servingApn.get('pcrf_session_id', None)
-        ueIp = servingApn.get('subscriber_routing', None)
-
-        diameterResponse = diameterClient.sendDiameterRequest(
-                requestType='RAR',
-                hostname=servingPgwPeer,
-                sessionId=pcrfSessionId,
-                chargingRules=ChargingRule,
-                ueIp=ueIp,
-                servingPgw=servingPgw,
-                servingRealm=servingPgwRealm
-            )
-        
-        result = {"Result": "Successfully sent Gx RAR", "destinationClients": str(servingPgw)}
-        return result, 200
+        try:
+            # The provisioning node has no Diameter peers: the RAR is sent by a
+            # Diameter node, and the answer says whether one sent it (KI-149).
+            outcome = push_charging_rule_and_relay(diameterClient, databaseClient, json_data['imsi'],
+                                                   json_data['apn_id'], json_data['charging_rule_id'],
+                                                   relay_to_diameter_nodes)
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+        if outcome['result'] == 'NoSession':
+            return {'Result': 'Failed', 'reason': f"no Gx session for IMSI {json_data['imsi']} on APN {json_data['apn_id']}"}, 404
+        if outcome['result'] != 'OK':
+            return {'Result': 'Failed', 'reason': f"no Diameter node could send the Gx RAR to {outcome.get('pgw')}"}, 503
+        return {"Result": "Successfully sent Gx RAR", "destinationClients": str(outcome.get('pgw')), "node": outcome.get('node', originHostname)}, 200
 
 @ns_pcrf.route('/clr_subscriber')
 class PyHSS_PCRF_CLR_Subscriber(Resource):
@@ -2360,6 +2348,23 @@ class PyHSS_Geored_Network_Teardown(Resource):
                 immediate_reattach=bool(json_data.get('immediate_reattach', False)),
             )
             return {'result': 'OK', 'warnings': warnings}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_geored.route('/push_charging_rule')
+class PyHSS_Geored_Push_Charging_Rule(Resource):
+    @ns_geored.doc('Send the Gx RAR of PUT /pcrf/ from this Diameter node')
+    @no_auth_required
+    def post(self):
+        '''Install a predefined charging rule for a Gx session via this node's Diameter peer table (no further relay)'''
+        try:
+            json_data = request.get_json(force=True)
+            for key in ('imsi', 'apn_id', 'charging_rule_id'):
+                if key not in json_data:
+                    return {'error': f'{key} is required'}, 400
+            outcome = push_charging_rule(diameterClient, databaseClient, json_data['imsi'], json_data['apn_id'], json_data['charging_rule_id'])
+            return dict(outcome, node=originHostname), 200
         except Exception as E:
             print(E)
             return handle_exception(E)

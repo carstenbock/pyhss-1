@@ -3307,8 +3307,16 @@ class Diameter:
             elif int(CC_Request_Type) == 3:
                 self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777238_272] [CCA] Request type for CCA is 3 - Termination", redisClient=self.redisMessaging)
                 session_id_string = str(binascii.unhexlify(session_id).decode())
-                subscriber_details = self.database.Get_Subscriber(imsi=imsi)
-                stored_apn = self.database.Get_APN_by_Name(apn=apn)
+                # A subscriber deleted while attached, or an APN the HSS does not
+                # provision, has no state here to clear. Both lookups raise then,
+                # which answered the CCR-T with 5030 although the CCR-I had been
+                # accepted; the PCEF ends the session either way.
+                try:
+                    subscriber_details = self.database.Get_Subscriber(imsi=imsi)
+                    stored_apn = self.database.Get_APN_by_Name(apn=apn)
+                except Exception as e:
+                    self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777238_272] [CCA] CCR-T for IMSI {imsi} APN {apn}: {e}; nothing stored to clear", redisClient=self.redisMessaging)
+                    subscriber_details, stored_apn = None, None
                 if subscriber_details and stored_apn:
                     matching_subscriber_id = subscriber_details.get('subscriber_id', None)
                     matching_apn_id = stored_apn.get('apn_id', None)

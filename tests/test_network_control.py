@@ -315,3 +315,66 @@ def test_reattach_flag_is_encoded_in_the_clr():
 
     assert clr_flags(True) == [2]
     assert clr_flags(False) == []
+
+
+class FakePcrfDatabase:
+    def __init__(self, serving_apn):
+        self.serving_apn = serving_apn
+
+    def Get_Subscriber(self, imsi):
+        return {"subscriber_id": 7, "imsi": imsi}
+
+    def Get_Serving_APN(self, subscriber_id, apn_id):
+        return self.serving_apn
+
+    def Get_Charging_Rule(self, charging_rule_id):
+        return {"charging_rule_id": charging_rule_id, "rule_name": "video"}
+
+    def Get_APN(self, apn_id):
+        return {"apn_id": apn_id}
+
+
+PGW = "pgw.mnc001.mcc001.3gppnetwork.org"
+GX_SESSION = {"serving_pgw": PGW, "serving_pgw_peer": f"{PGW};hss01", "serving_pgw_realm": "epc",
+              "pcrf_session_id": "pgw;1;2", "subscriber_routing": "10.46.0.2"}
+
+
+def test_pcrf_push_from_the_provisioning_node_is_relayed_to_one_diameter_node():
+    # KI-149: PUT /pcrf/ ran sendDiameterRequest in the API process, which has no
+    # Diameter peers, and answered "Successfully sent Gx RAR" anyway.
+    from network_control import push_charging_rule_and_relay
+    relay = FakeRelay([{"result": "OK", "pgw": PGW, "node": "hss-3"}])
+    relay_calls = []
+
+    def relay_until(path, payload, until):
+        relay_calls.append((path, payload))
+        return [body for body in relay(path, payload) if until(body)][:1]
+
+    outcome = push_charging_rule_and_relay(FakeDiameter(), FakePcrfDatabase(GX_SESSION), IMSI, 3, 1, relay_until)
+
+    assert outcome["result"] == "OK" and outcome["node"] == "hss-3"
+    assert relay_calls == [("/geored/push_charging_rule", {"imsi": IMSI, "apn_id": 3, "charging_rule_id": 1})]
+
+
+def test_pcrf_push_that_no_node_could_send_is_reported():
+    from network_control import push_charging_rule_and_relay
+    outcome = push_charging_rule_and_relay(FakeDiameter(), FakePcrfDatabase(GX_SESSION), IMSI, 3, 1,
+                                           lambda path, payload, until: [{"result": "NotSent"}])
+
+    assert outcome["result"] == "NotSent"
+
+
+def test_pcrf_push_from_a_diameter_node_sends_the_rule_to_the_pgw():
+    from network_control import push_charging_rule
+    node = FakeDiameter(connected_peers=[PGW])
+
+    outcome = push_charging_rule(node, FakePcrfDatabase(GX_SESSION), IMSI, 3, 1)
+
+    assert outcome == {"result": "OK", "pgw": PGW}
+    [(request, hostname, kwargs)] = node.sent
+    assert (request, hostname, kwargs["sessionId"]) == ("RAR", PGW, "pgw;1;2")
+
+
+def test_pcrf_push_without_a_gx_session():
+    from network_control import push_charging_rule
+    assert push_charging_rule(FakeDiameter(), FakePcrfDatabase(None), IMSI, 3, 1)["result"] == "NoSession"

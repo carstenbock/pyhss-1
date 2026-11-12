@@ -165,6 +165,50 @@ def push_clr_and_relay(diameter_client, imsi: str, clr: dict, relay) -> dict:
     }
 
 
+def push_charging_rule(diameter_client, database_client, imsi: str, apn_id, charging_rule_id) -> dict:
+    """Send a Gx RAR installing a predefined charging rule from this node.
+
+    Returns {'result': 'OK' | 'NotSent' | 'NoSession', 'pgw': <serving PGW>}.
+    'NotSent' means this node has no route to the PGW (no PGW or DRA peer),
+    which is always the case on the provisioning node (KI-149).
+    """
+    subscriber = database_client.Get_Subscriber(imsi=str(imsi))
+    serving_apn = database_client.Get_Serving_APN(subscriber_id=subscriber["subscriber_id"], apn_id=apn_id)
+    if not serving_apn:
+        return {"result": "NoSession", "pgw": None}
+    charging_rule = database_client.Get_Charging_Rule(charging_rule_id)
+    charging_rule["apn_data"] = database_client.Get_APN(apn_id)
+    serving_pgw = serving_apn.get("serving_pgw")
+    sent = diameter_client.sendDiameterRequest(
+        requestType="RAR",
+        hostname=normalize_peer_hostname(serving_apn.get("serving_pgw_peer")),
+        sessionId=serving_apn.get("pcrf_session_id"),
+        chargingRules=charging_rule,
+        ueIp=serving_apn.get("subscriber_routing"),
+        servingPgw=serving_pgw,
+        servingRealm=serving_apn.get("serving_pgw_realm"),
+    )
+    return {"result": "OK" if sent else "NotSent", "pgw": serving_pgw}
+
+
+def push_charging_rule_and_relay(diameter_client, database_client, imsi: str, apn_id, charging_rule_id, relay) -> dict:
+    """Send the Gx RAR of PUT /pcrf/ from this node, else from one Diameter node.
+
+    The provisioning node holds no Diameter peers, so the push is relayed;
+    relay(path, payload, until) stops at the first node that sent it, so the
+    PGW gets the rule once. Returns this node's or the sending node's result.
+    """
+    local = push_charging_rule(diameter_client, database_client, imsi, apn_id, charging_rule_id)
+    if local["result"] != "NotSent":
+        return local
+    payload = {"imsi": str(imsi), "apn_id": apn_id, "charging_rule_id": charging_rule_id}
+    results = relay("/geored/push_charging_rule", payload, lambda body: body.get("result") == "OK") or []
+    for body in results:
+        if body.get("result") == "OK":
+            return body
+    return local
+
+
 def purge_subscriber_state_and_relay(diameter_client, relay, subscriber_ids=(), ims_subscriber_ids=(),
                                      log_tool=None, redis_messaging=None) -> None:
     """Remove the Sh and Rx subscription state of deleted subscribers from Redis.
