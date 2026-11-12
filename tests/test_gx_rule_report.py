@@ -10,6 +10,7 @@ INDICATION_OF_FAILED_RESOURCES_ALLOCATION (TS 29.214 4.4.6). Before, PyHSS
 answered the CCR-U and did nothing, so the P-CSCF kept the call as if its media
 bearer existed."""
 import json
+import time
 
 import pytest
 
@@ -72,6 +73,7 @@ def pcrf(tmp_path, monkeypatch):
     node.OriginHost = node.string_to_hex("hss01")
     node.OriginRealm = node.string_to_hex(REALM)
     node.MNC, node.MCC, node.hostname = "001", "001", "hss01"
+    node.RX_RAR_MIN_AGE = 0          # the age rule has its own test
     node.sent = []
     node.gx_rars = []
     node.relayed = []
@@ -400,3 +402,41 @@ def test_call_end_removes_every_rule_of_the_call(pcrf):
     str_request(pcrf)
 
     assert sorted(pcrf.gx_rars[-1]["chargingRuleName"]) == installed and len(installed) == 2
+
+
+def test_report_right_after_the_aar_waits_for_the_aaa(pcrf):
+    # Live 2026-11-12 21:01:17 UTC: the bearer was refused at once, and the RAR
+    # reached the P-CSCF 10 ms before the AAA, so it did not know the session
+    # yet (answer 5001). The worker hands a fresh rule to the relay; the relay
+    # endpoint sends once the rule is RX_RAR_MIN_AGE old.
+    pcrf.RX_RAR_MIN_AGE = 0.3
+    rule = call_aar(pcrf)
+
+    ccr_update(pcrf, rule)
+    assert rx_rars(pcrf) == []
+    assert pcrf.relayed[-1] == ("/geored/rx_failed_call_rules", {"subscriber_id": subscriber_id(pcrf), "rule_names": [rule]})
+
+    started = time.monotonic()
+    sent, missing = pcrf.rx_send_failed_resources(subscriber_id(pcrf), [rule], wait_fresh=True)
+    assert sent == [CALL_SESSION] and missing == []
+    assert time.monotonic() - started > 0.1
+
+
+def test_str_succeeds_when_the_pgw_no_longer_has_the_rule(pcrf):
+    # After a reported failure the PGW has dropped the rule and answers its
+    # removal with an error; the STR was answered 5001.
+    rule = call_aar(pcrf)
+
+    def await_failed(requestType, hostname, **kwargs):
+        pcrf.gx_rars.append(kwargs)
+        raa = pcrf.generate_avp(268, 40, pcrf.int_to_hex(5012, 4))
+        return pcrf.generate_diameter_packet("01", "00", 258, 16777238, "00000001", "00000001", raa)
+    pcrf.awaitDiameterRequestAndResponse = await_failed
+    avp = pcrf.generate_avp(263, 40, pcrf.string_to_hex(CALL_SESSION))
+    avp += pcrf.generate_avp(264, 40, pcrf.string_to_hex(PCSCF))
+    avp += pcrf.generate_avp(296, 40, pcrf.string_to_hex(REALM))
+    packet = pcrf.generate_diameter_packet("01", "c0", 275, 16777236, "00000005", "00000006", avp)
+    answer = pcrf.Answer_16777236_275(*pcrf.decode_diameter_packet(bytes.fromhex(packet)))
+    _, avps = pcrf.decode_diameter_packet(bytes.fromhex(answer))
+
+    assert int(pcrf.get_avp_data(avps, 268)[0], 16) == 2001

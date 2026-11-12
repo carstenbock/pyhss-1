@@ -2545,7 +2545,7 @@ class PyHSS_Geored_Rx_Failed_Call_Rules(Resource):
             rule_names = json_data.get('rule_names') or []
             if subscriber_id is None or not rule_names:
                 return {'error': 'subscriber_id and rule_names are required'}, 400
-            sent, missing = diameterClient.rx_send_failed_resources(subscriber_id, rule_names)
+            sent, missing = diameterClient.rx_send_failed_resources(subscriber_id, rule_names, wait_fresh=True)
             return {'result': 'OK', 'sent': sent, 'not_held': missing, 'node': originHostname}, 200
         except Exception as E:
             print(E)

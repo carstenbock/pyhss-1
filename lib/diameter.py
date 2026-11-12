@@ -1093,7 +1093,7 @@ class Diameter:
             specific_actions = (earlier or {}).get("specific_actions") or []
         value = json.dumps({"af_session_id": af_session_id, "af_peer": af_peer, "af_realm": af_realm, "af_via": af_via,
                             "specific_actions": sorted(set(int(action) for action in specific_actions)),
-                            "media_component": media_component})
+                            "media_component": media_component, "stored_at": time.time()})
         self.redisMessaging.setHashValue(name=self._rx_call_rules_key(subscriber_id), key=rule_name, value=value,
                                          keyExpiry=self.RX_CALL_RULE_TTL)
         owner = self.rx_local_call_session(af_session_id) or {}
@@ -1152,9 +1152,18 @@ class Diameter:
         self.rx_forget_call_rules(subscriberId, af_session_id)
         return rules
 
-    def rx_send_failed_resources(self, subscriber_id, rule_names):
+    # A rule that failed within this time of its AAR may be reported before
+    # the AAA has reached the AF (a bearer refused at once); the AF then does
+    # not know the session yet and rejects the RAR. Live 2026-11-12: the RAR
+    # was 10 ms ahead of the AAA and the P-CSCF answered 5001 (KI-115).
+    RX_RAR_MIN_AGE = 0.5
+
+    def rx_send_failed_resources(self, subscriber_id, rule_names, wait_fresh=False):
         """Send the KI-115 RAR for the call rules this node holds.
-        Returns ([Session-Ids sent], [rule names not held here])."""
+        Returns ([Session-Ids sent], [rule names not held here, or held but
+        too fresh to send without waiting]). wait_fresh=True (the relay
+        endpoint, not the serial worker) waits until the rule is
+        RX_RAR_MIN_AGE old; the worker leaves fresh rules to the relay."""
         held = self.redisMessaging.getAllHashData(name=self._rx_call_rules_key(subscriber_id))
         held = held if isinstance(held, dict) else {}
         sent, missing = [], []
@@ -1165,6 +1174,12 @@ class Diameter:
                 continue
             if entry['af_session_id'] in sent:
                 continue
+            age = time.time() - float(entry.get('stored_at') or 0)
+            if age < self.RX_RAR_MIN_AGE:
+                if not wait_fresh:
+                    missing.append(name)
+                    continue
+                time.sleep(self.RX_RAR_MIN_AGE - age)
             if self.SPECIFIC_ACTION_INDICATION_OF_FAILED_RESOURCES_ALLOCATION not in (entry.get('specific_actions') or []):
                 # TS 29.214 4.4.6: only an AF that subscribed is told.
                 self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] rule {name} inactive; the AF of session {entry['af_session_id']} did not subscribe to INDICATION_OF_FAILED_RESOURCES_ALLOCATION, no Rx RAR", redisClient=self.redisMessaging)
@@ -5911,8 +5926,11 @@ class Diameter:
                     avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] RAA returned Successfully, authorizing request", redisClient=self.redisMessaging)
                 else:
-                    avp += self.generate_avp(268, 40, self.int_to_hex(5001, 4))
-                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] RAA returned Unauthorized, returning Result-Code 5001", redisClient=self.redisMessaging)
+                    # The session ends either way (TS 29.214 4.4.4); a PGW that
+                    # no longer has the rule (e.g. it reported it failed, KI-115)
+                    # answers the removal with an error. It was STA 5001.
+                    avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))
+                    self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_275] [STA] RAA {raaResultCode} for the rule removal of session {sessionId}; answering the STR 2001", redisClient=self.redisMessaging)
 
             else:
                 self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_275] [STA] Unable to find serving APN for RAR, returning Result-Code 2001", redisClient=self.redisMessaging)
