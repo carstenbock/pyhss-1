@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import socket
 import binascii
+import zlib
 import hashlib
 import hmac
 import math
@@ -968,7 +969,13 @@ class Diameter:
         (TS 29.212 4.5.12). For the voice and video rules this PCRF installed for
         an Rx session, the PCRF sends an Rx RAR with Specific-Action
         INDICATION_OF_FAILED_RESOURCES_ALLOCATION to the AF of that session
-        (TS 29.214 4.4.6). Returns the Rx Session-Ids it sent a RAR for.
+        (TS 29.214 4.4.6). Returns the Rx Session-Ids it sent a RAR for here.
+
+        Each call has its own rule (rx_call_rule_name, KI-151), recorded in the
+        Redis of the node that handled the AAR. The CCR-U can reach another node
+        before replication or a push brings anything there, so rules this node
+        does not hold are relayed to the other nodes, and the node that holds
+        them sends the RAR.
         """
         reports = [report for report in self.gx_charging_rule_reports(avps)
                    if report['status'] == self.PCC_RULE_STATUS_INACTIVE]
@@ -976,12 +983,26 @@ class Diameter:
             return []
         subscriber = self.database.Get_Subscriber(imsi=imsi) or {}
         subscriberId = subscriber.get('subscriber_id')
-        callRules = {f"GBR-Voice_{subscriberId}", f"GBR-Video_{subscriberId}"}
-        failed = [(name, report['failure_code']) for report in reports
-                  for name in report['rule_names'] if name in callRules]
-        if not failed:
-            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: inactive PCC rules {[r['rule_names'] for r in reports]} belong to no Rx session", redisClient=self.redisMessaging)
+        names = [name for report in reports for name in report['rule_names']]
+        perCall = [name for name in names
+                   if name.startswith(f"GBR-Voice_{subscriberId}_") or name.startswith(f"GBR-Video_{subscriberId}_")]
+        legacy = [name for name in names if name in (f"GBR-Voice_{subscriberId}", f"GBR-Video_{subscriberId}")]
+        if not perCall and not legacy:
+            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: inactive PCC rules {names} belong to no Rx session", redisClient=self.redisMessaging)
             return []
+        sent, missing = self.rx_send_failed_resources(subscriberId, perCall) if perCall else ([], [])
+        if missing:
+            self._rx_relay('/geored/rx_failed_call_rules', {'subscriber_id': subscriberId, 'rule_names': missing},
+                           'rx_relay_failed_call_rules')
+            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: PCC rules {missing} inactive, not held here, relayed to the other nodes", redisClient=self.redisMessaging)
+        if legacy:
+            sent += self._gx_report_failed_legacy_rules(imsi, legacy)
+        return sent
+
+    def _gx_report_failed_legacy_rules(self, imsi, failed) -> list:
+        """A per-subscriber rule of a call set up before HSS 1.7.33: the AF
+        session is the subscriber's last call session (pcscf_active_session)."""
+        from network_control import peer_via
         imsSubscriber = self.database.Get_IMS_Subscriber(imsi=imsi) or {}
         afSessionId = imsSubscriber.get('pcscf_active_session')
         afHost = imsSubscriber.get('pcscf')
@@ -989,7 +1010,11 @@ class Diameter:
         if not afSessionId or not afHost or not afRealm:
             self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: PCC rules {failed} failed, but no active Rx session is stored; the P-CSCF is not told", redisClient=self.redisMessaging)
             return []
-        from network_control import peer_via
+        if self._send_failed_resources_rar(afSessionId, afHost, afRealm, peer_via(imsSubscriber.get('pcscf_peer'))):
+            return [afSessionId]
+        return []
+
+    def _send_failed_resources_rar(self, afSessionId, afHost, afRealm, via) -> bool:
         # SPEC-DEVIATION: TS 29.214 4.4.6 -- the RAR is sent whether or not the AF
         # subscribed to INDICATION_OF_FAILED_RESOURCES_ALLOCATION in its AAR, and it
         # carries no Flows AVP: PyHSS keeps neither the subscribed actions nor the
@@ -998,17 +1023,110 @@ class Diameter:
         sent = self.sendDiameterRequest(
             requestType='RX_RAR',
             hostname=afHost,
-            via=peer_via(imsSubscriber.get('pcscf_peer')),
+            via=via,
             sessionId=afSessionId,
             destinationHost=afHost,
             destinationRealm=afRealm,
             specificActions=[self.SPECIFIC_ACTION_INDICATION_OF_FAILED_RESOURCES_ALLOCATION],
         )
         if not sent:
-            self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: Rx RAR for session {afSessionId} not sent, no route to {afHost}", redisClient=self.redisMessaging)
-            return []
-        self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: PCC rules {failed} inactive, sent Rx RAR INDICATION_OF_FAILED_RESOURCES_ALLOCATION for session {afSessionId} to {afHost}", redisClient=self.redisMessaging)
-        return [afSessionId]
+            self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [gx_report_failed_call_rules] Rx RAR for session {afSessionId} not sent, no route to {afHost}", redisClient=self.redisMessaging)
+            return False
+        self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] sent Rx RAR INDICATION_OF_FAILED_RESOURCES_ALLOCATION for session {afSessionId} to {afHost}", redisClient=self.redisMessaging)
+        return True
+
+    # Rx call sessions and their Gx rules (KI-151). A rule per AF session, so
+    # two calls of one subscriber get separate rules and bearers, and a failed
+    # rule names its call.
+    RX_CALL_RULE_TTL = 86400
+
+    @staticmethod
+    def rx_call_rule_name(kind, subscriber_id, af_session_id) -> str:
+        return f"GBR-{kind}_{subscriber_id}_{zlib.crc32(str(af_session_id).encode()):08x}"
+
+    def _rx_call_rules_key(self, subscriber_id):
+        return f"rx_call_rules:{subscriber_id}"
+
+    RX_CALL_SESSIONS_KEY = "rx_call_sessions"
+
+    def rx_store_call_rule(self, subscriber_id, rule_name, af_session_id, af_peer, af_realm, af_via=None, imsi=None):
+        """Node-local: which AF session a call rule belongs to, and whose call
+        an AF session is (the STR of an earlier call of a subscriber with two
+        calls is not found through pcscf_active_session). Kept for a day at
+        most; the STR removes it, a CCR-T does not (the call's STR follows)."""
+        value = json.dumps({"af_session_id": af_session_id, "af_peer": af_peer, "af_realm": af_realm, "af_via": af_via})
+        self.redisMessaging.setHashValue(name=self._rx_call_rules_key(subscriber_id), key=rule_name, value=value,
+                                         keyExpiry=self.RX_CALL_RULE_TTL)
+        self.redisMessaging.setHashValue(name=self.RX_CALL_SESSIONS_KEY, key=af_session_id,
+                                         value=json.dumps({"subscriber_id": subscriber_id, "imsi": imsi}),
+                                         keyExpiry=self.RX_CALL_RULE_TTL)
+
+    def rx_forget_call_rules(self, subscriber_id, af_session_id):
+        for kind in ("Voice", "Video"):
+            self.redisMessaging.deleteHashKey(name=self._rx_call_rules_key(subscriber_id),
+                                              key=self.rx_call_rule_name(kind, subscriber_id, af_session_id))
+        self.redisMessaging.deleteHashKey(name=self.RX_CALL_SESSIONS_KEY, key=af_session_id)
+
+    def rx_local_call_session(self, af_session_id):
+        owner = self.redisMessaging.getHashValue(name=self.RX_CALL_SESSIONS_KEY, key=af_session_id)
+        if isinstance(owner, (str, bytes)) and owner:
+            try:
+                owner = json.loads(owner)
+            except ValueError:
+                return None
+        return owner if isinstance(owner, dict) else None
+
+    def rx_find_call_session(self, af_session_id):
+        """{subscriber_id, imsi} of a call's Rx session: from this node's Redis,
+        else from the node that handled its AAR (asked over HTTP)."""
+        owner = self.rx_local_call_session(af_session_id)
+        if owner:
+            return owner
+        for body in self._rx_query('/geored/rx_call_session', {'af_session_id': af_session_id}):
+            if body.get('owner'):
+                return body['owner']
+        return None
+
+    def _rx_query(self, path, payload):
+        """Like _rx_relay, but returns the JSON bodies, stopping at the first
+        node that answers with an owner."""
+        results = []
+        for endpoint in config.get('hss', {}).get('rx_notify_endpoints', []) or []:
+            parsed = urlparse(endpoint)
+            host, port = parsed.hostname, parsed.port or 8080
+            if not host:
+                continue
+            try:
+                addresses = sorted({info[4][0] for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+            except Exception:
+                continue
+            for address in addresses:
+                urlHost = f"[{address}]" if ':' in address else address
+                try:
+                    body = requests.post(f"{parsed.scheme}://{urlHost}:{port}{path}", json=payload, timeout=1).json()
+                except Exception:
+                    continue
+                results.append(body)
+                if body.get('owner'):
+                    return results
+        return results
+
+    def rx_send_failed_resources(self, subscriber_id, rule_names):
+        """Send the KI-115 RAR for the call rules this node holds.
+        Returns ([Session-Ids sent], [rule names not held here])."""
+        held = self.redisMessaging.getAllHashData(name=self._rx_call_rules_key(subscriber_id))
+        held = held if isinstance(held, dict) else {}
+        sent, missing = [], []
+        for name in rule_names:
+            entry = held.get(name)
+            if not isinstance(entry, dict):
+                missing.append(name)
+                continue
+            if entry['af_session_id'] in sent:
+                continue
+            if self._send_failed_resources_rar(entry['af_session_id'], entry['af_peer'], entry['af_realm'], entry.get('af_via')):
+                sent.append(entry['af_session_id'])
+        return sent, missing
 
     def get_grouped_avp_payloads(self, avps, avp_code):
         """Undecoded payloads (hex) of the top-level grouped AVPs with this code."""
@@ -4894,6 +5012,7 @@ class Diameter:
             apn_ids = [apn['apn_id'] for apn in self.database.GetAll(APN)]
             keys += [self._rx_af_subscription_key(int(subscriber_id), apn_id)
                      for subscriber_id in subscriber_ids for apn_id in apn_ids]
+            keys += [self._rx_call_rules_key(int(subscriber_id)) for subscriber_id in subscriber_ids]
         return self.redisMessaging.deleteKeys(keys)
 
     def sh_get_subscriptions(self, ims_subscriber_id):
@@ -5339,12 +5458,15 @@ class Diameter:
                             qci = 1
                             precedence = 40
                             arp_priority = 14
-                            # Open5GS binds dedicated bearers by PCC rule name, so a per-call name
-                            # adds a new bearer every call and leaks until the per-session cap of 4
-                            # (Bearer Overflow). Use a stable per-subscriber name so the single
-                            # QCI-1 voice bearer is reused/updated; fall back to the Rx session id
-                            # only when subscriberId is unavailable (e.g. emergency).
-                            rule_name = "GBR-Voice_" + str(subscriberId if subscriberId else aarSessionID)
+                            # One rule per AF session (KI-151): a second call of the same
+                            # subscriber gets its own rule and bearer, and a failed rule names
+                            # its call. Open5GS binds dedicated bearers by rule name, so every
+                            # rule must be removed again or the bearers pile up to the cap of 4
+                            # (Bearer Overflow, the reason for the earlier per-subscriber name):
+                            # the STR removes exactly this name, computed from its Session-Id.
+                            # Without a subscriber id (emergency) the Session-Id itself is used.
+                            rule_name = (self.rx_call_rule_name("Voice", subscriberId, aarSessionID) if subscriberId
+                                         else "GBR-Voice_" + str(aarSessionID))
                             charging_rule_id = 1000
                         elif (int(mediaType, 16) == 1):
                             #Video
@@ -5353,7 +5475,8 @@ class Diameter:
                             qci = 1
                             precedence = 30
                             arp_priority = 11
-                            rule_name = "GBR-Video_" + str(subscriberId if subscriberId else aarSessionID)
+                            rule_name = (self.rx_call_rule_name("Video", subscriberId, aarSessionID) if subscriberId
+                                         else "GBR-Video_" + str(aarSessionID))
                             charging_rule_id = 1001
 
                         try:
@@ -5530,6 +5653,8 @@ class Diameter:
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Updating Emergency Subscriber: {updatedEmergencySubscriberData}", redisClient=self.redisMessaging)
                             self.database.Update_Emergency_Subscriber(subscriberIp=ueIp, subscriberData=updatedEmergencySubscriberData, imsi=imsi)
 
+                        if subscriberId:
+                            self.rx_store_call_rule(subscriberId, rule_name, aarSessionID, aarOriginHost, aarOriginRealm, imsi=imsi)
                         # Flow-Status of the call's media component (TS 29.213 6.2, 6.3):
                         # a held stream gates its flows, a removed one (port 0) loses its rule.
                         callComponent = next((component for component in self.rx_media_components(avps)
@@ -5678,7 +5803,15 @@ class Diameter:
             servingApn = None
             subscriberId = None
             try:
-                imsSubscriber = self.database.Get_IMS_Subscriber_By_Session_Id(sessionId=sessionId)
+                try:
+                    imsSubscriber = self.database.Get_IMS_Subscriber_By_Session_Id(sessionId=sessionId)
+                except Exception:
+                    # Not the subscriber's last call session: an earlier of two
+                    # simultaneous calls (KI-151).
+                    owner = self.rx_find_call_session(sessionId)
+                    if not owner or not owner.get('imsi'):
+                        raise
+                    imsSubscriber = self.database.Get_IMS_Subscriber(imsi=owner['imsi'])
                 imsi = imsSubscriber.get('imsi', None)
                 pcscf = imsSubscriber.get('pcscf', None)
                 pcscf_realm = imsSubscriber.get('pcscf_realm', None)
@@ -5689,6 +5822,7 @@ class Diameter:
                 if self.rx_remove_af_subscription(subscriber_id=subscriberId, apn_id=apnId, af_session_id=sessionId):
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] Removed AF Subscription for subscriber: {subscriberId}", redisClient=self.redisMessaging)
                 self.rx_relay_forget_af_session(subscriber_id=subscriberId, apn_id=apnId, af_session_id=sessionId)
+                self.rx_forget_call_rules(subscriberId, sessionId)
                 servingApn = self.database.Get_Serving_APN(subscriber_id=subscriberId, apn_id=apnId)
                 try:
                     if not servingApn or servingApn == None or servingApn == 'None':
@@ -5715,7 +5849,8 @@ class Diameter:
                     pcrfSessionId = servingApn.get('pcrf_session_id', None)
                 else:
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] No servingApn defined for IMS Subscriber", redisClient=self.redisMessaging)
-                self.database.Update_Proxy_CSCF(imsi=imsi, proxy_cscf=pcscf, pcscf_realm=pcscf_realm, pcscf_peer=pcscf_peer, pcscf_active_session=None)
+                if imsSubscriber.get('pcscf_active_session') == sessionId:
+                    self.database.Update_Proxy_CSCF(imsi=imsi, proxy_cscf=pcscf, pcscf_realm=pcscf_realm, pcscf_peer=pcscf_peer, pcscf_active_session=None)
             except Exception as e:
                 pass
 
@@ -5751,7 +5886,8 @@ class Diameter:
                         sessionId=pcrfSessionId,
                         servingPgw=servingPgw,
                         servingRealm=servingPgwRealm,
-                        chargingRuleName='GBR-Voice_' + str(subscriberId if subscriberId else aarSessionID),
+                        chargingRuleName=(self.rx_call_rule_name('Voice', subscriberId, aarSessionID) if subscriberId
+                                          else 'GBR-Voice_' + str(aarSessionID)),
                         chargingRuleAction='remove'
                 )
             

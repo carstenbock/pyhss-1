@@ -9,6 +9,8 @@ of the call's Rx session with an Rx RAR carrying Specific-Action
 INDICATION_OF_FAILED_RESOURCES_ALLOCATION (TS 29.214 4.4.6). Before, PyHSS
 answered the CCR-U and did nothing, so the P-CSCF kept the call as if its media
 bearer existed."""
+import json
+
 import pytest
 
 from database import APN, AUC, IMS_SUBSCRIBER, Database, SUBSCRIBER
@@ -27,6 +29,24 @@ FAILED_RESOURCES_ALLOCATION = 9
 
 
 class NullMessaging:
+    """Redis stand-in: keeps hashes (the node-local Rx call rules), ignores the rest."""
+
+    def __init__(self):
+        self.hashes = {}
+
+    def setHashValue(self, name, key, value, keyExpiry=None, **kwargs):
+        self.hashes.setdefault(name, {})[key] = json.loads(value)
+
+    def getAllHashData(self, name, **kwargs):
+        return dict(self.hashes.get(name, {}))
+
+    def getHashValue(self, name, key, **kwargs):
+        value = self.hashes.get(name, {}).get(key)
+        return json.dumps(value).encode() if value is not None else ""
+
+    def deleteHashKey(self, name, key, **kwargs):
+        self.hashes.get(name, {}).pop(key, None)
+
     def __getattr__(self, name):
         return lambda *args, **kwargs: ""
 
@@ -53,8 +73,12 @@ def pcrf(tmp_path, monkeypatch):
     node.OriginRealm = node.string_to_hex(REALM)
     node.MNC, node.MCC, node.hostname = "001", "001", "hss01"
     node.sent = []
+    node.gx_rars = []
+    node.relayed = []
+    node._rx_relay = lambda path, payload, label: node.relayed.append((path, payload))
 
     def await_gx_rar(requestType, hostname, **kwargs):
+        node.gx_rars.append(kwargs)
         raa = node.generate_avp(268, 40, node.int_to_hex(2001, 4))
         return node.generate_diameter_packet("01", "00", 258, 16777238, "00000001", "00000001", raa)
 
@@ -71,12 +95,12 @@ def subscriber_id(node):
     return node.database.Get_Subscriber(imsi=IMSI)["subscriber_id"]
 
 
-def call_aar(node):
-    """The P-CSCF authorizes a voice call; this stores the call's Rx session."""
+def call_aar(node, session=CALL_SESSION, media_type=0):
+    """The P-CSCF authorizes a call; returns the name of the Gx rule installed for it."""
     rx = lambda code, data: node.generate_vendor_avp(code, "c0", 10415, data)
-    component = rx(517, rx(518, node.int_to_hex(1, 4)) + rx(520, node.int_to_hex(0, 4))
+    component = rx(517, rx(518, node.int_to_hex(1, 4)) + rx(520, node.int_to_hex(media_type, 4))
                    + rx(511, node.int_to_hex(2, 4)))
-    avp = node.generate_avp(263, 40, node.string_to_hex(CALL_SESSION))
+    avp = node.generate_avp(263, 40, node.string_to_hex(session))
     avp += node.generate_avp(264, 40, node.string_to_hex(PCSCF))
     avp += node.generate_avp(296, 40, node.string_to_hex(REALM))
     avp += node.generate_avp(443, 40, node.generate_avp(450, 40, node.int_to_hex(2, 4))
@@ -86,6 +110,15 @@ def call_aar(node):
     packet = node.generate_diameter_packet("01", "c0", 265, 16777236, "00000001", "00000002", avp)
     packet_vars, avps = node.decode_diameter_packet(bytes.fromhex(packet))
     node.Answer_16777236_265(packet_vars, avps)
+    return node.gx_rars[-1]["chargingRules"]["rule_name"]
+
+
+def str_request(node, session=CALL_SESSION):
+    avp = node.generate_avp(263, 40, node.string_to_hex(session))
+    avp += node.generate_avp(264, 40, node.string_to_hex(PCSCF))
+    avp += node.generate_avp(296, 40, node.string_to_hex(REALM))
+    packet = node.generate_diameter_packet("01", "c0", 275, 16777236, "00000005", "00000006", avp)
+    node.Answer_16777236_275(*node.decode_diameter_packet(bytes.fromhex(packet)))
 
 
 def ccr_update(node, rule_name, status=INACTIVE, failure_code=RESOURCE_ALLOCATION_FAILURE):
@@ -116,9 +149,9 @@ def rx_rars(node):
 
 
 def test_failed_voice_bearer_is_reported_to_the_pcscf(pcrf):
-    call_aar(pcrf)
+    rule = call_aar(pcrf)
 
-    result = ccr_update(pcrf, f"GBR-Voice_{subscriber_id(pcrf)}")
+    result = ccr_update(pcrf, rule)
 
     assert result == 2001
     [(_, hostname, rar)] = rx_rars(pcrf)
@@ -130,27 +163,28 @@ def test_failed_voice_bearer_is_reported_to_the_pcscf(pcrf):
 
 
 def test_failed_video_bearer_is_reported_too(pcrf):
-    call_aar(pcrf)
+    rule = call_aar(pcrf, media_type=1)
 
-    ccr_update(pcrf, f"GBR-Video_{subscriber_id(pcrf)}")
+    ccr_update(pcrf, rule)
 
+    assert rule.startswith("GBR-Video_")
     assert [rar[2]["sessionId"] for rar in rx_rars(pcrf)] == [CALL_SESSION]
 
 
 def test_report_without_failure_code_still_counts(pcrf):
     # Rule-Failure-Code is optional in a Charging-Rule-Report; INACTIVE alone
     # already means the rule is not enforced.
-    call_aar(pcrf)
+    rule = call_aar(pcrf)
 
-    ccr_update(pcrf, f"GBR-Voice_{subscriber_id(pcrf)}", failure_code=None)
+    ccr_update(pcrf, rule, failure_code=None)
 
     assert len(rx_rars(pcrf)) == 1
 
 
 def test_active_rule_report_tells_nobody(pcrf):
-    call_aar(pcrf)
+    rule = call_aar(pcrf)
 
-    ccr_update(pcrf, f"GBR-Voice_{subscriber_id(pcrf)}", status=ACTIVE)
+    ccr_update(pcrf, rule, status=ACTIVE)
 
     assert rx_rars(pcrf) == []
 
@@ -160,26 +194,65 @@ def test_failed_rule_of_another_subscriber_is_not_reported(pcrf):
     # call rule (a predefined APN rule, or another UE's) has no Rx session here.
     call_aar(pcrf)
 
-    ccr_update(pcrf, "GBR-Voice_999")
+    ccr_update(pcrf, "GBR-Voice_999_0000abcd")
     ccr_update(pcrf, "internet-default")
 
-    assert rx_rars(pcrf) == []
+    assert rx_rars(pcrf) == [] and pcrf.relayed == []
 
 
 def test_no_rar_after_the_call_ended(pcrf):
-    # After the STR the stored session is cleared; a late report must not reach
-    # a session the P-CSCF has already closed.
+    # The STR removes the call's rule and its record; a late report must not
+    # reach a session the P-CSCF has already closed.
+    rule = call_aar(pcrf)
+    str_request(pcrf)
+    assert pcrf.gx_rars[-1]["chargingRuleName"] == rule
+    assert pcrf.gx_rars[-1]["chargingRuleAction"] == "remove"
+
+    ccr_update(pcrf, rule)
+
+    assert rx_rars(pcrf) == []
+
+
+def test_two_calls_each_get_their_own_rule_and_report(pcrf):
+    # KI-151: one stored call session per subscriber, so with two calls at
+    # once a RAR reached only the latest one. Each call now has its own rule.
+    first = call_aar(pcrf, session=f"{PCSCF};1;first")
+    second = call_aar(pcrf, session=f"{PCSCF};1;second")
+    assert first != second
+
+    ccr_update(pcrf, first)
+    assert [rar[2]["sessionId"] for rar in rx_rars(pcrf)] == [f"{PCSCF};1;first"]
+
+    str_request(pcrf, session=f"{PCSCF};1;first")          # the first call ends
+    assert pcrf.gx_rars[-1]["chargingRuleName"] == first   # only its rule goes
+    # ... and the second call's stored session is left alone
+    assert pcrf.database.Get_IMS_Subscriber(imsi=IMSI)["pcscf_active_session"] == f"{PCSCF};1;second"
+
+    ccr_update(pcrf, second)
+    assert [rar[2]["sessionId"] for rar in rx_rars(pcrf)] == [f"{PCSCF};1;first", f"{PCSCF};1;second"]
+
+
+def test_rule_held_by_another_node_is_relayed(pcrf):
+    # The CCR-U can reach a node other than the one that handled the AAR, before
+    # anything about the call has reached it; that node relays the report.
+    rule = call_aar(pcrf)
+    pcrf.redisMessaging.hashes.clear()                      # this node holds nothing
+
+    ccr_update(pcrf, rule)
+
+    assert rx_rars(pcrf) == []
+    assert pcrf.relayed == [("/geored/rx_failed_call_rules",
+                             {"subscriber_id": subscriber_id(pcrf), "rule_names": [rule]})]
+
+
+def test_rule_of_a_call_from_before_the_upgrade(pcrf):
+    # A call set up by HSS <= 1.7.32 has the per-subscriber rule; its session is
+    # the subscriber's last call session.
     call_aar(pcrf)
-    avp = pcrf.generate_avp(263, 40, pcrf.string_to_hex(CALL_SESSION))
-    avp += pcrf.generate_avp(264, 40, pcrf.string_to_hex(PCSCF))
-    avp += pcrf.generate_avp(296, 40, pcrf.string_to_hex(REALM))
-    packet = pcrf.generate_diameter_packet("01", "c0", 275, 16777236, "00000005", "00000006", avp)
-    pcrf.Answer_16777236_275(*pcrf.decode_diameter_packet(bytes.fromhex(packet)))
-    assert not pcrf.database.Get_IMS_Subscriber(imsi=IMSI).get("pcscf_active_session")
 
     ccr_update(pcrf, f"GBR-Voice_{subscriber_id(pcrf)}")
 
-    assert rx_rars(pcrf) == []
+    assert [rar[2]["sessionId"] for rar in rx_rars(pcrf)] == [CALL_SESSION]
 
 
 def test_rx_rar_encoding(pcrf):

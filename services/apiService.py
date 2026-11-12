@@ -2470,7 +2470,42 @@ class PyHSS_Geored_Rx_Forget_Af_Session(Resource):
             if subscriber_id is None or apn_id is None or not af_session_id:
                 return {'error': 'subscriber_id, apn_id and af_session_id are required'}, 400
             diameterClient.rx_remove_af_subscription(subscriber_id=subscriber_id, apn_id=apn_id, af_session_id=af_session_id)
+            diameterClient.rx_forget_call_rules(subscriber_id, af_session_id)
             return {'result': 'OK'}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_geored.route('/rx_call_session')
+class PyHSS_Geored_Rx_Call_Session(Resource):
+    @ns_geored.doc('Tell whose call an Rx session is, if this node handled its AAR')
+    @no_auth_required
+    def post(self):
+        '''Return {owner: {subscriber_id, imsi}} for a call's Rx Session-Id held on this node (KI-151)'''
+        try:
+            json_data = request.get_json(force=True)
+            af_session_id = json_data.get('af_session_id')
+            if not af_session_id:
+                return {'error': 'af_session_id is required'}, 400
+            return {'owner': diameterClient.rx_local_call_session(af_session_id), 'node': originHostname}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
+@ns_geored.route('/rx_failed_call_rules')
+class PyHSS_Geored_Rx_Failed_Call_Rules(Resource):
+    @ns_geored.doc('Receive call rules a PCEF reported as failed and tell the AF of those held on this node')
+    @no_auth_required
+    def post(self):
+        '''Send the Rx RAR (INDICATION_OF_FAILED_RESOURCES_ALLOCATION) for the call rules this node holds (KI-115, KI-151); no further relay'''
+        try:
+            json_data = request.get_json(force=True)
+            subscriber_id = json_data.get('subscriber_id')
+            rule_names = json_data.get('rule_names') or []
+            if subscriber_id is None or not rule_names:
+                return {'error': 'subscriber_id and rule_names are required'}, 400
+            sent, missing = diameterClient.rx_send_failed_resources(subscriber_id, rule_names)
+            return {'result': 'OK', 'sent': sent, 'not_held': missing, 'node': originHostname}, 200
         except Exception as E:
             print(E)
             return handle_exception(E)
