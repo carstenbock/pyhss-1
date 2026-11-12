@@ -17,6 +17,12 @@ from pyhss_config import config
 from database import geored_check_updated_endpoints
 from geored_routing import push_targets, expand_endpoints
 
+# A peer pod that is being removed can black-hole connects: without a connect
+# timeout one push waited for aiohttp's default of 5 minutes (KI-171).
+GEORED_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=5, sock_connect=1)
+GEORED_DEAD_SECONDS = 30
+
+
 class GeoredService:
     """
     PyHSS Geored Service
@@ -38,6 +44,8 @@ class GeoredService:
         # ADR-0040 step 1: replicated state goes to this endpoint only (the
         # provisioning node); empty keeps the push to every endpoint.
         self.georedPrimary = config.get('geored', {}).get('primary_endpoint') or None
+        # Peer URL -> time until which pushes skip it after a failed connect (KI-171).
+        self.deadPeers = {}
         self.webhookPeers = config.get('webhooks', {}).get('endpoints', [])
         self.ocsPeers = config.get('ocs', {}).get('endpoints', [])
         self.ocsNotificationsEnabled = config.get('ocs', {}).get('enabled', False)
@@ -51,6 +59,16 @@ class GeoredService:
             if not (len(self.georedPeers) > 0):
                 self.logger.error("[Geored] Fatal Error - no peers defined under geored.sync_endpoints, exiting.")
                 quit()
+
+    @staticmethod
+    def _peerOf(url: str) -> str:
+        return url.split('/geored/')[0].rstrip('/')
+
+    def _alive(self, peers):
+        """Peers whose last connect did not fail within GEORED_DEAD_SECONDS. A
+        failing peer would otherwise cost every push its connect timeout."""
+        now = time.monotonic()
+        return [peer for peer in peers if self.deadPeers.get(self._peerOf(peer), 0) <= now]
 
     async def sendGeored(self, asyncSession, url: str, operation: str, body: str, transactionId: str=uuid.uuid4(), retryCount: int=3) -> bool:
             """
@@ -71,6 +89,9 @@ class GeoredService:
 
             accepted = False
             for attempt in range(retryCount):
+                if self.deadPeers.get(self._peerOf(url), 0) > time.monotonic():
+                    # It just failed to connect: no further attempts now (KI-171).
+                    break
                 try:
                     responseStatusCode = None
                     responseBody = None
@@ -114,7 +135,8 @@ class GeoredService:
                                 usePrefix=True, 
                                 prefixHostname=self.hostname, 
                                 prefixServiceName='metric'))
-                except aiohttp.ClientConnectionError as e:
+                except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                    self.deadPeers[self._peerOf(url)] = time.monotonic() + GEORED_DEAD_SECONDS
                     error_message = str(e)
                     await(self.logTool.logAsync(service='Geored', level='warning', message=f"[Geored] [sendGeored] Operation {operation} failed on {url}, with body: ({body}) and transactionId {transactionId}. Response code: {responseStatusCode}. Error Message: {e}"))
                     if "Name or service not known" in error_message:
@@ -315,7 +337,7 @@ class GeoredService:
                 georedUrls = georedMessage['urls']
                 georedTasks = []
 
-                socketSession = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
+                socketSession = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=GEORED_HTTP_TIMEOUT)
                 async with socketSession as session:
                     for georedEndpoint in georedUrls:
                         georedTasks.append(self.sendGeored(asyncSession=session, url=georedEndpoint, operation=georedOperation, body=georedBody))
@@ -345,12 +367,13 @@ class GeoredService:
                 georedBody = georedMessage['body']
                 georedTasks = []
 
-                socketSession = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
+                socketSession = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=GEORED_HTTP_TIMEOUT)
                 async with socketSession as session:
                     self.georedPeers = geored_check_updated_endpoints(config)
                     targets, fallback = push_targets(georedBody, self.georedPeers, self.georedPrimary)
                     # Headless-Service endpoints become one URL per current pod (KI-139).
                     targets, fallback = expand_endpoints(targets), expand_endpoints(fallback)
+                    targets, fallback = self._alive(targets), self._alive(fallback)
                     for remotePeer in targets:
                         georedTasks.append(self.sendGeored(asyncSession=session, url=remotePeer+'/geored/', operation=georedOperation, body=georedBody))
                     accepted = await asyncio.gather(*georedTasks)
@@ -391,7 +414,7 @@ class GeoredService:
                 webhookBody = webhookMessage['body']
                 webhookTasks = []
                 
-                socketSession = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False))
+                socketSession = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=False), timeout=GEORED_HTTP_TIMEOUT)
                 async with socketSession as session:
                     if webhookType == 'ocs':
                         if self.ocsNotificationsEnabled:

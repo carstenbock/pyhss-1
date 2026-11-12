@@ -5,7 +5,6 @@
 import socket
 import binascii
 import zlib
-import threading
 import hashlib
 import hmac
 import math
@@ -1121,10 +1120,9 @@ class Diameter:
         return owner if isinstance(owner, dict) else None
 
     def rx_relay_call_ended(self, af_session_id):
-        """Ask the other nodes, in a background thread, to end a call whose
-        record they hold (its rules on the PGW and the record itself)."""
-        threading.Thread(target=self._rx_relay, args=('/geored/rx_call_ended', {'af_session_id': af_session_id},
-                                                      'rx_relay_call_ended'), daemon=True).start()
+        """Ask the other nodes (in the background, like every Rx relay) to end
+        a call whose record they hold (its rules on the PGW and the record)."""
+        self._rx_relay('/geored/rx_call_ended', {'af_session_id': af_session_id}, 'rx_relay_call_ended')
 
     def rx_end_call_locally(self, af_session_id):
         """A relayed STR: if this node holds the call's record, remove the
@@ -3185,28 +3183,17 @@ class Diameter:
                        'rx_relay_forget_af_session')
 
     def _rx_relay(self, path, payload, label):
+        """Relay to the other HSS nodes (rx_notify_endpoints) without blocking
+        the worker: queued to this process's background sender (KI-171)."""
         endpoints = config.get('hss', {}).get('rx_notify_endpoints', []) or []
         if not endpoints:
             return
-        for endpoint in endpoints:
-            parsed = urlparse(endpoint)
-            host = parsed.hostname
-            port = parsed.port or 8080
-            if not host:
-                continue
-            try:
-                addresses = sorted({addrinfo[4][0] for addrinfo in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
-            except Exception as e:
-                self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [{label}] failed to resolve {host}: {e}", redisClient=self.redisMessaging)
-                continue
-            for address in addresses:
-                urlHost = f"[{address}]" if ':' in address else address
-                url = f"{parsed.scheme}://{urlHost}:{port}{path}"
-                try:
-                    requests.post(url, json=payload, timeout=2)
-                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [{label}] sent to {url}: {payload}", redisClient=self.redisMessaging)
-                except Exception as e:
-                    self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [{label}] relay to {url} failed: {e}", redisClient=self.redisMessaging)
+        relay = getattr(self, 'peerRelay', None)
+        if relay is None:
+            from peer_relay import PeerRelay
+            relay = self.peerRelay = PeerRelay(
+                log=lambda level, message: self.logTool.log(service='HSS', level=level, message=f"[diameter.py] {message}", redisClient=self.redisMessaging))
+        relay.submit(endpoints, path, payload, label)
 
 
     #3GPP Gx Credit Control Answer

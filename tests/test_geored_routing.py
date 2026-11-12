@@ -66,6 +66,7 @@ def test_push_reports_whether_the_endpoint_took_it():
     service = GeoredService.__new__(GeoredService)
     service.logTool, service.redisGeoredMessaging = Quiet(), Quiet()
     service.benchmarking, service.hostname = False, "hss01"
+    service.deadPeers = {}
 
     async def accept(request):
         return web.json_response({})
@@ -93,6 +94,10 @@ def test_push_reports_whether_the_endpoint_took_it():
         return ok, failed, refused
 
     assert asyncio.run(run()) == (True, False, False)
+
+    # The refused peer is skipped for a while instead of costing every push a
+    # connect attempt (KI-171).
+    assert service._alive(["http://127.0.0.1:1"]) == []
 
 
 def test_headless_endpoint_reaches_pods_added_later():

@@ -5,6 +5,7 @@
 import asyncio
 import sys, os, json
 import time, uuid
+import signal
 from datetime import datetime
 from tzlocal import get_localzone
 import sctp, socket, struct
@@ -56,6 +57,12 @@ class DiameterService:
         self.hostname = self.originHost
         self.useExternalSocketService = config.get('hss', {}).get('use_external_socket_service', False)
         self.diameterPeerKey = config.get('hss', {}).get('diameter_peer_key', 'diameterPeers')
+        # Graceful stop (KI-171): on SIGTERM stop accepting connections, send
+        # each connected peer (the DRAs) a DPR, and keep answering for this long.
+        self.shutdownDrainSeconds = float(os.environ.get('HSS_SHUTDOWN_DRAIN_SECONDS',
+                                                         config.get('hss', {}).get('shutdown_drain_seconds', 10)))
+        self.server = None
+        self.shuttingDown = False
         
         # IFC template cache configuration
         self.ifcUseDatabase = config.get('hss', {}).get('ifc_templates', {}).get('use_database', False)
@@ -434,6 +441,32 @@ class DiameterService:
             await(self.logTool.logAsync(service='Diameter', level='info', message=f"[Diameter] [handleConnection] [{coroutineUuid}] Unhandled exception in diameterService.handleConnection: {e}"))
             return
 
+    async def shutdown(self):
+        """Leave the DRAs' routing before the pod goes (KI-171).
+
+        Stop accepting connections, send a DPR (Disconnect-Cause REBOOTING) to
+        every connected peer, so it stops sending requests here and uses the
+        other HSS nodes, and keep answering the requests already in flight for
+        shutdownDrainSeconds. The other containers of the pod stay up for that
+        time (preStop sleep in the chart)."""
+        if self.shuttingDown:
+            return
+        self.shuttingDown = True
+        await(self.logTool.logAsync(service='Diameter', level='info', message=f"[Diameter] [shutdown] SIGTERM: closing the listener, DPR to the peers, draining for {self.shutdownDrainSeconds:.0f} s"))
+        if self.server is not None:
+            self.server.close()
+        dpr = await(self.diameterLibrary.Request_282(originHost=self.originHost, originRealm=self.originRealm))
+        for peer in list(self.activePeers.values()):
+            if not peer.Connected or not peer.IpAddress or not peer.Port:
+                continue
+            outboundData = OutboundData(DestinationIp=peer.IpAddress, DestinationPort=peer.Port,
+                                        InitialReceiveTimestamp=time.time_ns(), OutboundHex=dpr)
+            await(self.redisDwrMessaging.sendMessage(queue=f"diameter-outbound-{peer.IpAddress}-{peer.Port}", message=outboundData.model_dump_json(),
+                                                     queueExpiry=60, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter'))
+        await(asyncio.sleep(self.shutdownDrainSeconds))
+        await(self.logTool.logAsync(service='Diameter', level='info', message="[Diameter] [shutdown] drained, exiting"))
+        os._exit(0)
+
     async def startServer(self, host: str=None, port: int=None, type: str=None):
         """
         Start a server with the given parameters and handle new clients with self.handleConnection.
@@ -508,10 +541,23 @@ class DiameterService:
                 server = await(asyncio.start_server(self.handleConnection, sock=self.sctpSocket))
             else:
                 return False
+            self.server = server
+            try:
+                asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(self.shutdown()))
+            except (NotImplementedError, RuntimeError):
+                pass
             servingAddresses = ', '.join(str(sock.getsockname()) for sock in server.sockets)
             await(self.logTool.logAsync(service='Diameter', level='info', message=f"{self.banners.diameterService()}\n[Diameter] Serving on {servingAddresses}"))
             async with server:
-                await(server.serve_forever())
+                try:
+                    await(server.serve_forever())
+                except asyncio.CancelledError:
+                    if not self.shuttingDown:
+                        raise
+                # Closing the listener ends serve_forever(); the open connections
+                # keep being served until shutdown() exits the process.
+                while self.shuttingDown:
+                    await(asyncio.sleep(3600))
 
 
 def main():

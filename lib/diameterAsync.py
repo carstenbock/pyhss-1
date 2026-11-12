@@ -414,6 +414,17 @@ class DiameterAsync:
             await(self.logTool.error(message=f"Error: {traceback.format_exc()}", redisClient=self.redisMessaging))
             return None
 
+    async def Request_282(self, originHost: str, originRealm: str, disconnectCause: int = 0):
+        """
+        Builds a Disconnect Peer Request (RFC 6733 5.4). Disconnect-Cause 0 is
+        REBOOTING: the peer takes the connection down and connects again later.
+        """
+        avp = ''
+        avp += await(self.generate_avp(264, 40, await(self.string_to_hex(originHost))))    #Origin Host
+        avp += await(self.generate_avp(296, 40, await(self.string_to_hex(originRealm))))   #Origin Realm
+        avp += await(self.generate_avp(273, 40, format(int(disconnectCause), "x").zfill(8)))  #Disconnect-Cause
+        return await(self.generate_diameter_packet("01", "80", 282, 0, (await(self.generateId(4))), (await(self.generateId(4))), avp))
+
     async def Answer_257(self):
         pass
 
