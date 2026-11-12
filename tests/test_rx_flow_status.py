@@ -94,29 +94,29 @@ def test_held_call_gates_the_voice_rule(pcrf):
     aar(pcrf, ENABLED_UPLINK)
 
     rar = pcrf.rars[-1]
-    assert rar["chargingRules"]["flow_status"] == ENABLED_UPLINK
+    assert rar["chargingRules"][0]["flow_status"] == ENABLED_UPLINK
 
 
 def test_inactive_stream_disables_the_voice_rule(pcrf):
     aar(pcrf, DISABLED)
 
-    assert pcrf.rars[-1]["chargingRules"]["flow_status"] == DISABLED
+    assert pcrf.rars[-1]["chargingRules"][0]["flow_status"] == DISABLED
 
 
 def test_resumed_call_enables_the_voice_rule_again(pcrf):
     aar(pcrf, DISABLED)
     aar(pcrf, ENABLED)
 
-    assert pcrf.rars[-1]["chargingRules"]["flow_status"] == ENABLED
+    assert pcrf.rars[-1]["chargingRules"][0]["flow_status"] == ENABLED
 
 
 def test_removed_stream_removes_the_voice_rule(pcrf):
     aar(pcrf, REMOVED)
 
     rar = pcrf.rars[-1]
-    assert rar["chargingRuleAction"] == "remove"
-    assert rar["chargingRuleName"].startswith("GBR-Voice_")
-    assert "chargingRules" not in rar
+    [removed] = rar["removeRuleNames"]
+    assert removed.startswith("GBR-Voice_")
+    assert not rar.get("chargingRules")
 
 
 def test_video_component_gets_a_video_rule(pcrf):
@@ -124,7 +124,7 @@ def test_video_component_gets_a_video_rule(pcrf):
     # so a video AAR got no rule at all.
     aar(pcrf, ENABLED, media_type=1)
 
-    assert pcrf.rars[-1]["chargingRules"]["rule_name"].startswith("GBR-Video_")
+    assert pcrf.rars[-1]["chargingRules"][0]["rule_name"].startswith("GBR-Video_")
 
 
 def test_gx_rule_carries_the_flow_status(pcrf):
@@ -137,3 +137,62 @@ def test_gx_rule_carries_the_flow_status(pcrf):
 
     flow_status = pcrf.generate_vendor_avp(511, "c0", 10415, pcrf.int_to_hex(ENABLED_UPLINK, 4))
     assert flow_status in encoded
+
+
+def voice_and_video_aar(node, video_status=ENABLED):
+    """A video call AAR as the P-CSCF sends it since chart 1.16.1: component 1
+    audio, component 2 video with its own flows and b=AS bandwidth."""
+    rx = lambda code, data: node.generate_vendor_avp(code, "c0", 10415, data)
+    text = lambda value: value.encode().hex()
+
+    def component(number, media_type, port, bandwidth, status):
+        flows = "" if status == REMOVED else (
+            rx(519, rx(509, node.int_to_hex(1, 4))
+               + rx(507, text(f"permit in 17 from {UE_IP} {port} to {NET_IP} {port + 10000}"))
+               + rx(507, text(f"permit out 17 from {NET_IP} {port + 10000} to {UE_IP} {port}"))
+               + rx(512, node.int_to_hex(0, 4))))
+        return rx(517, rx(518, node.int_to_hex(number, 4)) + flows + rx(520, node.int_to_hex(media_type, 4))
+                  + rx(515, node.int_to_hex(bandwidth, 4)) + rx(516, node.int_to_hex(bandwidth, 4))
+                  + rx(511, node.int_to_hex(status, 4)))
+
+    avp = node.generate_avp(263, 40, node.string_to_hex(f"{PCSCF};1;video-call"))
+    avp += node.generate_avp(264, 40, node.string_to_hex(PCSCF))
+    avp += node.generate_avp(296, 40, node.string_to_hex(REALM))
+    avp += node.generate_avp(443, 40, node.generate_avp(450, 40, node.int_to_hex(2, 4))
+                             + node.generate_avp(444, 40, node.string_to_hex(f"sip:{IMSI}@{REALM}")))
+    avp += node.generate_avp(8, 40, "0a2d0002")
+    avp += component(1, 0, 50000, 41000, ENABLED) + component(2, 1, 50010, 384000, video_status)
+    packet = node.generate_diameter_packet("01", "c0", 265, 16777236, "00000001", "00000002", avp)
+    return node.Answer_16777236_265(*node.decode_diameter_packet(bytes.fromhex(packet)))
+
+
+def test_video_call_gets_a_voice_and_a_video_rule(pcrf):
+    # KI-168: only the first Media-Component-Description was read, so the
+    # video stream of a video call got no rule and no bearer.
+    voice_and_video_aar(pcrf)
+
+    rules = {rule["rule_name"].split("_")[0]: rule for rule in pcrf.rars[-1]["chargingRules"]}
+    assert set(rules) == {"GBR-Voice", "GBR-Video"}
+    assert (rules["GBR-Voice"]["qci"], rules["GBR-Video"]["qci"]) == (1, 2)
+    assert rules["GBR-Video"]["mbr_dl"] == 384000 and rules["GBR-Voice"]["mbr_dl"] == 41000
+    # each rule has its own component's flows, not all flows of the AAR
+    assert all("50010" in tft["tft_string"] for tft in rules["GBR-Video"]["tft"])
+    assert all("50000" in tft["tft_string"] for tft in rules["GBR-Voice"]["tft"])
+
+
+def test_dropping_video_removes_only_the_video_rule(pcrf):
+    voice_and_video_aar(pcrf)
+    video = next(rule["rule_name"] for rule in pcrf.rars[-1]["chargingRules"] if rule["qci"] == 2)
+
+    voice_and_video_aar(pcrf, video_status=REMOVED)                     # re-INVITE: m=video 0
+
+    rar = pcrf.rars[-1]
+    assert rar["removeRuleNames"] == [video]
+    assert [rule["qci"] for rule in rar["chargingRules"]] == [1]
+
+
+def test_held_video_is_gated_on_its_own(pcrf):
+    voice_and_video_aar(pcrf, video_status=DISABLED)
+
+    status = {rule["qci"]: rule["flow_status"] for rule in pcrf.rars[-1]["chargingRules"]}
+    assert status == {1: ENABLED, 2: DISABLED}

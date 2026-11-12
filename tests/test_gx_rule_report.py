@@ -116,7 +116,7 @@ def call_aar(node, session=CALL_SESSION, media_type=0, actions=PCSCF_ACTIONS, ad
     packet = node.generate_diameter_packet("01", "c0", 265, 16777236, "00000001", "00000002", avp)
     packet_vars, avps = node.decode_diameter_packet(bytes.fromhex(packet))
     node.Answer_16777236_265(packet_vars, avps)
-    return node.gx_rars[-1]["chargingRules"]["rule_name"]
+    return node.gx_rars[-1]["chargingRules"][0]["rule_name"]
 
 
 def str_request(node, session=CALL_SESSION):
@@ -211,7 +211,7 @@ def test_no_rar_after_the_call_ended(pcrf):
     # reach a session the P-CSCF has already closed.
     rule = call_aar(pcrf)
     str_request(pcrf)
-    assert pcrf.gx_rars[-1]["chargingRuleName"] == rule
+    assert pcrf.gx_rars[-1]["chargingRuleName"] == [rule]
     assert pcrf.gx_rars[-1]["chargingRuleAction"] == "remove"
 
     ccr_update(pcrf, rule)
@@ -230,7 +230,7 @@ def test_two_calls_each_get_their_own_rule_and_report(pcrf):
     assert [rar[2]["sessionId"] for rar in rx_rars(pcrf)] == [f"{PCSCF};1;first"]
 
     str_request(pcrf, session=f"{PCSCF};1;first")          # the first call ends
-    assert pcrf.gx_rars[-1]["chargingRuleName"] == first   # only its rule goes
+    assert pcrf.gx_rars[-1]["chargingRuleName"] == [first]  # only its rule goes
     # ... and the second call's stored session is left alone
     assert pcrf.database.Get_IMS_Subscriber(imsi=IMSI)["pcscf_active_session"] == f"{PCSCF};1;second"
 
@@ -379,3 +379,24 @@ def test_ccr_t_for_a_deleted_subscriber_or_unprovisioned_apn_succeeds(pcrf):
     assert ccr_terminate(pcrf, "001010000009999", "ims") == 2001
     assert ccr_terminate(pcrf, IMSI, "temporary-apn") == 2001
     assert ccr_terminate(pcrf, IMSI, "ims") == 2001
+
+
+def test_call_end_removes_every_rule_of_the_call(pcrf):
+    # KI-168: a video call has a voice and a video rule; the STR removed only
+    # the voice rule, so the video bearer stayed until the PDN connection ended.
+    rx = lambda code, data: pcrf.generate_vendor_avp(code, "c0", 10415, data)
+    components = "".join(rx(517, rx(518, pcrf.int_to_hex(number, 4)) + rx(520, pcrf.int_to_hex(media, 4))
+                            + rx(511, pcrf.int_to_hex(2, 4))) for number, media in ((1, 0), (2, 1)))
+    avp = pcrf.generate_avp(263, 40, pcrf.string_to_hex(CALL_SESSION))
+    avp += pcrf.generate_avp(264, 40, pcrf.string_to_hex(PCSCF))
+    avp += pcrf.generate_avp(296, 40, pcrf.string_to_hex(REALM))
+    avp += pcrf.generate_avp(443, 40, pcrf.generate_avp(450, 40, pcrf.int_to_hex(2, 4))
+                             + pcrf.generate_avp(444, 40, pcrf.string_to_hex(f"sip:{IMSI}@{REALM}")))
+    avp += pcrf.generate_avp(8, 40, "0a2d0002") + components
+    packet = pcrf.generate_diameter_packet("01", "c0", 265, 16777236, "00000001", "00000002", avp)
+    pcrf.Answer_16777236_265(*pcrf.decode_diameter_packet(bytes.fromhex(packet)))
+    installed = sorted(rule["rule_name"] for rule in pcrf.gx_rars[-1]["chargingRules"])
+
+    str_request(pcrf)
+
+    assert sorted(pcrf.gx_rars[-1]["chargingRuleName"]) == installed and len(installed) == 2

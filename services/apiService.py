@@ -2517,18 +2517,18 @@ class PyHSS_Geored_Rx_Forget_Af_Session(Resource):
             print(E)
             return handle_exception(E)
 
-@ns_geored.route('/rx_call_session')
-class PyHSS_Geored_Rx_Call_Session(Resource):
-    @ns_geored.doc('Tell whose call an Rx session is, if this node handled its AAR')
+@ns_geored.route('/rx_call_ended')
+class PyHSS_Geored_Rx_Call_Ended(Resource):
+    @ns_geored.doc('Receive an ended Rx call session (STR on another node) and end it here if this node holds its record')
     @no_auth_required
     def post(self):
-        '''Return {owner: {subscriber_id, imsi}} for a call's Rx Session-Id held on this node (KI-151)'''
+        '''Remove the call's Gx rules and record if this node set the call up (KI-151, KI-168)'''
         try:
             json_data = request.get_json(force=True)
             af_session_id = json_data.get('af_session_id')
             if not af_session_id:
                 return {'error': 'af_session_id is required'}, 400
-            return {'owner': diameterClient.rx_local_call_session(af_session_id), 'node': originHostname}, 200
+            return {'result': 'OK', 'removed': diameterClient.rx_end_call_locally(af_session_id), 'node': originHostname}, 200
         except Exception as E:
             print(E)
             return handle_exception(E)

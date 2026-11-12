@@ -5,6 +5,7 @@
 import socket
 import binascii
 import zlib
+import threading
 import hashlib
 import hmac
 import math
@@ -956,7 +957,8 @@ class Diameter:
         """
         components = []
         for payload in self.get_grouped_avp_payloads(avps, 517):
-            component = {'number': None, 'media_type': None, 'flow_status': None, 'sub_components': []}
+            component = {'number': None, 'media_type': None, 'flow_status': None, 'sub_components': [],
+                         'max_ul': None, 'max_dl': None, 'flow_descriptions': []}
             for child in self.decodeAvpPacket(payload):
                 code = int(child['avp_code'])
                 if code == 518:
@@ -965,6 +967,10 @@ class Diameter:
                     component['media_type'] = int(child['misc_data'], 16)
                 elif code == 511:
                     component['flow_status'] = int(child['misc_data'], 16)
+                elif code == 516:
+                    component['max_ul'] = int(child['misc_data'], 16)
+                elif code == 515:
+                    component['max_dl'] = int(child['misc_data'], 16)
                 elif code == 519:
                     sub = {'flow_status': None, 'flow_usage': None}
                     for grandchild in child.get('sub_avps', []):
@@ -972,6 +978,8 @@ class Diameter:
                             sub['flow_status'] = int(grandchild['misc_data'], 16)
                         elif int(grandchild['avp_code']) == 512:
                             sub['flow_usage'] = int(grandchild['misc_data'], 16)
+                        elif int(grandchild['avp_code']) == 507:
+                            component['flow_descriptions'].append(grandchild['misc_data'])
                     component['sub_components'].append(sub)
             components.append(component)
         return components
@@ -1089,14 +1097,18 @@ class Diameter:
                             "media_component": media_component})
         self.redisMessaging.setHashValue(name=self._rx_call_rules_key(subscriber_id), key=rule_name, value=value,
                                          keyExpiry=self.RX_CALL_RULE_TTL)
+        owner = self.rx_local_call_session(af_session_id) or {}
+        rules = list(dict.fromkeys((owner.get("rules") or []) + [rule_name]))
         self.redisMessaging.setHashValue(name=self.RX_CALL_SESSIONS_KEY, key=af_session_id,
-                                         value=json.dumps({"subscriber_id": subscriber_id, "imsi": imsi}),
+                                         value=json.dumps({"subscriber_id": subscriber_id, "imsi": imsi, "rules": rules}),
                                          keyExpiry=self.RX_CALL_RULE_TTL)
 
     def rx_forget_call_rules(self, subscriber_id, af_session_id):
-        for kind in ("Voice", "Video"):
-            self.redisMessaging.deleteHashKey(name=self._rx_call_rules_key(subscriber_id),
-                                              key=self.rx_call_rule_name(kind, subscriber_id, af_session_id))
+        owner = self.rx_local_call_session(af_session_id) or {}
+        names = set(owner.get("rules") or []) | {self.rx_call_rule_name(kind, subscriber_id, af_session_id)
+                                                 for kind in ("Voice", "Video", "Text")}
+        for name in names:
+            self.redisMessaging.deleteHashKey(name=self._rx_call_rules_key(subscriber_id), key=name)
         self.redisMessaging.deleteHashKey(name=self.RX_CALL_SESSIONS_KEY, key=af_session_id)
 
     def rx_local_call_session(self, af_session_id):
@@ -1108,40 +1120,39 @@ class Diameter:
                 return None
         return owner if isinstance(owner, dict) else None
 
-    def rx_find_call_session(self, af_session_id):
-        """{subscriber_id, imsi} of a call's Rx session: from this node's Redis,
-        else from the node that handled its AAR (asked over HTTP)."""
-        owner = self.rx_local_call_session(af_session_id)
-        if owner:
-            return owner
-        for body in self._rx_query('/geored/rx_call_session', {'af_session_id': af_session_id}):
-            if body.get('owner'):
-                return body['owner']
-        return None
+    def rx_relay_call_ended(self, af_session_id):
+        """Ask the other nodes, in a background thread, to end a call whose
+        record they hold (its rules on the PGW and the record itself)."""
+        threading.Thread(target=self._rx_relay, args=('/geored/rx_call_ended', {'af_session_id': af_session_id},
+                                                      'rx_relay_call_ended'), daemon=True).start()
 
-    def _rx_query(self, path, payload):
-        """Like _rx_relay, but returns the JSON bodies, stopping at the first
-        node that answers with an owner."""
-        results = []
-        for endpoint in config.get('hss', {}).get('rx_notify_endpoints', []) or []:
-            parsed = urlparse(endpoint)
-            host, port = parsed.hostname, parsed.port or 8080
-            if not host:
-                continue
-            try:
-                addresses = sorted({info[4][0] for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
-            except Exception:
-                continue
-            for address in addresses:
-                urlHost = f"[{address}]" if ':' in address else address
-                try:
-                    body = requests.post(f"{parsed.scheme}://{urlHost}:{port}{path}", json=payload, timeout=1).json()
-                except Exception:
-                    continue
-                results.append(body)
-                if body.get('owner'):
-                    return results
-        return results
+    def rx_end_call_locally(self, af_session_id):
+        """A relayed STR: if this node holds the call's record, remove the
+        call's rules from the PGW (all but the voice rule, which the node that
+        got the STR removes when it knows the subscriber; harmless if it is
+        removed twice) and forget the record. Returns the removed rule names."""
+        owner = self.rx_local_call_session(af_session_id)
+        if not owner:
+            return []
+        subscriberId = owner.get('subscriber_id')
+        rules = [name for name in owner.get('rules') or []]
+        try:
+            apnId = (self.database.Get_APN_by_Name(apn="ims")).get('apn_id', None)
+            servingApn = self.database.Get_Serving_APN(subscriber_id=subscriberId, apn_id=apnId)
+        except Exception:
+            servingApn = None
+        if rules and servingApn:
+            self.sendDiameterRequest(
+                requestType='RAR',
+                hostname=(servingApn.get('serving_pgw_peer') or '').split(';')[0],
+                sessionId=servingApn.get('pcrf_session_id'),
+                servingPgw=servingApn.get('serving_pgw'),
+                servingRealm=servingApn.get('serving_pgw_realm'),
+                chargingRuleName=rules,
+                chargingRuleAction='remove',
+            )
+        self.rx_forget_call_rules(subscriberId, af_session_id)
+        return rules
 
     def rx_send_failed_resources(self, subscriber_id, rule_names):
         """Send the KI-115 RAR for the call rules this node holds.
@@ -1164,6 +1175,150 @@ class Diameter:
                                                [entry.get('media_component')]):
                 sent.append(entry['af_session_id'])
         return sent, missing
+
+    # Media-Type (TS 29.214 5.3.19) and the Gx rule each gets: name, QCI (voice
+    # and text QCI 1 as conversational voice-class media, video QCI 2, GSMA
+    # IR.92 / IR.94), precedence, ARP and the bandwidth cap in bit/s.
+    MEDIA_TYPE_AUDIO, MEDIA_TYPE_VIDEO, MEDIA_TYPE_CONTROL, MEDIA_TYPE_TEXT = 0, 1, 4, 5
+    CALL_MEDIA = {
+        0: {"kind": "Voice", "charging_rule_id": 1000, "qci": 1, "precedence": 40, "arp_priority": 14, "cap": 128000},
+        1: {"kind": "Video", "charging_rule_id": 1001, "qci": 2, "precedence": 30, "arp_priority": 11, "cap": 512000},
+        5: {"kind": "Text", "charging_rule_id": 1002, "qci": 1, "precedence": 45, "arp_priority": 14, "cap": 16000},
+    }
+
+    def rx_call_rules(self, avps, subscriberId, aarSessionID, ueIp, preemptive):
+        """The Gx rules of a call AAR: ([rules to install], [names to remove]).
+
+        One rule per AUDIO, VIDEO or TEXT Media-Component-Description; the
+        first component used to stand for the whole call, so a video stream
+        got no rule (KI-168). A component with Flow-Status REMOVED (port 0)
+        removes its rule; the others carry their Flow-Status (KI-70). The
+        flows come from the component's sub-components; an audio component
+        without any falls back to the SDP of the AAR."""
+        components = [component for component in self.rx_media_components(avps)
+                      if component['media_type'] in self.CALL_MEDIA]
+        seen = {}
+        installRules, removeRules = [], []
+        for component in components:
+            media = self.CALL_MEDIA[component['media_type']]
+            seen[media['kind']] = seen.get(media['kind'], 0) + 1
+            kind = media['kind'] if seen[media['kind']] == 1 else f"{media['kind']}{component['number']}"
+            ruleName = (self.rx_call_rule_name(kind, subscriberId, aarSessionID) if subscriberId
+                        else f"GBR-{kind}_{aarSessionID}")
+            if component['flow_status'] == self.FLOW_STATUS_REMOVED:
+                removeRules.append(ruleName)
+                continue
+            ul = min(component['max_ul'], media['cap']) if component['max_ul'] else media['cap']
+            dl = min(component['max_dl'], media['cap']) if component['max_dl'] else media['cap']
+            tfts = self.rx_tfts(component['flow_descriptions'])
+            if not tfts and component['media_type'] == self.MEDIA_TYPE_AUDIO:
+                tfts = self.rx_sdp_tfts(avps, ueIp)
+            installRules.append({
+                "charging_rule_id": media['charging_rule_id'],
+                "qci": media['qci'],
+                "arp_preemption_capability": preemptive,
+                "arp_preemption_vulnerability": not preemptive,
+                "mbr_dl": dl, "mbr_ul": ul, "gbr_dl": dl, "gbr_ul": ul,
+                "precedence": media['precedence'],
+                "arp_priority": media['arp_priority'],
+                "rule_name": ruleName,
+                "tft_group_id": 1,
+                "rating_group": None,
+                "tft": tfts,
+                "flow_status": component['flow_status'],
+                "media_component": component['number'],
+            })
+        return installRules, removeRules
+
+    def rx_tfts(self, flow_descriptions):
+        """Gx TFTs from Rx Flow-Descriptions (hex). Open5GS has no 'permit in',
+        so an uplink description is turned round into 'permit out' with
+        direction 2."""
+        tfts = []
+        for tftId, hexDescription in enumerate(flow_descriptions, start=1):
+            description = bytes.fromhex(hexDescription).decode('ascii')
+            direction = 1 if 'permit out' in description.lower() else None
+            if 'permit in' in description.lower():
+                parts = description.split(' ')
+                description = f"permit out {parts[2]} from {parts[7]} {parts[8]} to {parts[4]} {parts[5]}"
+                direction = 2
+            tfts.append({"tft_group_id": 1, "direction": direction, "tft_id": tftId, "tft_string": description})
+        return tfts
+
+    def rx_sdp_tfts(self, avps, ueIp):
+        """TFTs of an audio component from the SDP in the AAR's Codec-Data,
+        for an AF that sends no Flow-Descriptions."""
+        completedTftList = []
+        try:
+            sdpOffer = self.get_avp_data(avps, 524)[0]
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got SDP Offer raw: {sdpOffer}", redisClient=self.redisMessaging)
+            sdpOffer = binascii.unhexlify(sdpOffer).decode('utf-8')
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got SDP Offer decoded: {sdpOffer}", redisClient=self.redisMessaging)
+            sdpAnswer = self.get_avp_data(avps, 524)[1]
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got SDP Answer raw: {sdpAnswer}", redisClient=self.redisMessaging)
+            sdpAnswer = binascii.unhexlify(sdpAnswer).decode('utf-8')
+            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got SDP Answer decoded: {sdpAnswer}", redisClient=self.redisMessaging)
+
+            regexIpv4 = r"IN IP4 (\d*\.\d*\.\d*\.\d*)"
+            regexIpv6 = r"IN IP6 ([0-9a-fA-F:]{3,39})"
+            regexRtp = r"m=audio (\d*)"
+            regexRtcp = r"a=rtcp:(\d+)"                            
+
+            sdpDownlink = None
+            sdpUplink = None
+            sdpDownlinkIpv4 = ''
+            sdpDownlinkRtpPort = ''
+            sdpUplinkRtpPort = ''
+
+            # First, work out which side the SDP Downlink is, then do the same for the SDP Uplink.
+            if 'downlink' in sdpOffer.lower():
+                sdpDownlink  = sdpOffer
+            elif 'downlink' in sdpAnswer.lower():
+                sdpDownlink = sdpAnswer
+
+            if 'uplink' in sdpOffer.lower():
+                sdpUplink  = sdpOffer
+            elif 'uplink' in sdpAnswer.lower():
+                sdpUplink = sdpAnswer
+
+            # Grab the SDP Downlink IP
+            sdpDownlinkIpv4 = self.Match_SDP(regexPattern=regexIpv4, sdpBody=sdpDownlink)
+            sdpDownlinkIpv6 = self.Match_SDP(regexPattern=regexIpv6, sdpBody=sdpDownlink)
+
+            # Get the RTP ports
+            sdpDownlinkRtpPort = self.Match_SDP(regexPattern=regexRtp, sdpBody=sdpDownlink)
+            sdpUplinkRtpPort = self.Match_SDP(regexPattern=regexRtp, sdpBody=sdpUplink)
+
+            # The RTCP Port is always the RTP port + 1. Comma separated ports arent used due to lack of support in open source PGWs.
+            # We take a blind approach by setting a range of +1 on both sides.
+            sdpDownlinkRtpPorts = f"{sdpDownlinkRtpPort}-{int(sdpDownlinkRtpPort)+1}"
+            sdpUplinkRtpPorts = f"{sdpUplinkRtpPort}-{int(sdpUplinkRtpPort)+1}"
+
+            # If we've got a UE that's sending a malformed request, use a fallback rule.
+            # Else, if all necessary variables are defined, use the correct SDP rule.
+            # The fallback rule will fail on some cheap handsets.
+            if not sdpDownlinkIpv4 or not sdpDownlinkRtpPort or not sdpUplinkRtpPort:
+                tftString = f"permit out 17 from {ueIp}/32 1-65535 to any 1-65535"
+            else:
+                tftString = f"permit out 17 from {sdpDownlinkIpv4}/32 {sdpDownlinkRtpPorts} to {ueIp}/32 {sdpUplinkRtpPorts}"
+
+            completedTftList.append({
+                    "tft_group_id": 1,
+                    "direction": 2,
+                    "tft_id": 2,
+                    "tft_string": tftString  
+                    })
+            completedTftList.append({
+                    "tft_group_id": 1,
+                    "direction": 1,
+                    "tft_id": 1,
+                    "tft_string": tftString
+                    })
+
+        except Exception as e:
+            self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Failed to extract SDP due to error: {traceback.format_exc()}", redisClient=self.redisMessaging)
+
+        return completedTftList
 
     def get_grouped_avp_payloads(self, avps, avp_code):
         """Undecoded payloads (hex) of the top-level grouped AVPs with this code."""
@@ -2043,8 +2198,9 @@ class Diameter:
             if chargingRuleName is None:
                 self.logTool.log(service='HSS', level='error', message="chargingRuleName must be defined when removing a charging rule", redisClient=self.redisMessaging)
                 return None
-            Charging_Rule_Name = self.generate_vendor_avp(1005, "c0", 10415, str(binascii.hexlify(str.encode(str(chargingRuleName))),'ascii'))
-            ChargingRuleDef = Charging_Rule_Name
+            names = chargingRuleName if isinstance(chargingRuleName, (list, tuple)) else [chargingRuleName]
+            ChargingRuleDef = ''.join(self.generate_vendor_avp(1005, "c0", 10415, str(binascii.hexlify(str.encode(str(name))),'ascii'))
+                                      for name in names)
             return self.generate_vendor_avp(1002, "c0", 10415, ChargingRuleDef)
         
         else:
@@ -5434,11 +5590,11 @@ class Diameter:
                         response = self.generate_diameter_packet("01", "40", 265, 16777236, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
                         return response
 
-                    # In order to send a Gx RAR, we need to ensure that mediaType is AUDIO(0) or VIDEO(1)
-                    valid_media_types = [0, 1]
-                    if int(mediaType, 16) not in valid_media_types:
+                    # A call: its media components are handled one by one below (KI-168).
+                    valid_media_types = [self.MEDIA_TYPE_AUDIO, self.MEDIA_TYPE_VIDEO, self.MEDIA_TYPE_TEXT]
+                    if not any(component['media_type'] in valid_media_types for component in self.rx_media_components(avps)):
                         self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Media type with value {mediaType} is incorrect - Is not AUDIO or VIDEO or CONTROL", redisClient=self.redisMessaging)
-                    assert(int(mediaType, 16) in valid_media_types)
+                    assert(any(component['media_type'] in valid_media_types for component in self.rx_media_components(avps)))
                     # At this point, we know the AAR is indicating a call setup, so we'll get the serving pgw information, then send a 
                     # RAR to the PGW over Gx, asking it to setup the dedicated bearer.
 
@@ -5489,188 +5645,14 @@ class Diameter:
                         if not ueIp and servingApn is not None:
                             ueIp = servingApn.get('subscriber_routing', None)
 
-                        if (int(mediaType, 16) == 0):
-                            #Audio
-                            ulBandwidth = 128000
-                            dlBandwidth = 128000
-                            qci = 1
-                            precedence = 40
-                            arp_priority = 14
-                            # One rule per AF session (KI-151): a second call of the same
-                            # subscriber gets its own rule and bearer, and a failed rule names
-                            # its call. Open5GS binds dedicated bearers by rule name, so every
-                            # rule must be removed again or the bearers pile up to the cap of 4
-                            # (Bearer Overflow, the reason for the earlier per-subscriber name):
-                            # the STR removes exactly this name, computed from its Session-Id.
-                            # Without a subscriber id (emergency) the Session-Id itself is used.
-                            rule_name = (self.rx_call_rule_name("Voice", subscriberId, aarSessionID) if subscriberId
-                                         else "GBR-Voice_" + str(aarSessionID))
-                            charging_rule_id = 1000
-                        elif (int(mediaType, 16) == 1):
-                            #Video
-                            ulBandwidth = 512000
-                            dlBandwidth = 512000
-                            qci = 1
-                            precedence = 30
-                            arp_priority = 11
-                            rule_name = (self.rx_call_rule_name("Video", subscriberId, aarSessionID) if subscriberId
-                                         else "GBR-Video_" + str(aarSessionID))
-                            charging_rule_id = 1001
-
-                        try:
-                            avpUlBandwidth = int((self.get_avp_data(avps, 516)[0]), 16)
-                            avpDlBandwidth = int((self.get_avp_data(avps, 515)[0]), 16)
-
-                            if avpUlBandwidth <= ulBandwidth:
-                                ulBandwidth = avpUlBandwidth
-                    
-                            if avpDlBandwidth <= dlBandwidth:
-                                dlBandwidth = avpDlBandwidth
-                        except Exception as e:
-                            pass
-
-                        """
-                        If the PCSCF supplies us TFT's ready to go, use those.
-                        If not, compile our own.
-                        """
-                        suppliedTfts = None
-                        completedTftList = []
-
-                        try:
-                            suppliedTfts = self.get_avp_data(avps, 507)
-                            if suppliedTfts:
-                                if isinstance(suppliedTfts, list):
-                                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] P-CSCF provided TFTs", redisClient=self.redisMessaging)
-                                    tftId = 1
-                                    for suppliedTft in suppliedTfts:
-                                        tftDirection = None
-                                        decodedTft = bytes.fromhex(suppliedTft).decode('ascii')
-                                        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got TFT from PCSCF: {decodedTft}", redisClient=self.redisMessaging)
-                                        if 'permit out' in decodedTft.lower():
-                                            tftDirection = 1
-                                        if 'permit in' in decodedTft.lower():
-                                            #@@ Ugly hack, but open5gs has no support for 'permit in' currently.
-                                            # Assuming standard syntax, we need to flip the src srcprt and dst dstport, then change permit in to permit out.
-                                            # permit out 17 from 1.1.1.1 54939 to 2.2.2.2 50021
-                                            # permit in 17 from 2.2.2.2 50021 to 2.2.2.2 54939
-                                            decodedTftSplit = decodedTft.split(' ')
-                                            decodedTft = f"permit out {decodedTftSplit[2]} from {decodedTftSplit[7]} {decodedTftSplit[8]} to {decodedTftSplit[4]} {decodedTftSplit[5]}"
-                                            tftDirection = 2
-                                            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Recompiled 'permit in' TFT to: {decodedTft}", redisClient=self.redisMessaging)
-
-                                        completedTftList.append({
-                                        "tft_group_id": 1,
-                                        "direction": tftDirection,
-                                        "tft_id": tftId,
-                                        "tft_string": decodedTft
-                                        }
-                                        )
-                                        tftId += 1
-                        except Exception as e:
-                            self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Error using TFTs from PCSCF: {traceback.format_exc()}", redisClient=self.redisMessaging)
-                        if not suppliedTfts:
-                            try:
-                                sdpOffer = self.get_avp_data(avps, 524)[0]
-                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got SDP Offer raw: {sdpOffer}", redisClient=self.redisMessaging)
-                                sdpOffer = binascii.unhexlify(sdpOffer).decode('utf-8')
-                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got SDP Offer decoded: {sdpOffer}", redisClient=self.redisMessaging)
-                                sdpAnswer = self.get_avp_data(avps, 524)[1]
-                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got SDP Answer raw: {sdpAnswer}", redisClient=self.redisMessaging)
-                                sdpAnswer = binascii.unhexlify(sdpAnswer).decode('utf-8')
-                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got SDP Answer decoded: {sdpAnswer}", redisClient=self.redisMessaging)
-
-                                regexIpv4 = r"IN IP4 (\d*\.\d*\.\d*\.\d*)"
-                                regexIpv6 = r"IN IP6 ([0-9a-fA-F:]{3,39})"
-                                regexRtp = r"m=audio (\d*)"
-                                regexRtcp = r"a=rtcp:(\d+)"                            
-
-                                sdpDownlink = None
-                                sdpUplink = None
-                                sdpDownlinkIpv4 = ''
-                                sdpDownlinkRtpPort = ''
-                                sdpUplinkRtpPort = ''
-
-                                # First, work out which side the SDP Downlink is, then do the same for the SDP Uplink.
-                                if 'downlink' in sdpOffer.lower():
-                                    sdpDownlink  = sdpOffer
-                                elif 'downlink' in sdpAnswer.lower():
-                                    sdpDownlink = sdpAnswer
-                                
-                                if 'uplink' in sdpOffer.lower():
-                                    sdpUplink  = sdpOffer
-                                elif 'uplink' in sdpAnswer.lower():
-                                    sdpUplink = sdpAnswer
-
-                                # Grab the SDP Downlink IP
-                                sdpDownlinkIpv4 = self.Match_SDP(regexPattern=regexIpv4, sdpBody=sdpDownlink)
-                                sdpDownlinkIpv6 = self.Match_SDP(regexPattern=regexIpv6, sdpBody=sdpDownlink)
-
-                                # Get the RTP ports
-                                sdpDownlinkRtpPort = self.Match_SDP(regexPattern=regexRtp, sdpBody=sdpDownlink)
-                                sdpUplinkRtpPort = self.Match_SDP(regexPattern=regexRtp, sdpBody=sdpUplink)
-
-                                # The RTCP Port is always the RTP port + 1. Comma separated ports arent used due to lack of support in open source PGWs.
-                                # We take a blind approach by setting a range of +1 on both sides.
-                                sdpDownlinkRtpPorts = f"{sdpDownlinkRtpPort}-{int(sdpDownlinkRtpPort)+1}"
-                                sdpUplinkRtpPorts = f"{sdpUplinkRtpPort}-{int(sdpUplinkRtpPort)+1}"
-
-                                # If we've got a UE that's sending a malformed request, use a fallback rule.
-                                # Else, if all necessary variables are defined, use the correct SDP rule.
-                                # The fallback rule will fail on some cheap handsets.
-                                if not sdpDownlinkIpv4 or not sdpDownlinkRtpPort or not sdpUplinkRtpPort:
-                                    tftString = f"permit out 17 from {ueIp}/32 1-65535 to any 1-65535"
-                                else:
-                                    tftString = f"permit out 17 from {sdpDownlinkIpv4}/32 {sdpDownlinkRtpPorts} to {ueIp}/32 {sdpUplinkRtpPorts}"
-                                
-                                completedTftList.append({
-                                        "tft_group_id": 1,
-                                        "direction": 2,
-                                        "tft_id": 2,
-                                        "tft_string": tftString  
-                                        })
-                                completedTftList.append({
-                                        "tft_group_id": 1,
-                                        "direction": 1,
-                                        "tft_id": 1,
-                                        "tft_string": tftString
-                                        })
-
-                            except Exception as e:
-                                self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Failed to extract SDP due to error: {traceback.format_exc()}", redisClient=self.redisMessaging)
-                    
-                        """
-                        The below logic is applied:
-                        1. Grab the Flow Rules and bitrates from the PCSCF in the AAR,
-                        2. Compare it to a given backup rule
-                        - If the flowrates are greater than the backup rule (UE is asking for more than allowed), use the backup rule
-                        - If the flowrates are lesser than the backup rule, use the requested flowrates.
-                        3. Send the winning rule.
-                        """
-
-                        if emergencySubscriber or registeredEmergencySubscriber:
-                            self.logTool.log(service='HSS', level='debug', message="[diameter.py] [Answer_16777236_265] [AAA] Setting ARP to PreEmpt as this is an emergency bearer", redisClient=self.redisMessaging)
-                            arpPreemptionCapability = True
-                            arpPreemptionVulnerability = False
-                        else:
-                            arpPreemptionCapability = False
-                            arpPreemptionVulnerability = True
-                        
-                        chargingRule = {
-                        "charging_rule_id": charging_rule_id,
-                        "qci": qci,
-                        "arp_preemption_capability": arpPreemptionCapability,
-                        "mbr_dl": dlBandwidth,
-                        "mbr_ul": ulBandwidth,
-                        "gbr_ul": ulBandwidth,
-                        "precedence": precedence,
-                        "arp_priority": arp_priority,
-                        "rule_name": rule_name,
-                        "arp_preemption_vulnerability": arpPreemptionVulnerability,
-                        "gbr_dl": dlBandwidth,
-                        "tft_group_id": 1,
-                        "rating_group": None,
-                        "tft": completedTftList
-                        }
+                        # One Gx rule per media component of the call (KI-168): voice,
+                        # video and text each get their own rule, QCI and bearer, with
+                        # their own Flow-Status; a component removed with port 0 loses
+                        # its rule. Each rule's name carries the Rx session (KI-151).
+                        preemptive = bool(emergencySubscriber or registeredEmergencySubscriber)
+                        installRules, removeRules = self.rx_call_rules(avps, subscriberId, aarSessionID, ueIp, preemptive)
+                        if not installRules and not removeRules:
+                            raise Exception("No AUDIO, VIDEO or TEXT media component in the AAR")
 
                         if not emergencySubscriber:
                             self.database.Update_Proxy_CSCF(imsi=imsi, proxy_cscf=aarOriginHost, pcscf_realm=aarOriginRealm, pcscf_peer=remotePeer, pcscf_active_session=sessionId)
@@ -5692,43 +5674,27 @@ class Diameter:
                             self.database.Update_Emergency_Subscriber(subscriberIp=ueIp, subscriberData=updatedEmergencySubscriberData, imsi=imsi)
 
                         if subscriberId:
-                            callNumber = next((component['number'] for component in self.rx_media_components(avps)
-                                               if component['media_type'] == int(mediaType, 16)), None)
-                            self.rx_store_call_rule(subscriberId, rule_name, aarSessionID, aarOriginHost, aarOriginRealm, imsi=imsi,
-                                                    specific_actions=[int(value, 16) for value in self.get_avp_data(avps, 513)],
-                                                    media_component=callNumber)
-                        # Flow-Status of the call's media component (TS 29.213 6.2, 6.3):
-                        # a held stream gates its flows, a removed one (port 0) loses its rule.
-                        callComponent = next((component for component in self.rx_media_components(avps)
-                                              if component['media_type'] == int(mediaType, 16)), None)
-                        rxFlowStatus = callComponent['flow_status'] if callComponent else None
-                        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAR Generated to be sent to serving PGW: {servingPgw} via peer {servingPgwPeer}, Flow-Status {rxFlowStatus}", redisClient=self.redisMessaging)
-                        if rxFlowStatus == self.FLOW_STATUS_REMOVED:
-                            reAuthAnswer = self.awaitDiameterRequestAndResponse(
-                                    requestType='RAR',
-                                    hostname=servingPgwPeer,
-                                    sessionId=pcrfSessionId,
-                                    servingPgw=servingPgw,
-                                    servingRealm=servingPgwRealm,
-                                    chargingRuleName=rule_name,
-                                    chargingRuleAction='remove'
-                            )
-                        else:
-                            chargingRule['flow_status'] = rxFlowStatus
-                            reAuthAnswer = self.awaitDiameterRequestAndResponse(
-                                    requestType='RAR',
-                                    hostname=servingPgwPeer,
-                                    sessionId=pcrfSessionId,
-                                    chargingRules=chargingRule,
-                                    ueIp=ueIp,
-                                    servingPgw=servingPgw,
-                                    servingRealm=servingPgwRealm
-                            )
+                            subscribedActions = [int(value, 16) for value in self.get_avp_data(avps, 513)]
+                            for rule in installRules:
+                                self.rx_store_call_rule(subscriberId, rule['rule_name'], aarSessionID, aarOriginHost, aarOriginRealm, imsi=imsi,
+                                                        specific_actions=subscribedActions,
+                                                        media_component=rule['media_component'])
+                        self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAR to serving PGW {servingPgw} via {servingPgwPeer}: install {[rule['rule_name'] for rule in installRules]}, remove {removeRules}", redisClient=self.redisMessaging)
+                        reAuthAnswer = self.awaitDiameterRequestAndResponse(
+                                requestType='RAR',
+                                hostname=servingPgwPeer,
+                                sessionId=pcrfSessionId,
+                                chargingRules=installRules or None,
+                                ueIp=ueIp,
+                                removeRuleNames=removeRules,
+                                servingPgw=servingPgw,
+                                servingRealm=servingPgwRealm
+                        )
 
                         if not len(reAuthAnswer) > 0:
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAA Timeout: {reAuthAnswer}", redisClient=self.redisMessaging)
                             assert()
-                            
+
                         raaPacketVars, raaAvps = self.decode_diameter_packet(reAuthAnswer)
                         raaResultCode = int(self.get_avp_data(raaAvps, 268)[0], 16)
 
@@ -5844,16 +5810,29 @@ class Diameter:
             avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
             servingApn = None
             subscriberId = None
+            callRules = None
             try:
+                # The call's record names its rules (one per media component,
+                # KI-168) and its subscriber, also for the earlier of two
+                # simultaneous calls (KI-151).
+                owner = self.rx_local_call_session(sessionId)
+                callRules = (owner or {}).get('rules') or None
                 try:
                     imsSubscriber = self.database.Get_IMS_Subscriber_By_Session_Id(sessionId=sessionId)
                 except Exception:
-                    # Not the subscriber's last call session: an earlier of two
-                    # simultaneous calls (KI-151).
-                    owner = self.rx_find_call_session(sessionId)
                     if not owner or not owner.get('imsi'):
+                        # Neither a call set up on this node nor the subscriber's
+                        # latest call: a registration session, or the earlier of
+                        # two calls set up on another node. The node holding the
+                        # call's record ends it; asked in the background, off the
+                        # serial worker's path.
+                        self.rx_relay_call_ended(sessionId)
                         raise
                     imsSubscriber = self.database.Get_IMS_Subscriber(imsi=owner['imsi'])
+                if not owner:
+                    # The call was set up on another node: this node removes the
+                    # voice rule below, the holder of the record the others.
+                    self.rx_relay_call_ended(sessionId)
                 imsi = imsSubscriber.get('imsi', None)
                 pcscf = imsSubscriber.get('pcscf', None)
                 pcscf_realm = imsSubscriber.get('pcscf_realm', None)
@@ -5928,7 +5907,8 @@ class Diameter:
                         sessionId=pcrfSessionId,
                         servingPgw=servingPgw,
                         servingRealm=servingPgwRealm,
-                        chargingRuleName=(self.rx_call_rule_name('Voice', subscriberId, aarSessionID) if subscriberId
+                        chargingRuleName=(callRules if callRules
+                                          else self.rx_call_rule_name('Voice', subscriberId, aarSessionID) if subscriberId
                                           else 'GBR-Voice_' + str(aarSessionID)),
                         chargingRuleAction='remove'
                 )
@@ -6863,7 +6843,7 @@ class Diameter:
         return response
 
     #3GPP Gx - Re Auth Request
-    def Request_16777238_258(self, sessionId, servingPgw, servingRealm, chargingRules=None, ueIp=None, chargingRuleAction='install', chargingRuleName=None, sessionReleaseCause=None):
+    def Request_16777238_258(self, sessionId, servingPgw, servingRealm, chargingRules=None, ueIp=None, chargingRuleAction='install', chargingRuleName=None, sessionReleaseCause=None, removeRuleNames=None):
         avp = ''
         self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Request_16777238_258] [RAR] Creating Re Auth Request", redisClient=self.redisMessaging)
 
@@ -6885,9 +6865,14 @@ class Diameter:
 
         #Setup Charging Rule
         self.logTool.log(service='HSS', level='debug', message=chargingRules, redisClient=self.redisMessaging)
+        # One RAR can remove some rules and install others (one per media
+        # component of a call).
+        if removeRuleNames:
+            avp += self.Charging_Rule_Generator(action='remove', chargingRuleName=list(removeRuleNames))
         if chargingRules is not None and ueIp is not None:
             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Request_16777238_258] [RAR] Charging Rules: {chargingRules}", redisClient=self.redisMessaging)
-            avp += self.Charging_Rule_Generator(ChargingRules=chargingRules, ue_ip=ueIp)
+            for rule in (chargingRules if isinstance(chargingRules, list) else [chargingRules]):
+                avp += self.Charging_Rule_Generator(ChargingRules=rule, ue_ip=ueIp)
             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Request_16777238_258] [RAR] Generated Charging Rules", redisClient=self.redisMessaging)
         elif chargingRuleName is not None and chargingRuleAction == 'remove':
             avp += self.Charging_Rule_Generator(action=chargingRuleAction, chargingRuleName=chargingRuleName)
