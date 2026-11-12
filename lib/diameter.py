@@ -281,14 +281,51 @@ class Diameter:
             octet_4 = int(str(hex_ip[6:8]), base=16)
             return str(octet_1) + "." + str(octet_2) + "." + str(octet_3) + "." + str(octet_4)
         elif len(hex_ip) == 32:
-            n=4
-            ipv6_split = [hex_ip[idx:idx + n] for idx in range(0, len(hex_ip), n)]
-            ipv6_str = ''
-            for octect in ipv6_split:
-                ipv6_str += str(octect).lstrip('0') + ":"
-            #Strip last Colon
-            ipv6_str = ipv6_str[:-1]
-            return ipv6_str
+            # RFC 5952 text form. Stripping each group's zeros gave "cafe::46:..."
+            # for "cafe:0000:0046:..." and empty groups that were not an address.
+            return ipaddress.IPv6Address(bytes.fromhex(hex_ip)).compressed
+
+    @staticmethod
+    def framed_ipv6_prefix(hex_value):
+        """Framed-IPv6-Prefix (AVP 97, RFC 7155 4.4.10.1.2): reserved octet,
+        prefix length, prefix. Returns an ipaddress.IPv6Network."""
+        data = bytes.fromhex(hex_value)
+        length = data[1]
+        prefix = data[2:2 + (length + 7) // 8].ljust(16, b"\0")
+        return ipaddress.IPv6Network((prefix, length), strict=False)
+
+    def ue_address(self, avps):
+        """The UE address of a Gx CCR or Rx AAR: Framed-IP-Address (AVP 8,
+        IPv4; a 16-byte AVP 8 from an older P-CSCF is read as IPv6), else
+        Framed-IPv6-Prefix (AVP 97): the address for a /128, the prefix
+        ("<net>/<len>") otherwise. None when the request carries neither (KI-72)."""
+        framed = self.get_avp_data(avps, 8)
+        if framed and len(framed[0]) in (8, 32):
+            return self.hex_to_ip(framed[0])
+        prefixes = self.get_avp_data(avps, 97)
+        if prefixes:
+            network = self.framed_ipv6_prefix(prefixes[0])
+            return str(network.network_address) if network.prefixlen == 128 else str(network)
+        return None
+
+    def serving_apn_for_address(self, ue_ip):
+        """The Gx session of a UE address. An IPv6 address of an AAR is also
+        looked up as its /64, which is what a CCR-I with only a
+        Framed-IPv6-Prefix stores."""
+        try:
+            return self.database.Get_Serving_APN_By_IP(subscriberIp=ue_ip)
+        except Exception:
+            pass
+        try:
+            address = ipaddress.ip_address(ue_ip)
+        except ValueError:
+            return None
+        if address.version != 6:
+            return None
+        try:
+            return self.database.Get_Serving_APN_By_IP(subscriberIp=str(ipaddress.IPv6Network(f"{address}/64", strict=False)))
+        except Exception:
+            return None
 
     #Converts string to hex
     def string_to_hex(self, string):
@@ -996,30 +1033,15 @@ class Diameter:
                            'rx_relay_failed_call_rules')
             self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: PCC rules {missing} inactive, not held here, relayed to the other nodes", redisClient=self.redisMessaging)
         if legacy:
-            sent += self._gx_report_failed_legacy_rules(imsi, legacy)
+            # A call set up before HSS 1.7.34: which AF session and which
+            # Specific-Actions it subscribed to are not known, so no RAR.
+            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: PCC rules {legacy} of a call from before HSS 1.7.34 inactive; its AF subscription is unknown, no Rx RAR", redisClient=self.redisMessaging)
         return sent
 
-    def _gx_report_failed_legacy_rules(self, imsi, failed) -> list:
-        """A per-subscriber rule of a call set up before HSS 1.7.33: the AF
-        session is the subscriber's last call session (pcscf_active_session)."""
-        from network_control import peer_via
-        imsSubscriber = self.database.Get_IMS_Subscriber(imsi=imsi) or {}
-        afSessionId = imsSubscriber.get('pcscf_active_session')
-        afHost = imsSubscriber.get('pcscf')
-        afRealm = imsSubscriber.get('pcscf_realm')
-        if not afSessionId or not afHost or not afRealm:
-            self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [gx_report_failed_call_rules] IMSI {imsi}: PCC rules {failed} failed, but no active Rx session is stored; the P-CSCF is not told", redisClient=self.redisMessaging)
-            return []
-        if self._send_failed_resources_rar(afSessionId, afHost, afRealm, peer_via(imsSubscriber.get('pcscf_peer'))):
-            return [afSessionId]
-        return []
-
-    def _send_failed_resources_rar(self, afSessionId, afHost, afRealm, via) -> bool:
-        # SPEC-DEVIATION: TS 29.214 4.4.6 -- the RAR is sent whether or not the AF
-        # subscribed to INDICATION_OF_FAILED_RESOURCES_ALLOCATION in its AAR, and it
-        # carries no Flows AVP: PyHSS keeps neither the subscribed actions nor the
-        # media component numbers of an Rx session. Each call rule covers the
-        # session's only media component of its type, so the session is named whole.
+    def _send_failed_resources_rar(self, afSessionId, afHost, afRealm, via, mediaComponents=()) -> bool:
+        # TS 29.214 4.4.6: the RAR carries the affected media components as
+        # Flows; it is only sent to an AF that subscribed to the action (the
+        # callers check that).
         sent = self.sendDiameterRequest(
             requestType='RX_RAR',
             hostname=afHost,
@@ -1028,6 +1050,7 @@ class Diameter:
             destinationHost=afHost,
             destinationRealm=afRealm,
             specificActions=[self.SPECIFIC_ACTION_INDICATION_OF_FAILED_RESOURCES_ALLOCATION],
+            mediaComponents=[number for number in mediaComponents if number is not None],
         )
         if not sent:
             self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [gx_report_failed_call_rules] Rx RAR for session {afSessionId} not sent, no route to {afHost}", redisClient=self.redisMessaging)
@@ -1049,12 +1072,21 @@ class Diameter:
 
     RX_CALL_SESSIONS_KEY = "rx_call_sessions"
 
-    def rx_store_call_rule(self, subscriber_id, rule_name, af_session_id, af_peer, af_realm, af_via=None, imsi=None):
+    def rx_store_call_rule(self, subscriber_id, rule_name, af_session_id, af_peer, af_realm, af_via=None, imsi=None,
+                           specific_actions=None, media_component=None):
         """Node-local: which AF session a call rule belongs to, and whose call
         an AF session is (the STR of an earlier call of a subscriber with two
         calls is not found through pcscf_active_session). Kept for a day at
         most; the STR removes it, a CCR-T does not (the call's STR follows)."""
-        value = json.dumps({"af_session_id": af_session_id, "af_peer": af_peer, "af_realm": af_realm, "af_via": af_via})
+        # The Specific-Actions the AF subscribed to (TS 29.214 4.4.1): an AAR
+        # that names none (a later AAR of the session) keeps the earlier ones.
+        if not specific_actions:
+            earlier = self.redisMessaging.getAllHashData(name=self._rx_call_rules_key(subscriber_id))
+            earlier = earlier.get(rule_name) if isinstance(earlier, dict) else None
+            specific_actions = (earlier or {}).get("specific_actions") or []
+        value = json.dumps({"af_session_id": af_session_id, "af_peer": af_peer, "af_realm": af_realm, "af_via": af_via,
+                            "specific_actions": sorted(set(int(action) for action in specific_actions)),
+                            "media_component": media_component})
         self.redisMessaging.setHashValue(name=self._rx_call_rules_key(subscriber_id), key=rule_name, value=value,
                                          keyExpiry=self.RX_CALL_RULE_TTL)
         self.redisMessaging.setHashValue(name=self.RX_CALL_SESSIONS_KEY, key=af_session_id,
@@ -1124,7 +1156,12 @@ class Diameter:
                 continue
             if entry['af_session_id'] in sent:
                 continue
-            if self._send_failed_resources_rar(entry['af_session_id'], entry['af_peer'], entry['af_realm'], entry.get('af_via')):
+            if self.SPECIFIC_ACTION_INDICATION_OF_FAILED_RESOURCES_ALLOCATION not in (entry.get('specific_actions') or []):
+                # TS 29.214 4.4.6: only an AF that subscribed is told.
+                self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [gx_report_failed_call_rules] rule {name} inactive; the AF of session {entry['af_session_id']} did not subscribe to INDICATION_OF_FAILED_RESOURCES_ALLOCATION, no Rx RAR", redisClient=self.redisMessaging)
+                continue
+            if self._send_failed_resources_rar(entry['af_session_id'], entry['af_peer'], entry['af_realm'], entry.get('af_via'),
+                                               [entry.get('media_component')]):
                 sent.append(entry['af_session_id'])
         return sent, missing
 
@@ -3277,8 +3314,13 @@ class Diameter:
 
                 #Get UE IP            
                 try:
-                    ue_ip = self.get_avp_data(avps, 8)[0]
-                    ue_ip = str(self.hex_to_ip(ue_ip))
+                    # IPv4, else the IPv6 prefix of an IPv6-only PDN connection. Every
+                    # IPv6-only session used to be stored as "Failed to Decode / Get UE
+                    # IP", and storing that again removed the other sessions with the
+                    # same value (Update_Serving_APN de-duplicates by address).
+                    ue_ip = self.ue_address(avps)
+                    if ue_ip is None:
+                        raise ValueError("no Framed-IP-Address or Framed-IPv6-Prefix")
                     # Fire a notification to the webhook queue, for the OCS.
                     try:
                         ocsNotificationBody = {
@@ -5235,8 +5277,7 @@ class Diameter:
             registeredEmergencySubscriber = False
 
             try:
-                ueIp = self.get_avp_data(avps, 8)[0]
-                ueIp = str(self.hex_to_ip(ueIp))
+                ueIp = self.ue_address(avps)
             except Exception as e:
                 ueIp = None
 
@@ -5258,10 +5299,7 @@ class Diameter:
                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Service URN: {serviceUrn}", redisClient=self.redisMessaging)
                 if not serviceUrn or serviceUrn == 'None' or serviceUrn == None:
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Checking Get_Serving_APN_By_IP for UE IP: {ueIp}", redisClient=self.redisMessaging)
-                    try:
-                        ipServingApn = self.database.Get_Serving_APN_By_IP(subscriberIp=ueIp)
-                    except:
-                        ipServingApn = None
+                    ipServingApn = self.serving_apn_for_address(ueIp) if ueIp else None
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] IP Serving APN: {ipServingApn}", redisClient=self.redisMessaging)
                     ipApnName = ''
                     if ipServingApn:
@@ -5654,7 +5692,11 @@ class Diameter:
                             self.database.Update_Emergency_Subscriber(subscriberIp=ueIp, subscriberData=updatedEmergencySubscriberData, imsi=imsi)
 
                         if subscriberId:
-                            self.rx_store_call_rule(subscriberId, rule_name, aarSessionID, aarOriginHost, aarOriginRealm, imsi=imsi)
+                            callNumber = next((component['number'] for component in self.rx_media_components(avps)
+                                               if component['media_type'] == int(mediaType, 16)), None)
+                            self.rx_store_call_rule(subscriberId, rule_name, aarSessionID, aarOriginHost, aarOriginRealm, imsi=imsi,
+                                                    specific_actions=[int(value, 16) for value in self.get_avp_data(avps, 513)],
+                                                    media_component=callNumber)
                         # Flow-Status of the call's media component (TS 29.213 6.2, 6.3):
                         # a held stream gates its flows, a removed one (port 0) loses its rule.
                         callComponent = next((component for component in self.rx_media_components(avps)
@@ -7012,7 +7054,7 @@ class Diameter:
         return response
 
     #3GPP Rx Re-Auth Request (TS 29.214 5.6.3), PCRF to AF
-    def Request_16777236_258(self, sessionId, destinationHost, destinationRealm, specificActions):
+    def Request_16777236_258(self, sessionId, destinationHost, destinationRealm, specificActions, mediaComponents=()):
         avp = ''
         avp += self.generate_avp(263, 40, self.string_to_hex(sessionId))                                 #Session-Id
         avp += self.generate_avp(258, 40, format(int(16777236),"x").zfill(8))                            #Auth-Application-Id (Rx)
@@ -7022,6 +7064,9 @@ class Diameter:
         avp += self.generate_avp(293, 40, self.string_to_hex(destinationHost))                           #Destination-Host
         for specificAction in specificActions:
             avp += self.generate_vendor_avp(513, "c0", 10415, self.int_to_hex(int(specificAction), 4))   #Specific-Action
+        for mediaComponent in mediaComponents:
+            avp += self.generate_vendor_avp(510, "c0", 10415,
+                                            self.generate_vendor_avp(518, "c0", 10415, self.int_to_hex(int(mediaComponent), 4)))  #Flows / Media-Component-Number
         response = self.generate_diameter_packet("01", "c0", 258, 16777236, self.generate_id(4), self.generate_id(4), avp)     #Generate Diameter packet
         return response
 

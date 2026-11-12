@@ -95,7 +95,11 @@ def subscriber_id(node):
     return node.database.Get_Subscriber(imsi=IMSI)["subscriber_id"]
 
 
-def call_aar(node, session=CALL_SESSION, media_type=0):
+# Specific-Actions of the P-CSCF's call AAR (opensips 0.1.49).
+PCSCF_ACTIONS = (1, 2, 3, 4, 6, 9, 12)
+
+
+def call_aar(node, session=CALL_SESSION, media_type=0, actions=PCSCF_ACTIONS, address_avp=None):
     """The P-CSCF authorizes a call; returns the name of the Gx rule installed for it."""
     rx = lambda code, data: node.generate_vendor_avp(code, "c0", 10415, data)
     component = rx(517, rx(518, node.int_to_hex(1, 4)) + rx(520, node.int_to_hex(media_type, 4))
@@ -105,8 +109,10 @@ def call_aar(node, session=CALL_SESSION, media_type=0):
     avp += node.generate_avp(296, 40, node.string_to_hex(REALM))
     avp += node.generate_avp(443, 40, node.generate_avp(450, 40, node.int_to_hex(2, 4))
                              + node.generate_avp(444, 40, node.string_to_hex(f"sip:{IMSI}@{REALM}")))
-    avp += node.generate_avp(8, 40, "0a2d0002")
+    avp += address_avp if address_avp is not None else node.generate_avp(8, 40, "0a2d0002")
     avp += component
+    for action in actions:
+        avp += node.generate_vendor_avp(513, "c0", 10415, node.int_to_hex(action, 4))
     packet = node.generate_diameter_packet("01", "c0", 265, 16777236, "00000001", "00000002", avp)
     packet_vars, avps = node.decode_diameter_packet(bytes.fromhex(packet))
     node.Answer_16777236_265(packet_vars, avps)
@@ -246,13 +252,93 @@ def test_rule_held_by_another_node_is_relayed(pcrf):
 
 
 def test_rule_of_a_call_from_before_the_upgrade(pcrf):
-    # A call set up by HSS <= 1.7.32 has the per-subscriber rule; its session is
-    # the subscriber's last call session.
+    # A call set up by HSS <= 1.7.33 has the per-subscriber rule; which
+    # Specific-Actions its AF subscribed to is not known, so it gets no RAR.
     call_aar(pcrf)
 
     ccr_update(pcrf, f"GBR-Voice_{subscriber_id(pcrf)}")
 
-    assert [rar[2]["sessionId"] for rar in rx_rars(pcrf)] == [CALL_SESSION]
+    assert rx_rars(pcrf) == []
+
+
+def test_af_that_did_not_subscribe_is_not_told(pcrf):
+    # TS 29.214 4.4.6: INDICATION_OF_FAILED_RESOURCES_ALLOCATION goes only to an
+    # AF that subscribed to it. The P-CSCF before opensips 0.1.49 subscribed to
+    # 1-6 and 12; PyHSS used to send the RAR anyway (a SPEC-DEVIATION).
+    rule = call_aar(pcrf, actions=(1, 2, 3, 4, 5, 6, 12))
+
+    ccr_update(pcrf, rule)
+
+    assert rx_rars(pcrf) == []
+
+
+def test_later_aar_without_specific_actions_keeps_the_subscription(pcrf):
+    # The subscription is made in the session's first AAR; an update AAR
+    # (183, re-INVITE) that names no Specific-Action leaves it in place.
+    rule = call_aar(pcrf)
+    assert call_aar(pcrf, actions=()) == rule
+
+    ccr_update(pcrf, rule)
+
+    assert len(rx_rars(pcrf)) == 1
+
+
+def test_rar_names_the_failed_media_component(pcrf):
+    # TS 29.214 4.4.6: the RAR carries the affected flows (Flows with the
+    # Media-Component-Number of the call's component).
+    rule = call_aar(pcrf)
+
+    ccr_update(pcrf, rule)
+
+    assert rx_rars(pcrf)[0][2]["mediaComponents"] == [1]
+    packet = pcrf.Request_16777236_258(sessionId=CALL_SESSION, destinationHost=PCSCF, destinationRealm=REALM,
+                                       specificActions=[FAILED_RESOURCES_ALLOCATION], mediaComponents=[1])
+    _, avps = pcrf.decode_diameter_packet(bytes.fromhex(packet))
+    assert [int(value, 16) for value in pcrf.get_avp_data(avps, 518)] == [1]
+
+
+def test_ipv6_ue_address_from_framed_ipv6_prefix(pcrf):
+    # KI-72: the P-CSCF (opensips 0.1.49) names an IPv6 UE with
+    # Framed-IPv6-Prefix (AVP 97) /128 instead of a 16-byte Framed-IP-Address.
+    prefix = pcrf.generate_avp(97, 40, "0080" + "cafe00000046000412340000000000aa")
+    packet = pcrf.generate_diameter_packet("01", "c0", 265, 16777236, "00000001", "00000002", prefix)
+    _, avps = pcrf.decode_diameter_packet(bytes.fromhex(packet))
+    assert pcrf.ue_address(avps) == "cafe:0:46:4:1234::aa"
+
+    legacy = pcrf.generate_avp(8, 40, "cafe00000046000412340000000000aa")
+    packet = pcrf.generate_diameter_packet("01", "c0", 265, 16777236, "00000001", "00000002", legacy)
+    _, avps = pcrf.decode_diameter_packet(bytes.fromhex(packet))
+    assert pcrf.ue_address(avps) == "cafe:0:46:4:1234::aa"           # the old 16-byte AVP 8 still works
+
+
+def test_ipv6_formatting():
+    # The old formatter stripped each group's zeros: "cafe:0000:0046:..." became
+    # "cafe::46:..." and runs of zero groups became ":::".
+    node = Diameter.__new__(Diameter)
+    assert node.hex_to_ip("cafe00000046000400000000000000aa") == "cafe:0:46:4::aa"
+    assert node.hex_to_ip("0a2d0002") == "10.45.0.2"
+
+
+def test_ipv6_only_pdn_session_is_found_by_the_ue_address(pcrf):
+    # A CCR-I of an IPv6-only PDN connection carries only Framed-IPv6-Prefix
+    # (/64). It was stored as "Failed to Decode / Get UE IP", the same value for
+    # every such session; the AAR's /128 address is now matched to the /64.
+    avp = pcrf.generate_avp(263, 40, pcrf.string_to_hex("pgw;6;6"))
+    avp += pcrf.generate_avp(264, 40, pcrf.string_to_hex("pgw.epc"))
+    avp += pcrf.generate_avp(296, 40, pcrf.string_to_hex("epc"))
+    avp += pcrf.generate_avp(258, 40, "01000016")
+    avp += pcrf.generate_avp(416, 40, pcrf.int_to_hex(1, 4))
+    avp += pcrf.generate_avp(415, 40, pcrf.int_to_hex(0, 4))
+    avp += pcrf.generate_avp(443, 40, pcrf.generate_avp(450, 40, pcrf.int_to_hex(1, 4))
+                             + pcrf.generate_avp(444, 40, pcrf.string_to_hex(IMSI)))
+    avp += pcrf.generate_avp(30, 40, pcrf.string_to_hex("internet"))
+    avp += pcrf.generate_avp(97, 40, "0040" + "cafe0000004600040000000000000000")
+    packet = pcrf.generate_diameter_packet("01", "c0", 272, 16777238, "00000009", "0000000a", avp)
+    pcrf.Answer_16777238_272(*pcrf.decode_diameter_packet(bytes.fromhex(packet)))
+
+    found = pcrf.serving_apn_for_address("cafe:0:46:4:1234::aa")
+
+    assert found and found["subscriber_routing"] == "cafe:0:46:4::/64"
 
 
 def test_rx_rar_encoding(pcrf):
