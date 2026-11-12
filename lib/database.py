@@ -122,7 +122,10 @@ class SUBSCRIBER(Base):
     msisdn = Column(String(18), index=True, doc='Primary Phone number of Subscriber')
     ue_ambr_dl = Column(Integer, default=999999, doc='Downlink Aggregate Maximum Bit Rate')
     ue_ambr_ul = Column(Integer, default=999999, doc='Uplink Aggregate Maximum Bit Rate')
-    nam = Column(Integer, default=0, doc='Network Access Mode [3GPP TS. 123 008 2.1.1.2] - 0 (PACKET_AND_CIRCUIT) or 2 (ONLY_PACKET)')
+    # ONLY_PACKET by default: the platform has no CS domain (no SGs/MSC). With
+    # PACKET_AND_CIRCUIT the MME grants a combined attach and phones try CS
+    # fallback for calls, which fails and detaches them (TS 23.272).
+    nam = Column(Integer, default=2, doc='Network Access Mode [3GPP TS 23.008 2.1.1.2] - 0 (PACKET_AND_CIRCUIT) or 2 (ONLY_PACKET, default)')
     roaming_enabled = Column(Boolean, default=1, doc='Whether or not to enable roaming on this subscriber')
     roaming_rule_list = Column(String(512), doc='Comma separated list of roaming rules applicable to this subscriber')
     subscribed_rau_tau_timer = Column(Integer, default=300, doc='Subscribed periodic TAU/RAU timer value in seconds')
