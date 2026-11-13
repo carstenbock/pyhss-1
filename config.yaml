@@ -25,6 +25,9 @@ hss:
   MCC: "001"
   #Your Home Mobile Network Code (Used for PLMN calcluation)
   MNC: "01"
+  #Further home PLMNs whose subscribers keep their own IMS domain (ADR-0045),
+  #comma-separated "<MCC>-<MNC>" with the MNC digits as on the SIM, e.g. "262-25"
+  AdditionalPLMNs: ""
 
   #The maximum time to wait, in seconds, before disconnecting a client when no data is received.
   client_socket_timeout: 300

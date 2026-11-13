@@ -22,6 +22,42 @@ def get_ims_domain(mcc: str, mnc: str) -> str:
     return f"ims.mnc{str(mnc).zfill(3)}.mcc{str(mcc).zfill(3)}.3gppnetwork.org"
 
 
+def parse_home_plmns(mcc: str, mnc: str, additional: str = "") -> List[tuple]:
+    """Home PLMNs as (MCC, MNC) with the MNC digits as on the SIM (ADR-0045).
+
+    The platform PLMN comes first, then the additional home PLMNs from
+    ``additional`` ("262-25,310-410"). The MNC keeps its length because the
+    IMSI does not show it: 26225... is 262/25, not 262/025.
+    """
+    plmns = [(str(mcc), str(mnc))]
+    for item in str(additional or "").split(","):
+        a_mcc, sep, a_mnc = item.strip().partition("-")
+        if sep and len(a_mcc) == 3 and a_mcc.isdigit() and len(a_mnc) in (2, 3) and a_mnc.isdigit():
+            if (a_mcc, a_mnc) not in plmns:
+                plmns.append((a_mcc, a_mnc))
+    return plmns
+
+
+def home_plmn_for_imsi(imsi: Optional[str], plmns: Sequence[tuple]) -> tuple:
+    """The home PLMN whose MCC+MNC is the longest prefix of the IMSI.
+
+    Falls back to the platform PLMN (the first entry) for an unknown prefix or
+    a missing IMSI, which is what every subscriber got before ADR-0045.
+    """
+    best = plmns[0]
+    best_len = 0
+    for mcc, mnc in plmns:
+        prefix = f"{mcc}{mnc}"
+        if imsi and str(imsi).startswith(prefix) and len(prefix) > best_len:
+            best, best_len = (mcc, mnc), len(prefix)
+    return best
+
+
+def ims_domain_for_imsi(imsi: Optional[str], plmns: Sequence[tuple]) -> str:
+    """IMS home domain of the subscriber's own PLMN (TS 23.003 §13.2)."""
+    return get_ims_domain(*home_plmn_for_imsi(imsi, plmns))
+
+
 def normalize_peer_hostname(peer_field: Optional[str]) -> Optional[str]:
     """Strip Diameter peer metadata suffix (peer;originHost) and return hostname."""
     if not peer_field:
@@ -575,6 +611,9 @@ def teardown_subscriber(
     resolved_mcc = mcc or getattr(diameter_client, "MCC", "999")
     resolved_mnc = mnc or getattr(diameter_client, "MNC", "999")
     ims_domain = get_ims_domain(resolved_mcc, resolved_mnc)
+    if not (mcc or mnc) and getattr(diameter_client, "homePlmns", None):
+        # ADR-0045: the subscriber's own home PLMN, not always the platform's.
+        ims_domain = ims_domain_for_imsi(imsi, diameter_client.homePlmns)
     resolved_realm = diameter_realm or subscriber_info.get("serving_mme_realm") or ims_subscriber_info.get("scscf_realm")
 
     # Runs first: releasing the IP-CAN session lets the P-CSCF tear an in-progress
@@ -655,6 +694,9 @@ def push_ims_profile(
     resolved_mcc = mcc or getattr(diameter_client, "MCC", "999")
     resolved_mnc = mnc or getattr(diameter_client, "MNC", "999")
     ims_domain = get_ims_domain(resolved_mcc, resolved_mnc)
+    if not (mcc or mnc) and getattr(diameter_client, "homePlmns", None):
+        # ADR-0045: the subscriber's own home PLMN, not always the platform's.
+        ims_domain = ims_domain_for_imsi(imsi, diameter_client.homePlmns)
 
     try:
         cx_user_data = diameter_client.build_cx_user_data(ims_subscriber)

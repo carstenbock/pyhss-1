@@ -27,6 +27,7 @@ import requests
 import traceback
 import re
 from baseModels import Peer, OutboundData
+from network_control import parse_home_plmns, home_plmn_for_imsi, ims_domain_for_imsi
 import pydantic_core
 import xml.etree.ElementTree as ET
 from pyhss_config import config
@@ -47,6 +48,11 @@ SWX_SAT_DEREGISTRATION_TYPES = (4, 5, 6, 7, 8, 9, 10, 11)
 SWX_AAA_BINDING_TTL_SEC = 604800
 
 
+def _home_plmns(node) -> list:
+    """Home PLMNs of a node (ADR-0045); only the platform PLMN when none were configured."""
+    return getattr(node, 'homePlmns', None) or [(node.MCC, node.MNC)]
+
+
 class Diameter:
 
     def __init__(
@@ -65,6 +71,9 @@ class Diameter:
         self.ProductName = self.string_to_hex(productName)
         self.MNC = str(mnc)
         self.MCC = str(mcc)
+        # ADR-0045: the platform PLMN first, then further home PLMNs whose
+        # subscribers keep their own IMS domain.
+        self.homePlmns = parse_home_plmns(self.MCC, self.MNC, config.get('hss', {}).get('AdditionalPLMNs', ''))
         self.logTool = logTool
 
         self.redisUseUnixSocket = config.get('redis', {}).get('useUnixSocket', False)
@@ -2052,7 +2061,7 @@ class Diameter:
         """
         # Imported here: network_control is a helper of the services and is not
         # needed by the rest of this module.
-        from network_control import _send_cx_rtr, get_ims_domain
+        from network_control import _send_cx_rtr
         try:
             if imsi is None and msisdn is None:
                 return False
@@ -2066,7 +2075,7 @@ class Diameter:
                 return False
 
             warnings = []
-            _send_cx_rtr(self, imsSubscriberDetails, imsi, get_ims_domain(self.MCC, self.MNC),
+            _send_cx_rtr(self, imsSubscriberDetails, imsi, ims_domain_for_imsi(imsi, _home_plmns(self)),
                          warnings, self.logTool, self.redisMessaging)
             self.database.Update_Serving_CSCF(imsi=imsi, serving_cscf=None)
             return not warnings
@@ -2085,9 +2094,36 @@ class Diameter:
 
         The MNC is compared without leading zeros, so a home MNC configured
         as "001" still matches "01" decoded from a 2-digit Visited-PLMN-Id.
+
+        Every home PLMN of ADR-0045 counts as home: a subscriber of one home
+        PLMN on the radio network of another is not roaming.
         """
-        return (str(mcc) != str(self.MCC)
-                or str(mnc).lstrip('0') != str(self.MNC).lstrip('0'))
+        return not any(str(mcc) == str(home_mcc)
+                       and str(mnc).lstrip('0') == str(home_mnc).lstrip('0')
+                       for home_mcc, home_mnc in _home_plmns(self))
+
+    def home_plmn_for_imsi(self, imsi) -> tuple:
+        """(MCC, MNC) of the subscriber's own home PLMN (ADR-0045)."""
+        return home_plmn_for_imsi(imsi, _home_plmns(self))
+
+    def ims_domain_for_imsi(self, imsi) -> str:
+        """IMS home domain of the subscriber's own home PLMN (ADR-0045)."""
+        return ims_domain_for_imsi(imsi, _home_plmns(self))
+
+    def home_template_vars(self, details: dict) -> dict:
+        """Template variables for the subscriber's own identities.
+
+        mcc/mnc stay the platform PLMN because templates also build node
+        names (AS server names) from them; identities use home_domain.
+        """
+        home_mcc, home_mnc = self.home_plmn_for_imsi(details.get('imsi'))
+        return {
+            'mcc': self.MCC.zfill(3),
+            'mnc': self.MNC.zfill(3),
+            'home_mcc': home_mcc.zfill(3),
+            'home_mnc': home_mnc.zfill(3),
+            'home_domain': self.ims_domain_for_imsi(details.get('imsi')),
+        }
 
     def validateOutboundRoamingNetwork(self, assignedRoamingRules: str, mcc: str, mnc: str) -> bool:
         """
@@ -3840,8 +3876,7 @@ class Diameter:
     def build_cx_user_data(self, ims_subscriber_details) -> str:
         """Render the Cx-User-Data XML for an IMS subscriber (SAA / PPR)."""
         details = dict(ims_subscriber_details)
-        details['mnc'] = self.MNC.zfill(3)
-        details['mcc'] = self.MCC.zfill(3)
+        details.update(self.home_template_vars(details))
 
         template = None
         if self.ifcCacheEnabled:
@@ -3897,7 +3932,7 @@ class Diameter:
             ims_subscriber_details = self.Get_IMS_Subscriber_Details_from_AVP(username) 
             self.logTool.log(service='HSS', level='debug', message="Got subscriber details: " + str(ims_subscriber_details), redisClient=self.redisMessaging)
             imsi = ims_subscriber_details['imsi']
-            domain = "ims.mnc" + str(self.MNC).zfill(3) + ".mcc" + str(self.MCC).zfill(3) + ".3gppnetwork.org"
+            domain = self.ims_domain_for_imsi(imsi)
         except Exception as E:
             self.logTool.log(service='HSS', level='debug', message="Threw Exception: " + str(E), redisClient=self.redisMessaging)
             self.logTool.log(service='HSS', level='debug', message=f"No known MSISDN or IMSI in Answer_16777216_301()", redisClient=self.redisMessaging)
@@ -4730,16 +4765,15 @@ class Diameter:
 
     def _sh_ims_public_identity(self, subscriber_details):
         """TS 29.328 section 7.6.2 - IMSPublicIdentity (Data-Reference 10)"""
-        mnc = self.MNC.zfill(3)
-        mcc = self.MCC.zfill(3)
         msisdn = subscriber_details.get('msisdn', '')
         imsi = subscriber_details.get('imsi', '')
+        domain = self.ims_domain_for_imsi(imsi)
         parts = ['<PublicIdentifiers>']
         if msisdn:
-            parts.append(f'<IMSPublicIdentity>sip:{msisdn}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org</IMSPublicIdentity>')
+            parts.append(f'<IMSPublicIdentity>sip:{msisdn}@{domain}</IMSPublicIdentity>')
             parts.append(f'<IMSPublicIdentity>tel:+{msisdn}</IMSPublicIdentity>')
         if imsi:
-            parts.append(f'<IMSPublicIdentity>sip:{imsi}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org</IMSPublicIdentity>')
+            parts.append(f'<IMSPublicIdentity>sip:{imsi}@{domain}</IMSPublicIdentity>')
         if msisdn:
             parts.append(f'<MSISDN>{msisdn}</MSISDN>')
         parts.append('</PublicIdentifiers>')
@@ -5014,8 +5048,7 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message=f"[Sh] Using legacy template: {sh_userdata_template}", redisClient=self.redisMessaging)
         template = self.templateEnv.get_template(sh_userdata_template)
 
-        subscriber_details['mnc'] = self.MNC.zfill(3)
-        subscriber_details['mcc'] = self.MCC.zfill(3)
+        subscriber_details.update(self.home_template_vars(subscriber_details))
 
         # TS 29.328 tIMSUserState: 0 NOT_REGISTERED, 1 REGISTERED, 2 REGISTERED_UNREG_SERVICES;
         # the values of the Cx registration state map onto them one to one.
@@ -5242,9 +5275,7 @@ class Diameter:
         msisdn = ims_subscriber_data.get('msisdn')
         public_identity = None
         if msisdn:
-            mnc = self.MNC.zfill(3)
-            mcc = self.MCC.zfill(3)
-            public_identity = f"sip:+{msisdn}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org"
+            public_identity = f"sip:+{msisdn}@{self.ims_domain_for_imsi(ims_subscriber_data.get('imsi'))}"
         for origin_host, subscription in subscriptions.items():
             if not isinstance(subscription, dict):
                 subscription = {}
@@ -6991,8 +7022,7 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Using template " + str(sh_userdata_template) + " for SH user data", redisClient=self.redisMessaging)
         template = templateEnv.get_template(sh_userdata_template)
         #These variables are passed to the template for use
-        subscriber_details['mnc'] = self.MNC.zfill(3)
-        subscriber_details['mcc'] = self.MCC.zfill(3)
+        subscriber_details.update(self.home_template_vars(subscriber_details))
 
         self.logTool.log(service='HSS', level='debug', message="Rendering template with values: " + str(subscriber_details), redisClient=self.redisMessaging)
         xmlbody = template.render(Sh_template_vars=subscriber_details)  # this is where to put args to the template renderer

@@ -125,9 +125,7 @@ def send_pnr_for_local_subscriptions(ims_subscriber_data):
     msisdn = ims_subscriber_data.get('msisdn')
     public_identity = None
     if msisdn:
-        mnc = diameterClient.MNC.zfill(3)
-        mcc = diameterClient.MCC.zfill(3)
-        public_identity = f"sip:+{msisdn}@ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org"
+        public_identity = f"sip:+{msisdn}@{diameterClient.ims_domain_for_imsi(ims_subscriber_data.get('imsi'))}"
     for origin_host, subscription in subscriptions.items():
         if not isinstance(subscription, dict):
             subscription = {}
