@@ -14,6 +14,7 @@ import random
 import ipaddress
 from typing import Optional
 import jinja2
+import gba_guss
 from database import Database, APN, ROAMING_NETWORK, ROAMING_RULE, EMERGENCY_SUBSCRIBER, IMS_SUBSCRIBER, geored_check_updated_endpoints, IFC_TEMPLATE
 from database import ims_registration_state, IMS_NOT_REGISTERED, IMS_REGISTERED, IMS_UNREGISTERED, RESTORATION_INFO_KEEP
 from messaging import RedisMessaging
@@ -7302,7 +7303,24 @@ class Diameter:
         
         # AVP 607: SIP-Number-Auth-Items (number of authentication items = 1)
         avp += self.generate_vendor_avp(607, "c0", 10415, "00000001")
-        
+
+        # AVP 400: GBA-UserSecSettings (TS 29.109). The authentication proxy
+        # asserts one of these public identities to the application server
+        # (Ut); without them it only knows the IMPI. A user without an IMS
+        # profile, or a profile that cannot be rendered, gets no GUSS and
+        # bootstraps all the same.
+        try:
+            ims_details = self.database.Get_IMS_Subscriber(imsi=imsi)
+            uids = gba_guss.public_identities(self.build_cx_user_data(ims_details))
+            if uids:
+                guss = gba_guss.build_guss(uids, "GBA_U" if auth_scheme == "GBA_U" else "GBA")
+                avp += self.generate_vendor_avp(400, "c0", 10415,
+                                                str(binascii.hexlify(guss.encode()), 'ascii'))
+        except Exception as e:
+            self.logTool.log(service='HSS', level='warning',
+                            message=f"Zh MAA without GUSS for {imsi}: {e}",
+                            redisClient=self.redisMessaging)
+
         # AVP 268: Result-Code (DIAMETER_SUCCESS = 2001 = 0x7D1)
         avp += self.generate_avp(268, 40, "000007d1")
         
