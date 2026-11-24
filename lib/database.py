@@ -87,7 +87,7 @@ class AUC(Base):
     ki = Column(String(32), doc='SIM Key - Authentication Key - Ki', nullable=False)
     opc = Column(String(32), doc='SIM Key - Network Operators key OPc', nullable=False)
     amf = Column(String(4), doc='Authentication Management Field', nullable=False)
-    sqn = Column(BigInteger, doc='Authentication sequence number')
+    sqn = Column(BigInteger, default=1, doc='Authentication sequence number, 1 when created without one (a NULL SQN failed every vector request, volte.io KI-251)')
     iccid = Column(String(20), unique=True, doc='Integrated Circuit Card Identification Number')
     imsi = Column(String(18), unique=True, doc='International Mobile Subscriber Identity')
     batch_name = Column(String(20), doc='Name of SIM Batch')
@@ -1816,6 +1816,10 @@ class Database:
     def Get_Vectors_AuC(self, auc_id, action, **kwargs):
         self.logTool.log(service='Database', level='debug', message="Getting Vectors for auc_id " + str(auc_id) + " with action " + str(action), redisClient=self.redisMessaging)
         key_data = self.GetObj(AUC, auc_id)
+        # An entry stored without SQN, before the column default (volte.io
+        # KI-251), starts at 1 like a new one: int(None) failed every request.
+        if key_data.get('sqn') is None:
+            key_data['sqn'] = 1
         vector_dict = {}
         
         if action == "air":

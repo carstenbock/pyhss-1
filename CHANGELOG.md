@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An AuC entry created without `sqn` (as `PUT /auc/` accepts it) was stored with a NULL SQN, and every vector request for it (MAR, AIR) failed with `int(None)`: the HSS answered `DIAMETER_UNABLE_TO_COMPLY` and the UE never attached or registered. `sqn` now defaults to 1, and an entry already stored with NULL starts at 1 (volte.io KI-251)
 - `default_ifc.xml`: a comment contained `--`, which made the profile not well-formed XML; profiles stored from the old template are still read (comments are dropped before parsing the GUSS identities)
 - Gx: setting up a PDN session read the whole `serving_apn` table to find sessions holding the same UE address, on the node that answered the CCR and on every node that received the update, so the work per session grew with the number of sessions. The database now selects the matching rows.
 - S6a AIR and ULR: a subscriber is now treated as roaming when the Visited-PLMN-Id differs from the home PLMN in MCC **or** MNC (TS 23.003 section 2.2). Both had to differ, so a visited network in the home country, or one with the home MNC in another country, counted as home and `roaming_enabled` and the roaming rules were not applied to it. Subscribers with `roaming_enabled` off, or a deny rule or `allow_undefined_networks: false` for such a network, are now rejected there with `DIAMETER_ERROR_ROAMING_NOT_ALLOWED` (5004).
