@@ -18,6 +18,7 @@ import os
 sys.path.append(os.path.realpath(os.path.dirname(__file__) + "/../lib"))
 
 import time
+import hmac
 import re
 import requests
 import traceback
@@ -44,6 +45,7 @@ from network_control import (
 )
 from pyhss_config import config
 from enum_management import ENUMClient, ENUMManagementError
+import simservs_selfcare
 
 
 siteName = config.get("hss", {}).get("site_name", "")
@@ -361,6 +363,7 @@ ns_geored = api.namespace('geored', description='PyHSS GeoRedundancy Functions')
 ns_push = api.namespace('push', description='PyHSS Push Async Diameter Command')
 ns_roaming = api.namespace('roaming', description='PyHSS Roaming Functions')
 ns_ifc_template = api.namespace('ifc_template', description='PyHSS IFC Template Functions')
+ns_selfcare = api.namespace('selfcare', description='Subscriber self-care: supplementary services (ADR-0052)')
 
 parser = reqparse.RequestParser()
 parser.add_argument('APN JSON', type=str, help='APN Body')
@@ -538,6 +541,10 @@ def auth_before_request():
         res = Response()
         res.headers['X-Content-Type-Options'] = '*'
         return res
+    if request.path.startswith('/selfcare/'):
+        # Own key, checked whatever lock_provisioning says; the
+        # Provisioning-Key does not open these endpoints (ADR-0052).
+        return selfcare_auth()
     if request.endpoint and 'static' not in request.endpoint:
         view_function = apiService.view_functions[request.endpoint]
         if hasattr(view_function, 'view_class'):
@@ -1139,6 +1146,88 @@ class PyHSS_IMS_SUBSCRIBER_IMSI(Resource):
         except Exception as E:
             print("Flask Exception: " + str(E))
             return handle_exception(E), 400
+
+def selfcare_settings():
+    """(key, allowed forwarding target prefixes) of the self-care API."""
+    hss = config.get('hss', {}) or {}
+    prefixes = [str(p).strip() for p in (hss.get('selfcare_cf_allowed_prefixes') or []) if str(p).strip()]
+    return str(hss.get('selfcare_key') or ''), prefixes
+
+
+def selfcare_auth():
+    key, _ = selfcare_settings()
+    if not key:
+        return {'result': 'Failed', 'reason': 'The self-care API is not enabled'}, 404
+    given = request.headers.get('Selfcare-Key', '')
+    if not hmac.compare_digest(given.encode(), key.encode()):
+        return {'Result': 'Unauthorized - Selfcare-Key Invalid'}, 401
+    return None
+
+
+def selfcare_subscriber(kind, value):
+    """Return (ims_subscriber, None) or (None, error response)."""
+    if kind == 'imsi' and re.fullmatch(r'[0-9]{5,15}', value):
+        lookup = {'imsi': value}
+    elif kind == 'msisdn' and re.fullmatch(r'\+?[0-9]{5,15}', value):
+        lookup = {'msisdn': value.lstrip('+')}
+    else:
+        return None, ({'result': 'Failed', 'reason': 'Use imsi/<digits> or msisdn/<digits>'}, 400)
+    try:
+        return databaseClient.Get_IMS_Subscriber(**lookup), None
+    except ValueError:
+        return None, ({'result': 'Failed', 'reason': 'IMS subscriber not found'}, 404)
+
+
+def selfcare_profile(ims_subscriber):
+    # The Sh read path prefers the deprecated sh_profile column (diameter.py).
+    return ims_subscriber.get('sh_profile') or ims_subscriber.get('xcap_profile') or ''
+
+
+@ns_selfcare.route('/supplementary_services/<string:kind>/<string:value>')
+class PyHSS_Selfcare_Supplementary_Services(Resource):
+    def get(self, kind, value):
+        '''Supplementary services a subscriber may change, as the MMTel-AS applies them'''
+        ims_subscriber, error = selfcare_subscriber(kind, value)
+        if error:
+            return error
+        _, prefixes = selfcare_settings()
+        try:
+            settings = simservs_selfcare.read_settings(selfcare_profile(ims_subscriber))
+        except Exception as E:
+            return {'result': 'Failed', 'reason': f'Stored profile cannot be read: {E}'}, 409
+        settings['allowed_target_prefixes'] = prefixes
+        return settings, 200
+
+    def put(self, kind, value):
+        '''Change the supplementary services a subscriber may change; other settings stay as they are'''
+        ims_subscriber, error = selfcare_subscriber(kind, value)
+        if error:
+            return error
+        _, prefixes = selfcare_settings()
+        try:
+            changes = simservs_selfcare.validate_changes(request.get_json(silent=True), prefixes)
+        except simservs_selfcare.SelfcareError as E:
+            return {'result': 'Failed', 'reason': str(E)}, 400
+        try:
+            profile = simservs_selfcare.apply_changes(selfcare_profile(ims_subscriber), changes)
+        except Exception as E:
+            return {'result': 'Failed', 'reason': f'Stored profile cannot be read: {E}'}, 409
+        try:
+            # Write the canonical column and clear the deprecated sh_profile so
+            # it cannot shadow the change on the next Sh read.
+            data = databaseClient.UpdateObj(IMS_SUBSCRIBER, {'xcap_profile': profile, 'sh_profile': None},
+                                            ims_subscriber['ims_subscriber_id'])
+        except Exception as E:
+            return handle_exception(E)
+        # Push the changed Sh repository data to subscribed ASs (TS 29.328 6.1.4)
+        try:
+            notify_subscribed_application_servers(data)
+        except Exception as pnr_error:
+            logTool.log(service='API', level='error', message=f"[API] Sh PNR notification failed: {pnr_error}", redisClient=redisMessaging)
+        settings = simservs_selfcare.read_settings(profile)
+        settings['allowed_target_prefixes'] = prefixes
+        return settings, 200
+
 
 @ns_ims_subscriber.route('/list')
 class PyHSS_IMS_Subscriber_All(Resource):

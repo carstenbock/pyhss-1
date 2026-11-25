@@ -17,6 +17,9 @@ hss:
   active_diameter_peers_timeout: 10
   lock_provisioning: False
   provisioning_key: "changeThisKeyInProduction"
+  # Self-care API for supplementary services (ADR-0052)
+  selfcare_key: "selfcareTestKey"
+  selfcare_cf_allowed_prefixes: ["+49"]
   CancelLocationRequest_Enabled: False
   Default_Sh_UserData: 'default_sh_user_data.xml'
   use_external_socket_service: False
