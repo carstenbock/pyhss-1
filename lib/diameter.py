@@ -1129,21 +1129,30 @@ class Diameter:
                 return None
         return owner if isinstance(owner, dict) else None
 
-    def rx_relay_call_ended(self, af_session_id):
+    def rx_relay_call_ended(self, af_session_id, removed_rules=None):
         """Ask the other nodes (in the background, like every Rx relay) to end
-        a call whose record they hold (its rules on the PGW and the record)."""
-        self._rx_relay('/geored/rx_call_ended', {'af_session_id': af_session_id}, 'rx_relay_call_ended')
+        a call whose record they hold (its rules on the PGW and the record).
+        removed_rules: the rules the asking node has removed from the PGW
+        itself; the holder of the record leaves those out."""
+        self._rx_relay('/geored/rx_call_ended',
+                       {'af_session_id': af_session_id, 'removed_rules': list(removed_rules or [])},
+                       'rx_relay_call_ended')
 
-    def rx_end_call_locally(self, af_session_id):
+    def rx_end_call_locally(self, af_session_id, removed_rules=None):
         """A relayed STR: if this node holds the call's record, remove the
-        call's rules from the PGW (all but the voice rule, which the node that
-        got the STR removes when it knows the subscriber; harmless if it is
-        removed twice) and forget the record. Returns the removed rule names."""
+        call's rules from the PGW and forget the record. The node that got the
+        STR removes the voice rule itself when it knows the subscriber and
+        names it in removed_rules: a rule is removed once (TS 29.212 4.5.2; a
+        PCEF may take a second removal badly, KI-296). Returns the names of the
+        rules removed here."""
         owner = self.rx_local_call_session(af_session_id)
         if not owner:
             return []
         subscriberId = owner.get('subscriber_id')
-        rules = [name for name in owner.get('rules') or []]
+        # By name is enough: a node that could not name the call's rule (no
+        # subscriber, 'GBR-Voice_<session>') matches nothing here, so all go.
+        removed = set(removed_rules) if isinstance(removed_rules, list) else set()
+        rules = [name for name in owner.get('rules') or [] if name not in removed]
         try:
             apnId = (self.database.Get_APN_by_Name(apn="ims")).get('apn_id', None)
             servingApn = self.database.Get_Serving_APN(subscriber_id=subscriberId, apn_id=apnId)
@@ -5860,6 +5869,7 @@ class Diameter:
             """
             Triggers a Re-Auth-Request to the PGW, the returns a Session Termination Answer.
             """
+            ownerRelayPending = False
             avp = ''
             sessionId = bytes.fromhex(self.get_avp_data(avps, 263)[0]).decode('ascii')                                          #Get Session-ID
             avp += self.generate_avp(263, 40, self.string_to_hex(sessionId))                                                    #Set session ID to received session ID
@@ -5888,8 +5898,10 @@ class Diameter:
                     imsSubscriber = self.database.Get_IMS_Subscriber(imsi=owner['imsi'])
                 if not owner:
                     # The call was set up on another node: this node removes the
-                    # voice rule below, the holder of the record the others.
-                    self.rx_relay_call_ended(sessionId)
+                    # voice rule below, the holder of the record the others. The
+                    # holder is asked once it is known whether the voice rule
+                    # was removed here (KI-296).
+                    ownerRelayPending = True
                 imsi = imsSubscriber.get('imsi', None)
                 pcscf = imsSubscriber.get('pcscf', None)
                 pcscf_realm = imsSubscriber.get('pcscf_realm', None)
@@ -5957,19 +5969,38 @@ class Diameter:
             except:
                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] Error getting Original SessionID: {traceback.format_exc()}", redisClient=self.redisMessaging)
                 aarSessionID = ""
+            if ownerRelayPending and not (servingApn is not None or emergencySubscriberData):
+                # No RAR from this node: the holder of the record removes all.
+                self.rx_relay_call_ended(sessionId)
+                ownerRelayPending = False
             if servingApn is not None or emergencySubscriberData:
+                removedRuleNames = (callRules if callRules
+                                    else self.rx_call_rule_name('Voice', subscriberId, aarSessionID) if subscriberId
+                                    else 'GBR-Voice_' + str(aarSessionID))
                 reAuthAnswer = self.awaitDiameterRequestAndResponse(
                         requestType='RAR',
                         hostname=servingPgwPeer,
                         sessionId=pcrfSessionId,
                         servingPgw=servingPgw,
                         servingRealm=servingPgwRealm,
-                        chargingRuleName=(callRules if callRules
-                                          else self.rx_call_rule_name('Voice', subscriberId, aarSessionID) if subscriberId
-                                          else 'GBR-Voice_' + str(aarSessionID)),
+                        chargingRuleName=removedRuleNames,
                         chargingRuleAction='remove'
                 )
-            
+
+                if ownerRelayPending:
+                    # The PGW removed these rules (RAA 2001): the holder removes
+                    # the others. Without an answer, or with an error, the
+                    # holder removes all, as a second attempt.
+                    removedHere = None
+                    if len(reAuthAnswer) > 0:
+                        try:
+                            if int(self.get_avp_data(self.decode_diameter_packet(reAuthAnswer)[1], 268)[0], 16) == 2001:
+                                removedHere = [removedRuleNames] if isinstance(removedRuleNames, str) else list(removedRuleNames)
+                        except Exception:
+                            removedHere = None
+                    self.rx_relay_call_ended(sessionId, removed_rules=removedHere)
+                    ownerRelayPending = False
+
                 if not len(reAuthAnswer) > 0:
                     self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] RAA Timeout: {reAuthAnswer}", redisClient=self.redisMessaging)
                     assert()
@@ -5995,6 +6026,10 @@ class Diameter:
             return response
         except Exception as e:
             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_275] [STA] Error generating STA, returning 2001", redisClient=self.redisMessaging)
+            if ownerRelayPending:
+                # The removal from this node failed before the holder of the
+                # call's record was asked: it removes all rules.
+                self.rx_relay_call_ended(bytes.fromhex(self.get_avp_data(avps, 263)[0]).decode('ascii'))
             avp = ''
             sessionId = self.get_avp_data(avps, 263)[0]                                                       #Get Session-ID
             avp += self.generate_avp(263, 40, sessionId)                                                    #Set session ID to received session ID

@@ -2609,13 +2609,15 @@ class PyHSS_Geored_Rx_Call_Ended(Resource):
     @ns_geored.doc('Receive an ended Rx call session (STR on another node) and end it here if this node holds its record')
     @no_auth_required
     def post(self):
-        '''Remove the call's Gx rules and record if this node set the call up (KI-151, KI-168)'''
+        '''Remove the call's Gx rules and record if this node set the call up (KI-151, KI-168); removed_rules names those the asking node removed itself (KI-296)'''
         try:
             json_data = request.get_json(force=True)
             af_session_id = json_data.get('af_session_id')
             if not af_session_id:
                 return {'error': 'af_session_id is required'}, 400
-            return {'result': 'OK', 'removed': diameterClient.rx_end_call_locally(af_session_id), 'node': originHostname}, 200
+            return {'result': 'OK',
+                    'removed': diameterClient.rx_end_call_locally(af_session_id, json_data.get('removed_rules')),
+                    'node': originHostname}, 200
         except Exception as E:
             print(E)
             return handle_exception(E)
