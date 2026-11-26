@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Copyright 2023-2025 David Kneipp <david@davidkneipp.com>
 # SPDX-License-Identifier: AGPL-3.0-or-later
+import threading
 import os, sys, json, time, traceback, socket
 
 sys.path.append(os.path.realpath(os.path.dirname(__file__) + "/../lib"))
@@ -163,6 +164,10 @@ class HssService:
 
 def main():
     hssService = HssService()
+    # Serving APN rows pushed by the other nodes while this one was down are
+    # not pushed again; fetch them, off the worker's path (helm KI-310).
+    threading.Thread(target=hssService.diameterLibrary.sync_serving_apns_from_peers,
+                     name="serving-apn-sync", daemon=True).start()
     hssService.handleQueue()
 
 

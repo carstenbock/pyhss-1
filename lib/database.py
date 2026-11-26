@@ -2369,7 +2369,10 @@ class Database:
 
         try:
             if serving_pgw_timestamp != None and serving_pgw_timestamp != 'None':
-                serving_pgw_timestamp = datetime.strptime(serving_pgw_timestamp, '%Y-%m-%dT%H:%M:%SZ')
+                # datetime is the module here: datetime.strptime raised, and
+                # every pushed row got the time of its arrival instead of the
+                # attach time, which the serving APN catch-up compares (helm KI-310).
+                serving_pgw_timestamp = datetime.datetime.strptime(str(serving_pgw_timestamp), '%Y-%m-%dT%H:%M:%SZ')
                 serving_pgw_timestamp = serving_pgw_timestamp.replace(tzinfo=timezone.utc)
                 serving_pgw_timestamp_string = serving_pgw_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
             else:
@@ -2474,6 +2477,36 @@ class Database:
         
         self.safe_close(session)
         return result   
+
+    def Get_Serving_APN_Rows(self, imsi=None, page=0, page_size=2000) -> list:
+        """The serving APN rows in the form a geored push carries them (IMSI
+        and APN name instead of the local ids), for the catch-up between
+        Diameter nodes (serving_apn_sync, helm KI-310)."""
+        Session = sessionmaker(bind=self.engine)
+        session = Session()
+        try:
+            query = (session.query(SERVING_APN, SUBSCRIBER.imsi, APN.apn)
+                     .join(SUBSCRIBER, SERVING_APN.subscriber_id == SUBSCRIBER.subscriber_id)
+                     .join(APN, SERVING_APN.apn == APN.apn_id))
+            if imsi:
+                query = query.filter(SUBSCRIBER.imsi == str(imsi))
+            query = query.order_by(SERVING_APN.serving_apn_id).offset(int(page) * int(page_size)).limit(int(page_size))
+            rows = []
+            for serving, subscriberImsi, apnName in query.all():
+                when = serving.serving_pgw_timestamp
+                rows.append({
+                    'imsi': str(subscriberImsi),
+                    'serving_apn': apnName,
+                    'pcrf_session_id': serving.pcrf_session_id,
+                    'serving_pgw': serving.serving_pgw,
+                    'serving_pgw_realm': serving.serving_pgw_realm,
+                    'serving_pgw_peer': serving.serving_pgw_peer,
+                    'serving_pgw_timestamp': when.strftime('%Y-%m-%dT%H:%M:%SZ') if when else None,
+                    'subscriber_routing': serving.subscriber_routing,
+                })
+            return rows
+        finally:
+            self.safe_close(session)
 
     def Get_Serving_APNs(self, subscriber_id: int) -> dict:
         """

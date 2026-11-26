@@ -2638,6 +2638,21 @@ class PyHSS_Geored_Rx_Call_Ended(Resource):
             print(E)
             return handle_exception(E)
 
+@ns_geored.route('/serving_apns')
+class PyHSS_Geored_Serving_APNs(Resource):
+    @ns_geored.doc('The serving APN rows of this node, for the catch-up of another Diameter node')
+    @no_auth_required
+    def get(self):
+        '''Serving APN rows of this node (optionally of one IMSI), paginated (KI-310)'''
+        try:
+            rows = databaseClient.Get_Serving_APN_Rows(imsi=request.args.get('imsi'),
+                                                       page=int(request.args.get('page', 0)),
+                                                       page_size=min(int(request.args.get('page_size', 2000)), 5000))
+            return {'serving_apns': rows, 'node': originHostname}, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
 @ns_geored.route('/rx_failed_call_rules')
 class PyHSS_Geored_Rx_Failed_Call_Rules(Resource):
     @ns_geored.doc('Receive call rules a PCEF reported as failed and tell the AF of those held on this node')

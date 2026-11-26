@@ -3279,6 +3279,41 @@ class Diameter:
                        {'subscriber_id': subscriber_id, 'apn_id': apn_id, 'af_session_id': af_session_id},
                        'rx_relay_forget_af_session')
 
+    def serving_apn_from_peers(self, imsi, apn_name, stale_session_id):
+        """The PGW refused a Gx session as unknown: this node missed the push of
+        the subscriber's current session (it was restarting, KI-310). Returns
+        the row another node holds, stored here as well, or None."""
+        import serving_apn_sync
+        try:
+            return serving_apn_sync.fresh_row(
+                self.database, config.get('hss', {}).get('rx_notify_endpoints', []) or [], imsi, apn_name, stale_session_id,
+                own=serving_apn_sync.own_addresses(),
+                log=lambda level, message: self.logTool.log(service='HSS', level=level, message=f"[diameter.py] {message}", redisClient=self.redisMessaging))
+        except Exception:
+            self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [serving_apn_from_peers] failed: {traceback.format_exc()}", redisClient=self.redisMessaging)
+            return None
+
+    def sync_serving_apns_from_peers(self, attempts=6, wait=20):
+        """At start: take the serving APN table over from the other nodes
+        (pushes sent while this node was down are not repeated, KI-310).
+        Repeated while no peer answers, e.g. when every node starts at once."""
+        import serving_apn_sync
+        endpoints = config.get('hss', {}).get('rx_notify_endpoints', []) or []
+        if not endpoints:
+            return None
+        for attempt in range(attempts):
+            try:
+                result = serving_apn_sync.sync(
+                    self.database, endpoints, own=serving_apn_sync.own_addresses(),
+                    log=lambda level, message: self.logTool.log(service='HSS', level=level, message=f"[diameter.py] {message}", redisClient=self.redisMessaging))
+                if result is not None:
+                    return result
+            except Exception:
+                self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [sync_serving_apns_from_peers] failed: {traceback.format_exc()}", redisClient=self.redisMessaging)
+            time.sleep(wait)
+        self.logTool.log(service='HSS', level='warning', message="[diameter.py] [sync_serving_apns_from_peers] no peer answered, serving APN table left as it is", redisClient=self.redisMessaging)
+        return None
+
     def _rx_relay(self, path, payload, label):
         """Relay to the other HSS nodes (rx_notify_endpoints) without blocking
         the worker: queued to this process's background sender (KI-171)."""
@@ -5856,6 +5891,32 @@ class Diameter:
 
                         raaPacketVars, raaAvps = self.decode_diameter_packet(reAuthAnswer)
                         raaResultCode = int(self.get_avp_data(raaAvps, 268)[0], 16)
+
+                        if raaResultCode == 5002 and imsi and not emergencySubscriber:
+                            # DIAMETER_UNKNOWN_SESSION_ID: the Gx session stored here is
+                            # gone at the PGW. Another node may hold the subscriber's
+                            # current one (this node missed its push, KI-310): one retry.
+                            freshApn = self.serving_apn_from_peers(imsi, 'ims', pcrfSessionId)
+                            if freshApn:
+                                pcrfSessionId = freshApn['pcrf_session_id']
+                                servingPgw = freshApn.get('serving_pgw') or servingPgw
+                                servingPgwRealm = freshApn.get('serving_pgw_realm') or servingPgwRealm
+                                servingPgwPeer = (freshApn.get('serving_pgw_peer') or servingPgwPeer or '').split(';')[0]
+                                ueIp = freshApn.get('subscriber_routing') or ueIp
+                                reAuthAnswer = self.awaitDiameterRequestAndResponse(
+                                        requestType='RAR',
+                                        hostname=servingPgwPeer,
+                                        sessionId=pcrfSessionId,
+                                        chargingRules=installRules or None,
+                                        ueIp=ueIp,
+                                        removeRuleNames=removeRules,
+                                        servingPgw=servingPgw,
+                                        servingRealm=servingPgwRealm
+                                )
+                                if not len(reAuthAnswer) > 0:
+                                    assert()
+                                raaPacketVars, raaAvps = self.decode_diameter_packet(reAuthAnswer)
+                                raaResultCode = int(self.get_avp_data(raaAvps, 268)[0], 16)
 
                         if raaResultCode == 2001:
                             avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))
