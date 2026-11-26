@@ -107,3 +107,18 @@ def test_live_session_is_still_aborted_when_the_pdn_ends(db):
     node.rx_terminate_local_af_subscriptions(IMSI, "ims")
 
     assert [(kind, kwargs["sessionId"]) for kind, kwargs in node.sent] == [("ASR", RX_SESSION)]
+
+
+def test_asr_for_an_ended_pdn_says_bearer_released(db):
+    # TS 29.214 5.3.1: BEARER_RELEASED (0) is the cause for a bearer that went
+    # with normal signalling. The ASR carried 1, INSUFFICIENT_SERVER_RESOURCES,
+    # which tells the AF that the PCRF is overloaded (helm KI-297).
+    node = make_node(db, "hss-0")
+    subscriber_id = db.Get_Subscriber(imsi=IMSI)["subscriber_id"]
+    node.rx_store_af_subscription(subscriber_id, 2, RX_SESSION, PCSCF, REALM, 7200)
+
+    node.rx_terminate_local_af_subscriptions(IMSI, "ims")
+
+    [(kind, kwargs)] = node.sent
+    assert kind == "ASR"
+    assert kwargs["abortCause"] == 0

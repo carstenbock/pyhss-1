@@ -3183,6 +3183,11 @@ class Diameter:
         self.logTool.log(service='HSS', level='debug', message="Successfully Generated NOA", redisClient=self.redisMessaging)
         return response
 
+    # Rx Abort-Cause (TS 29.214 5.3.1): the bearer went with normal signalling,
+    # here the end of the IP-CAN session. 1 is INSUFFICIENT_SERVER_RESOURCES, an
+    # overloaded PCRF, which every such ASR claimed before (helm KI-297).
+    ABORT_CAUSE_BEARER_RELEASED = 0
+
     # Upon receipt of CCR-Type 3 (Termination), send Rx ASR to every AF subscribed
     # to the IMS signalling bearer. The Gx session and the Rx subscription may be
     # handled by different cluster nodes (each diameter node has its own node-local
@@ -3228,7 +3233,7 @@ class Diameter:
                 peer=af['af_peer'],
                 realm=af['af_realm'],
                 sessionId=af_session_id,
-                abortCause=1
+                abortCause=self.ABORT_CAUSE_BEARER_RELEASED
             )
             self.rx_remove_af_subscription(subscriber_id=SubscriberID, apn_id=apnId, af_session_id=af_session_id)
         return True
