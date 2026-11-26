@@ -1,7 +1,7 @@
 services:
 
   pyhss_api:
-    image: ghcr.io/nickvsnetworking/pyhss/pyhss:development
+    image: ghcr.io/pyhss/pyhss/pyhss:development
     build:
       context: ../
       dockerfile: docker/Dockerfile
@@ -13,7 +13,6 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - pyhss_logs:/opt/pyhss/logs
       - pyhss_sqlite:/var/lib/pyhss
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/oam/ping"]
@@ -22,12 +21,13 @@ services:
       retries: 5
       start_period: 3s
       start_interval: 0.1s
+    stop_grace_period: 1s
     depends_on:
-      redis:
-        condition: service_healthy
+      pyhss_hss:
+        condition: service_started
 
   pyhss_diameter:
-    image: ghcr.io/nickvsnetworking/pyhss/pyhss:development
+    image: ghcr.io/pyhss/pyhss/pyhss:development
     env_file:
         - ../docker/.env
     environment:
@@ -36,7 +36,6 @@ services:
     ports:
       - "127.0.0.1:3868:3868"
     volumes:
-      - pyhss_logs:/opt/pyhss/logs
       - pyhss_sqlite:/var/lib/pyhss
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "3868"]
@@ -45,26 +44,27 @@ services:
       retries: 5
       start_period: 3s
       start_interval: 0.1s
+    stop_grace_period: 1s
     depends_on:
       pyhss_api:
         condition: service_healthy
 
   pyhss_hss:
-    image: ghcr.io/nickvsnetworking/pyhss/pyhss:development
+    image: ghcr.io/pyhss/pyhss/pyhss:development
     env_file:
         - ../docker/.env
     environment:
       CONTAINER_ROLE: "hss"
     container_name: "pyhss_hss"
     volumes:
-      - pyhss_logs:/opt/pyhss/logs
       - pyhss_sqlite:/var/lib/pyhss
+    stop_grace_period: 1s
     depends_on:
-      pyhss_diameter:
+      redis:
         condition: service_healthy
 
   pyhss_gsup:
-    image: ghcr.io/nickvsnetworking/pyhss/pyhss:development
+    image: ghcr.io/pyhss/pyhss/pyhss:development
     env_file:
         - ../docker/.env
     container_name: "pyhss_gsup"
@@ -73,7 +73,6 @@ services:
     ports:
       - "127.0.0.1:4222:4222"
     volumes:
-      - pyhss_logs:/opt/pyhss/logs
       - pyhss_sqlite:/var/lib/pyhss
     healthcheck:
       test: ["CMD", "nc", "-z", "localhost", "4222"]
@@ -82,9 +81,10 @@ services:
       retries: 5
       start_period: 3s
       start_interval: 0.1s
+    stop_grace_period: 1s
     depends_on:
-      redis:
-        condition: service_healthy
+      pyhss_hss:
+        condition: service_started
 
   redis:
     image: "redis:7.0-alpine"
@@ -104,5 +104,4 @@ services:
 
 volumes:
   redis_data:
-  pyhss_logs:
   pyhss_sqlite:

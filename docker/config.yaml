@@ -19,7 +19,7 @@ hss:
   ProductName: "${HSS_PRODUCT_NAME:-pyHSS}"
 
   #Name of the Site, shown in API
-  site_name: "${HSS_SITE_NAME:-Sydney}"
+  site_name: "${HSS_SITE_NAME:-}"
 
   #Your Home Mobile Country Code (Used for PLMN calcluation)
   MCC: "${HSS_MCC:-001}"
@@ -79,8 +79,17 @@ hss:
     - "${HSS_SCSCF_POOL:-scscf.ims.mnc001.mcc001.3gppnetwork.org}"
 
   roaming:
+    inbound:
+      # How to handle unknown IMSIs when inbound roaming. Valid options are:
+      #   IMSI_UNKNOWN - Reject the request with the "IMSI_UNKNOWN" error code.
+      #   ROAMING_NOT_ALLOWED - Reject the request with the "ROAMING_NOT_ALLOWED" error code.
+      # The latter is useful when operating a private network and public SIMs should not be allowed to connect.
+      # "Roaming not allowed" will cause the UE to not try again on this network.
+      # "Imsi unknown" may cause the UE to believe that its subscription is invalid.
+      # For private networks, "ROAMING_NOT_ALLOWED" is recommended. Otherwise, use "IMSI_UNKNOWN".
+      reject_unknown_imsis_with: "${HSS_ROAMING_REJECT_UNKNOWN_IMSIS_WITH:-ROAMING_NOT_ALLOWED}"
     outbound:
-      # Whether or not to a subscriber to connect to an undefined network when outbound roaming.
+      # Whether or not to allow a subscriber to connect to an undefined network when outbound roaming.
       allow_undefined_networks: ${HSS_ROAMING_ALLOW_UNDEFINED_NETWORKS:-True}
 
   # SCTP Socket Parameters
@@ -92,6 +101,14 @@ hss:
   gsup:
     bind_ip: "${HSS_GSUP_BIND_IP:-0.0.0.0}"
     bind_port: ${HSS_GSUP_BIND_PORT:-4222}
+    # Simple 2G / 3G USSD support via GSUP.
+    # Define USSD codes and messages here. The %msisdn% and %imsi% variables can be used in messages.
+    ussd:
+      codes:
+        - code: "*#100#"
+          msg: "Your MSISDN is: %msisdn%"
+        - code: "*#101#"
+          msg: "Your IMSI is: %imsi%"
 
   # IFC Template Configuration (backward compatible)
   ifc_templates:
@@ -128,9 +145,15 @@ geored:
   endpoints: []
 
 api:
+  bind_ip: "${API_BIND_IP:-0.0.0.0}"
+  bind_port: ${API_BIND_PORT:-8080}
   page_size: ${API_PAGE_SIZE:-200}
   # Whether or not to return key-based data when querying the AUC. Disable in production systems.
   enable_insecure_auc: ${API_ENABLE_INSECURE_AUC:-False}
+
+metric:
+  bind_ip: "${METRIC_BIND_IP:-0.0.0.0}"
+  bind_port: ${METRIC_BIND_PORT:-9191}
 
 benchmarking:
   # Whether to enable benchmark logging
@@ -149,6 +172,10 @@ eir:
 logging:
   level: "${LOGGING_LEVEL:-INFO}"
   logfiles:
+    # PyHSS logs can be viewed with journalctl when using the systemd services
+    # or "docker compose logs" when using docker. While this should be enough
+    # for most use cases, it is also possible to start the separate PyHSS
+    # logService that then logs to the files listed below.
     hss_logging_file: "${LOGGING_HSS_FILE:-/var/log/pyhss_hss.log}"
     diameter_logging_file: "${LOGGING_DIAMETER_FILE:-/var/log/pyhss_diameter.log}"
     geored_logging_file: "${LOGGING_GEORED_FILE:-/var/log/pyhss_geored.log}"

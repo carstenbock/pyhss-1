@@ -1373,14 +1373,26 @@ class Database:
         self.safe_close(session)
         return result
 
+    def msisdn_variants(self, msisdn) -> list:
+        #Returns the forms an MSISDN may be stored as, so a lookup matches whether or not
+        #the subscriber was provisioned with a leading + (E.164) prefix.
+        msisdn = str(msisdn).strip()
+        variants = [msisdn]
+        if msisdn.startswith('+'):
+            variants.append(msisdn.lstrip('+'))
+        else:
+            variants.append('+' + msisdn)
+        return list(dict.fromkeys(variants))
+
     def Get_IMS_Subscriber(self, **kwargs):
         #Get subscriber by IMSI or MSISDN
         Session = sessionmaker(bind = self.engine)
         session = Session()
         if 'msisdn' in kwargs:
-            self.logTool.log(service='Database', level='debug', message="Get_IMS_Subscriber for msisdn " + str(kwargs['msisdn']), redisClient=self.redisMessaging)
+            msisdnVariants = self.msisdn_variants(kwargs['msisdn'])
+            self.logTool.log(service='Database', level='debug', message="Get_IMS_Subscriber for msisdn " + str(kwargs['msisdn']) + " (matching any of " + str(msisdnVariants) + ")", redisClient=self.redisMessaging)
             try:
-                result = session.query(IMS_SUBSCRIBER).filter_by(msisdn=str(kwargs['msisdn'])).one()
+                result = session.query(IMS_SUBSCRIBER).filter(IMS_SUBSCRIBER.msisdn.in_(msisdnVariants)).one()
             except Exception as E:
                 self.safe_close(session)
                 raise ValueError(E)
@@ -1416,9 +1428,10 @@ class Database:
                 self.safe_close(session)
                 raise ValueError(E)
         elif 'msisdn' in kwargs:
-            self.logTool.log(service='Database', level='debug', message="Get_Subscriber for msisdn " + str(kwargs['msisdn']), redisClient=self.redisMessaging)
+            msisdnVariants = self.msisdn_variants(kwargs['msisdn'])
+            self.logTool.log(service='Database', level='debug', message="Get_Subscriber for msisdn " + str(kwargs['msisdn']) + " (matching any of " + str(msisdnVariants) + ")", redisClient=self.redisMessaging)
             try:
-                result = session.query(SUBSCRIBER).filter_by(msisdn=str(kwargs['msisdn'])).one()
+                result = session.query(SUBSCRIBER).filter(SUBSCRIBER.msisdn.in_(msisdnVariants)).one()
             except Exception as E:
                 self.safe_close(session)
                 raise ValueError(E)
@@ -2603,6 +2616,7 @@ class Database:
             raise ValueError(E)
         result = result.__dict__
         result.pop('_sa_instance_state')
+        self.safe_close(session)
         result = self.Sanitize_Datetime(result)
         return result
 
@@ -2619,6 +2633,7 @@ class Database:
             raise ValueError(E)
         result = result.__dict__
         result.pop('_sa_instance_state')
+        self.safe_close(session)
         result = self.Sanitize_Datetime(result)
         return result
 
@@ -2660,6 +2675,7 @@ class Database:
 
             if not result:
                 self.logTool.log(service='Database', level='debug', message=f"[database.py] [Get_Emergency_Subscriber] No match for emergency subscriber on IMSI: {imsi} / Subscriber IP: {subscriberIp} / gxSessionId: {gxSessionId} / rxSessionId: {rxSessionId}", redisClient=self.redisMessaging)
+                self.safe_close(session)
                 return None
             result = result.__dict__
             result.pop('_sa_instance_state')

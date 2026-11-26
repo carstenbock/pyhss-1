@@ -1,15 +1,17 @@
 # Copyright 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
 # SPDX-License-Identifier: AGPL-3.0-or-later
+import importlib
 import os
-import pytest
 import shlex
 import shutil
-import sqlglot
 import subprocess
+from pathlib import Path
+
+import pytest
+import sqlglot
 from conftest import wait_for_tcp_port
 from database import Database
 from logtool import LogTool
-from pathlib import Path
 from pyhss_config import config
 
 top_dir = Path(Path(__file__) / "../..").resolve()
@@ -27,6 +29,10 @@ def run_mariadbd(tmpdir):
         if not shutil.which(program):
             pytest.skip(f"{program} is not installed")
             return
+    if not importlib.util.find_spec("MySQLdb"):
+        # SQLAlchemy needs MySQLdb to connect to MySQL/MariaDB servers
+        pytest.skip("python module MySQLdb (mysqlclient) is not installed")
+        return
 
     cmd = [
         "mariadb-install-db",

@@ -142,8 +142,14 @@ def main():
         '/metrics': make_wsgi_app(registry=metricService.registry)
     })
 
-    prometheusPort = config.get('prometheus', {}).get('port', 9191)
-    prometheusWebClient.run(host='0.0.0.0', port=prometheusPort)
+    # Upstream keys (metric.bind_ip / metric.bind_port) with the fork's
+    # behaviour as fallback: port from prometheus.port, listen on all
+    # addresses (the pod is scraped from outside).
+    config_metric = config.get('metric', {})
+    host = config_metric.get('bind_ip', '0.0.0.0')
+    port = int(config_metric.get('bind_port', config.get('prometheus', {}).get('port', 9191)))
+
+    prometheusWebClient.run(host=host, port=port)
 
 
 if __name__ == '__main__':

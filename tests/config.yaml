@@ -7,7 +7,7 @@ hss:
   OriginHost: "hss01"
   OriginRealm: "epc.mnc001.mcc001.3gppnetwork.org"
   ProductName: "pyHSS"
-  site_name: "Sydney"
+  site_name: ""
   MCC: "001"
   MNC: "01"
   client_socket_timeout: 300
@@ -33,12 +33,20 @@ hss:
     - 'scscf.ims.mnc001.mcc001.3gppnetwork.org'
 
   roaming:
+    inbound:
+      reject_unknown_imsis_with: "ROAMING_NOT_ALLOWED"
     outbound:
       allow_undefined_networks: True
 
   gsup:
     bind_ip: "127.0.0.1"
     bind_port: 4222
+    ussd:
+      codes:
+        - code: "*#100#"
+          msg: "Your MSISDN is: %msisdn%"
+        - code: "*#101#"
+          msg: "Your IMSI is: %imsi%"
 
   # IFC Template configuration (backward compatible)
   ifc_templates:

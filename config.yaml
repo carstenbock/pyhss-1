@@ -4,7 +4,7 @@ hss:
   # Note: SCTP works but is still experimental. TCP has been load-tested and performs in a production environment.
   transport: "TCP"
   #IP Addresses to bind on (List) - For TCP only the first IP is used, for SCTP all used for Transport (Multihomed).
-  bind_ip: ["0.0.0.0"]
+  bind_ip: ["127.0.0.1"]
 
   #Port to listen on (Same for TCP & SCTP)
   bind_port: 3868
@@ -19,7 +19,7 @@ hss:
   ProductName: "pyHSS"
 
   #Name of the Site, shown in API
-  site_name: "Sydney"
+  site_name: ""
 
   #Your Home Mobile Country Code (Used for PLMN calcluation)
   MCC: "001"
@@ -82,8 +82,17 @@ hss:
     - 'scscf.ims.mnc001.mcc001.3gppnetwork.org'
 
   roaming:
+    inbound:
+      # How to handle unknown IMSIs when inbound roaming. Valid options are:
+      #   IMSI_UNKNOWN - Reject the request with the "IMSI_UNKNOWN" error code.
+      #   ROAMING_NOT_ALLOWED - Reject the request with the "ROAMING_NOT_ALLOWED" error code.
+      # The latter is useful when operating a private network and public SIMs should not be allowed to connect.
+      # "Roaming not allowed" will cause the UE to not try again on this network.
+      # "Imsi unknown" may cause the UE to believe that its subscription is invalid.
+      # For private networks, "ROAMING_NOT_ALLOWED" is recommended. Otherwise, use "IMSI_UNKNOWN".
+      reject_unknown_imsis_with: "ROAMING_NOT_ALLOWED"
     outbound:
-      # Whether or not to a subscriber to connect to an undefined network when outbound roaming.
+      # Whether or not to allow a subscriber to connect to an undefined network when outbound roaming.
       allow_undefined_networks: True
 
   # SCTP Socket Parameters
@@ -93,8 +102,16 @@ hss:
     rtoInitial: 1000
 
   gsup:
-    bind_ip: "0.0.0.0"
+    bind_ip: "127.0.0.1"
     bind_port: 4222
+    # Simple 2G / 3G USSD support via GSUP.
+    # Define USSD codes and messages here. The %msisdn% and %imsi% variables can be used in messages.
+    ussd:
+      codes:
+        - code: "*#100#"
+          msg: "Your MSISDN is %msisdn%"
+        - code: "*#101#"
+          msg: "Your IMSI is %imsi%"
 
   # IFC Template Configuration
   # Controls how Initial Filter Criteria (IFC) templates are loaded and cached
@@ -161,9 +178,15 @@ hss:
     ks_ext_naf_enabled: True    
 
 api:
+  bind_ip: "127.0.0.1"
+  bind_port: 8080
   page_size: 200
   # Whether or not to return key-based data when querying the AUC. Disable in production systems.
   enable_insecure_auc: False
+
+metric:
+  bind_ip: "127.0.0.1"
+  bind_port: 9191
 
 benchmarking:
   # Whether to enable benchmark logging
@@ -182,6 +205,10 @@ eir:
 logging:
   level: INFO
   logfiles:
+    # PyHSS logs can be viewed with journalctl when using the systemd services
+    # or "docker compose logs" when using docker. While this should be enough
+    # for most use cases, it is also possible to start the separate PyHSS
+    # logService that then logs to the files listed below.
     hss_logging_file: /var/log/pyhss_hss.log
     diameter_logging_file: /var/log/pyhss_diameter.log
     geored_logging_file: /var/log/pyhss_geored.log

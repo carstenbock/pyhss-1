@@ -1,6 +1,7 @@
 # PyHSS GSUP Authentication Info Request Controller
 # Copyright 2025 Lennart Rosam <hello@takuto.de>
 # Copyright 2025 Alexander Couzens <lynxis@fe80.eu>
+# Copyright 2026 eta <eta@eta.st>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import traceback
 
@@ -11,6 +12,7 @@ from gsup.controller.abstract_controller import GsupController
 from gsup.protocol.gsup_msg import GsupMessageUtil, GsupMessageBuilder, GMMCause
 from gsup.protocol.ipa_peer import IPAPeer
 from logtool import LogTool
+from pyhss_config import get_unknown_subscriber_2g_reject_cause
 from utils import validate_imsi, InvalidIMSI
 
 
@@ -79,7 +81,7 @@ class AIRController(GsupController):
                 peer,
                 GsupMessageBuilder().with_msg_type(MsgType.SEND_AUTH_INFO_ERROR)
                 .with_ie('imsi', imsi)
-                .with_ie('cause', GMMCause.IMSI_UNKNOWN.value)
+                .with_ie('cause', get_unknown_subscriber_2g_reject_cause().value)
                 .build(),
             )
         except Exception as e:

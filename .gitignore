@@ -5,6 +5,7 @@ subscribers.csv
 ts_129171v090200p.pdf
 config.yaml
 lib/*.pyc
+.idea
 
 log/*.log
 *.1
@@ -34,3 +35,4 @@ pyhss.egg-info
 tests/.pyhss*.db
 .venv
 hss.db
+debian/deps

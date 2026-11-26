@@ -11,7 +11,6 @@ This includes support for acting as:
  - VoLTE HSS
  - Equipment Identity Register (EIR)
  - PCRF
- - Generate BSF Credentials
  - Gateway Mobile Location Centre 
 
 Supported database backends are `MySQL`, `PostgreSQL` and `SQLite`, all provisioned through a Swagger based [RESTful API](docs/API.md) for easy, safe CRUD operations on the subscriber data.
@@ -31,7 +30,6 @@ The underlying library - ``diameter.py`` can be easily worked with to add suppor
 * Cx - For P/S/I/E-CSCF Authentication and Routing (Ie User-Authentication-Request, Location-Information-Request)
 * SLh - For Location of Subscriber MME from GMLC (Ie LCS-Routing-Info-Answer Request)
 * Sh - For Application Servers to IMS & XCAP Data
-* Zh/Zn - For generating GBA Credentials
 * Gx Credit Control Answer / Re-Auth Request including installing Charging Rules on demand
 
 
@@ -71,12 +69,13 @@ This will start the following services, bound to 127.0.0.1 to avoid exposing the
  - PyHSS API Service (Port 8080/tcp)
  - PyHSS GSUP Service (Port 4222/tcp)
  - Redis (Port 6379/tcp)
- - MySQL (Port 3306/tcp)
+
+Subscriber data is stored in an SQLite database on the `pyhss_sqlite` volume.
 
 For production, just pull the following image:
 
 ```shell
-docker pull ghcr.io/nickvsnetworking/pyhss/pyhss:latest
+docker pull ghcr.io/pyhss/pyhss/pyhss:latest
 ```
 
 The `latest` tag is automatically built from current master.  For configuration, please reference `docker/config.yaml`.
@@ -99,7 +98,7 @@ See the `docker/docker-compose.yaml` file for an example of how to set this up. 
 
 Should you desire to run / debug PyHSS through your IDE like PyCharm to Run / Debug services through docker, you can.
 
-1. Create a Python interpreter on docker (not docker compose) that uses the image `ghcr.io/nickvsnetworking/pyhss/pyhss:development`
+1. Create a Python interpreter on docker (not docker compose) that uses the image `ghcr.io/pyhss/pyhss/pyhss:development`
 2. Prepare the docker image by running `cd docker && docker compose build`. You'll need to rebuild only if requirements.txt changes.
 3. Create a Run configuration for each script:
    * Select the docker interpreter as runtime
@@ -119,6 +118,7 @@ PyHSS uses a queued microservices model. Each service performs a specific set of
 
 The following services make up PyHSS:
  - diameterService.py: Handles receiving and sending of diameter messages, and diameter client connection state.
+ - gsupService.py: Handles receiving and sending of GSUP messages to interact with 2G/3G Osmocom components.
  - hssService.py: Provides decoding and encoding of diameter requests and responses, as well as logic to perform as a HSS.
  - apiService.py: Provides the API, to allow management of PyHSS.
  - georedService.py: Sends georaphic redundancy messages to geored peers when defined. Also handles webhook messages.
@@ -156,6 +156,8 @@ python3 diameterService.py
 python3 hssService.py
 python3 apiService.py
 ```
+
+By default these services bind to `127.0.0.1`; edit `bind_ip` in `config.yaml` if they need to be reachable from other hosts.
 
 All going well you'll have a functioning HSS at this point. For production use, systemd scripts are located in `./systemd`
 PyHSS API uses Flask, and can be configured with your favourite WSGI server.

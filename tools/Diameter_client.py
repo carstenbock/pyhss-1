@@ -9,6 +9,7 @@ import time
 import _thread
 global recv_ip
 from pyhss_config import config
+from logtool import LogTool
 
 #Values to change / tweak
 recv_ip = config['hss']['bind_ip']                                                         #IP of this Machine
@@ -21,7 +22,8 @@ mcc = config['hss']['MCC']                                                      
 mnc = config['hss']['MNC']                                                                      #Mobile Network Code
 transport = config['hss']['transport']                                                              #Transport Type - TCP or SCTP (SCTP Support is basic)
 
-diameter = diameter.Diameter(diameter_host, realm, 'PyHSS-client', str(mcc), str(mnc))
+logTool = LogTool(config=config)
+diameter = diameter.Diameter(logTool, diameter_host, realm, 'PyHSS-client', str(mcc), str(mnc))
 sessionid = str(diameter_host) + ';' + diameter.generate_id(5) + ';1;app_gy'
 
 supported_calls = ["CER", "DWR", "AIR", "ULR", "UAR", "PUR", "SAR", "MAR", "MCR", "LIR", "RIR", "CLR", "NOR", "DEP", "UDR", "OCS-CCR", "PCRF-CCR", "ECR", "SH-PUR"]
@@ -72,7 +74,7 @@ def ReadBuffer():
                     #ToDo - check first byte only
                     if flags_bin[0] == '1':
                         print("Received CER - Sending CEA")
-                        SendRequest(diameter.Answer_257(packet_vars, avps, recv_ip))
+                        SendRequest(diameter.Answer_257(packet_vars, avps))
                     else:
                         print("Is CEA")
                         

@@ -1,9 +1,13 @@
 # Copyright 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
+# Copyright 2026 Lennart Rosam <hello@takuto.de>
+# Copyright 2026 eta <eta@eta.st>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import os
 import sys
-import yaml
 from pathlib import Path
+
+import yaml
+from gsup.protocol.gsup_msg import GMMCause
 
 config = None
 
@@ -102,4 +106,33 @@ def load_config():
     sys.exit(1)
 
 
+def validate_config():
+    """Validate configuration values at startup.
+
+    Refuses to start if config options have unexpected values,
+    preventing silent misconfiguration. Add future validations here."""
+
+    valid_reject_causes = {"IMSI_UNKNOWN", "ROAMING_NOT_ALLOWED"}
+    reject_cause = (
+        config.get("hss", {}).get("roaming", {}).get("inbound", {}).get("reject_unknown_imsis_with", "IMSI_UNKNOWN")
+    )
+    if reject_cause not in valid_reject_causes:
+        print(
+            f"ERROR: invalid value for hss.roaming.inbound.reject_unknown_imsis_with: '{reject_cause}'. "
+            f"Valid options are: {', '.join(sorted(valid_reject_causes))}"
+        )
+        sys.exit(1)
+
+
 load_config()
+validate_config()
+
+
+def get_unknown_subscriber_2g_reject_cause() -> GMMCause:
+    if (
+        config.get("hss", {}).get("roaming", {}).get("inbound", {}).get("reject_unknown_imsis_with", "IMSI_UNKNOWN")
+        == "ROAMING_NOT_ALLOWED"
+    ):
+        return GMMCause.ROAMING_NOTALLOWED
+    else:
+        return GMMCause.IMSI_UNKNOWN

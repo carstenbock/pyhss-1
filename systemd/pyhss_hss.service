@@ -1,9 +1,15 @@
+# The main PyHSS service: Initializes the database, provides decoding and
+# encoding of diameter requests and responses, as well as logic to perform as a
+# HSS.
 [Unit]
 Description=PyHSS HSS Service
 PartOf=pyhss.service
+Requires=redis-server.service
+After=redis-server.service
 
 [Service]
 Environment="PYTHONUNBUFFERED=1"
+Environment="PYHSS_LOG_STDOUT_NO_TIMESTAMP=1"
 User=root
 WorkingDirectory=/etc/pyhss/services/
 ExecStart=python3 hssService.py

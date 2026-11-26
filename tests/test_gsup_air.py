@@ -15,7 +15,7 @@ from gsup.protocol.osmocom_ipa import IPA
 
 
 class GSUPClient:
-    def __init__(self, server_ip, server_port, identity='SGSN'):
+    def __init__(self, server_ip, server_port, identity='SGSN\0'):
         self.server_ip = server_ip
         self.server_port = server_port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -143,7 +143,8 @@ class GSUPClient:
 
 
 def test_gsup_air(run_redis, create_test_db, run_pyhss_hss, run_pyhss_gsup):
-    client = GSUPClient('127.0.0.1', 4222, 'SGSN-NG')
+    client = GSUPClient('127.0.0.1', 4222, 'SGSN-NG\0')
+    # Identity (SGSN) is not null-terminated on purpose to test this code path
     client2 = GSUPClient('127.0.0.1', 4222, 'SGSN')
 
     client.connect()

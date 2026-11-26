@@ -1,3 +1,5 @@
+# Copyright 2026 volte.io
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Add IFC template table and foreign key
 
 Revision ID: c1a2b3d4e5f6

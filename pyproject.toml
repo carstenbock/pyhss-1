@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyhss"
-version = "1.0.3"
+dynamic = ["version"]
+requires-python = ">=3.11"
 
 [project.scripts]
 pyhss_api = "pyhss.services.apiService:main"
@@ -26,8 +27,14 @@ packages = [
 	"pyhss.tools",
 ]
 
+[tool.setuptools.dynamic]
+version = {attr = "pyhss.lib.version.pyhss_version"}
+
 [tool.setuptools.package-dir]
 pyhss = ""
+
+[tool.setuptools.package-data]
+"*" = ["*.asn1"]
 
 [tool.pytest.ini_options]
 addopts = "--tb=native"
@@ -39,9 +46,17 @@ env = [
 filterwarnings = [
 	# Warning appears inside SQLAlchemy code, also might not make sense:
 	# https://github.com/python/cpython/issues/135834
-	"ignore:The default datetime adapter is deprecated as of Python 3.12"
+	"ignore:The default datetime adapter is deprecated as of Python 3.12",
+
+	# PyparsingDeprecationWarnings appearing inside asn1tools
+	"ignore:'delimitedList' deprecated - use 'DelimitedList'",
+	"ignore:'excludeChars' argument is deprecated, use 'exclude_chars'",
+	"ignore:'parseString' deprecated - use 'parse_string'",
+	"ignore:'setName' deprecated - use 'set_name'",
+	"ignore:'setParseAction' deprecated - use 'set_parse_action'",
 ]
 markers = [
+    "skip_packaging",
     "slow",
 ]
 
@@ -49,10 +64,24 @@ markers = [
 line-length = 120
 include = [
 	"lib/databaseSchema.py",
+	"lib/gsup/controller/ss.py",
+	"lib/gsup/protocol/gsup_msg.py",
 	"lib/pyhss_config.py",
+	"lib/version.py",
 	"tests/test_database_upgrade_mariadb.py",
 	"tests/test_database_upgrade_postgresql.py",
 	"tests/test_database_upgrade_sqlite.py",
+	"tests/test_debian_control.py",
+	"tests/test_diameter_service_framing.py",
+	"tests/test_diameter_service_peers.py",
+	"tests/test_gsup_ussd.py",
 	"tests/test_license_headers.py",
+	"tests/test_messaging_queue_order.py",
 	"tests/test_milenage.py",
+]
+
+[tool.ruff.lint]
+ignore = [
+	"BLE001",  # https://docs.astral.sh/ruff/rules/blind-except/
+	"N999",    # https://docs.astral.sh/ruff/rules/invalid-module-name/
 ]

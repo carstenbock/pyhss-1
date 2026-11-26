@@ -1,9 +1,12 @@
+# Optional legacy service that may get removed in the future:
+# https://github.com/nickvsnetworking/pyhss/issues/264
 [Unit]
 Description=PyHSS Database Service
 PartOf=pyhss.service
 
 [Service]
 Environment="PYTHONUNBUFFERED=1"
+Environment="PYHSS_LOG_STDOUT_NO_TIMESTAMP=1"
 User=root
 WorkingDirectory=/etc/pyhss/services/
 ExecStart=python3 databaseService.py

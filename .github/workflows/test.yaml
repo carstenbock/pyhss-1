@@ -8,19 +8,21 @@ jobs:
     strategy:
       matrix:
         python-version:
-          - "3.9"  # Debian 10
+          - "3.11"  # Debian 12
           - "3.13"  # Debian 13
+          - "3.14"
 
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python-version }}
 
     - name: Install dependencies (apt)
       run: |
+        sudo apt-get update
         sudo apt-get -q install -y \
           libsctp-dev \
           mariadb-server \
@@ -34,6 +36,7 @@ jobs:
         pip install \
           -r requirements.txt \
           -r requirements-test.txt \
+          mysqlclient \
           psycopg2
 
     - name: Run PyHSS tests

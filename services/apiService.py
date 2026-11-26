@@ -2,13 +2,14 @@
 # Copyright 2022-2025 Nick <nick@nickvsnetworking.com>
 # Copyright 2023-2025 David Kneipp <david@davidkneipp.com>
 # Copyright 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
-# Copyright 2025 Lennart Rosam <hello@takuto.de>
+# Copyright 2025-2026 Lennart Rosam <hello@takuto.de>
+# Copyright 2025-2026 Alexander Couzens <lynxis@fe80.eu>
 # SPDX-License-Identifier: AGPL-3.0-or-later
 import sys
 import json
 import binascii
 import yaml
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, redirect
 from flask_restx import Api, Resource, fields, reqparse, abort
 from database import geored_check_updated_endpoints
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -29,6 +30,7 @@ from logtool import LogTool
 from diameter import Diameter
 from messaging import RedisMessaging
 from baseModels import SubscriberInfo
+from version import pyhss_version
 import database
 from network_control import (
     relay_teardown_domains,
@@ -323,6 +325,10 @@ def notify_subscribed_application_servers(ims_subscriber_data):
 
 apiService = Flask(__name__)
 
+@apiService.route("/")
+def PyHSS_API_redirect_to_docs():
+    return redirect("/docs/")
+
 APN = database.APN
 Serving_APN = database.SERVING_APN
 AUC = database.AUC
@@ -342,9 +348,12 @@ IFC_TEMPLATE = database.IFC_TEMPLATE
 
 
 apiService.wsgi_app = ProxyFix(apiService.wsgi_app)
-api = Api(apiService, version='1.0', title=f'{siteName + " - " if siteName else ""}{originHostname} - PyHSS OAM API',
-    description='Restful API for working with PyHSS',
-    doc='/docs/'
+api = Api(
+    apiService,
+    version=pyhss_version,
+    title=f"{siteName + ' - ' if siteName else ''}{originHostname} - PyHSS OAM API",
+    description="Restful API for working with PyHSS",
+    doc="/docs/",
 )
 
 ns_apn = api.namespace('apn', description='PyHSS APN Functions')
@@ -535,7 +544,12 @@ def auth_required(f):
     return decorated_function
 
 def auth_before_request():
-    if request.path.startswith('/docs') or request.path.startswith('/swagger') or request.path.startswith('/metrics'):
+    if (
+        request.path.startswith("/docs")
+        or request.path.startswith("/swagger")
+        or request.path.startswith("/metrics")
+        or request.path == "/"
+    ):
         return None
     if request.method == "OPTIONS":
         res = Response()
@@ -3141,7 +3155,11 @@ class PyHSS_IFC_Template_Cache_Invalidate_Single(Resource):
 
 
 def main():
-    apiService.run(debug=False, host='0.0.0.0', port=8080)
+    config_api = config.get('api', {})
+    host = config_api.get('bind_ip', '127.0.0.1')
+    port = int(config_api.get('bind_port', 8080))
+
+    apiService.run(debug=False, host=host, port=port)
 
 
 if __name__ == '__main__':
