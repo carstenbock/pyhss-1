@@ -18,6 +18,8 @@ import time
 import requests
 from typing import List, Dict, Optional, Tuple, Any
 
+from network_control import get_ims_domain, ims_domain_for_imsi, parse_home_plmns
+
 
 class ENUMManagementError(Exception):
     """Exception raised when ENUM management operations fail."""
@@ -54,6 +56,13 @@ class ENUMClient:
         self.naptr_ttl = self.enum_config.get('naptr_ttl', 3600)
         self.endpoints = self.enum_config.get('endpoints', [])
         self.sms_enabled = self.enum_config.get('sms_enabled', False)
+
+        # ADR-0045: the platform PLMN first, then the additional home PLMNs.
+        hss_config = config.get('hss', {})
+        self.home_plmns = parse_home_plmns(
+            hss_config.get('MCC', '999'), hss_config.get('MNC', '999'),
+            hss_config.get('AdditionalPLMNs', ''))
+        self.platform_ims_domain = get_ims_domain(*self.home_plmns[0])
 
     def _log(self, level: str, message: str):
         """Log a message if log_tool is available."""
@@ -112,6 +121,29 @@ class ENUMClient:
         
         # Append the domain
         return f"{reversed_digits}.{domain}"
+
+    def sip_domain_for(self, endpoint: dict, imsi: Optional[str] = None) -> str:
+        """
+        The domain of the SIP URI an ENUM entry on this endpoint points to.
+
+        The URI must be the public identity the subscriber registers, and a
+        subscriber of an additional home PLMN registers in the IMS domain of
+        its own PLMN (ADR-0045, TS 23.003 section 13.2). So where the endpoint
+        names the platform's IMS domain, the entry gets the home domain of the
+        subscriber's IMSI. An endpoint with any other sip_domain (e.g. an
+        interconnect name) keeps it for every subscriber.
+
+        Args:
+            endpoint: PowerDNS endpoint configuration
+            imsi: The subscriber's IMSI; without it the endpoint's domain is used
+
+        Returns:
+            The SIP domain for the NAPTR URI
+        """
+        sip_domain = endpoint.get('sip_domain', '')
+        if imsi and sip_domain == self.platform_ims_domain:
+            return ims_domain_for_imsi(imsi, self.home_plmns)
+        return sip_domain
 
     def generate_naptr_content(self, msisdn: str, sip_domain: str) -> str:
         """
@@ -307,7 +339,8 @@ class ENUMClient:
     def create_enum_entries(
         self,
         msisdn: Optional[str],
-        msisdn_list: Optional[str] = None
+        msisdn_list: Optional[str] = None,
+        imsi: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create ENUM entries for an IMS subscriber's MSISDNs.
@@ -315,6 +348,8 @@ class ENUMClient:
         Args:
             msisdn: Primary MSISDN
             msisdn_list: Comma-separated list of additional MSISDNs
+            imsi: The subscriber's IMSI, which decides the home domain of the
+                SIP URI (see sip_domain_for)
             
         Returns:
             Dictionary with results per endpoint
@@ -337,7 +372,7 @@ class ENUMClient:
         
         for endpoint in self.endpoints:
             endpoint_name = endpoint.get('name', endpoint.get('url', 'unknown'))
-            sip_domain = endpoint.get('sip_domain', '')
+            sip_domain = self.sip_domain_for(endpoint, imsi)
             results['endpoints'][endpoint_name] = {'domains': {}}
             
             for domain in endpoint.get('domains', []):
@@ -451,7 +486,8 @@ class ENUMClient:
         old_msisdn: Optional[str],
         old_msisdn_list: Optional[str],
         new_msisdn: Optional[str],
-        new_msisdn_list: Optional[str]
+        new_msisdn_list: Optional[str],
+        imsi: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Update ENUM entries when MSISDNs change.
@@ -464,6 +500,7 @@ class ENUMClient:
             old_msisdn_list: Previous comma-separated list of additional MSISDNs
             new_msisdn: New primary MSISDN
             new_msisdn_list: New comma-separated list of additional MSISDNs
+            imsi: The subscriber's IMSI (see sip_domain_for)
             
         Returns:
             Dictionary with results
@@ -508,7 +545,7 @@ class ENUMClient:
         if to_create:
             create_list = ','.join(to_create)
             try:
-                create_result = self.create_enum_entries(None, create_list)
+                create_result = self.create_enum_entries(None, create_list, imsi=imsi)
                 results['created'] = list(to_create)
                 if create_result.get('errors'):
                     results['errors'].extend(create_result['errors'])
@@ -588,7 +625,7 @@ class ENUMClient:
                     
                     try:
                         # Create/update ENUM entries for this subscriber
-                        create_result = self.create_enum_entries(msisdn, msisdn_list)
+                        create_result = self.create_enum_entries(msisdn, msisdn_list, imsi=sub.get('imsi'))
                         
                         if create_result.get('status') in ('ok', 'disabled', 'no_msisdns'):
                             results['succeeded'] += 1

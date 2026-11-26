@@ -1066,7 +1066,8 @@ class PyHSS_IMS_SUBSCRIBER_Get(Resource):
                     old_msisdn=old_msisdn,
                     old_msisdn_list=old_msisdn_list,
                     new_msisdn=new_msisdn,
-                    new_msisdn_list=new_msisdn_list
+                    new_msisdn_list=new_msisdn_list,
+                    imsi=data.get('imsi')
                 )
             except ENUMManagementError as enum_error:
                 # In strict mode, log but don't fail - subscriber is already updated
@@ -1111,7 +1112,8 @@ class PyHSS_IMS_SUBSCRIBER(Resource):
             try:
                 enumClient.create_enum_entries(
                     msisdn=json_data.get('msisdn'),
-                    msisdn_list=json_data.get('msisdn_list')
+                    msisdn_list=json_data.get('msisdn_list'),
+                    imsi=json_data.get('imsi')
                 )
             except ENUMManagementError as enum_error:
                 # In strict mode, ENUM errors are raised - rollback subscriber creation
