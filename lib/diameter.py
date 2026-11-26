@@ -1254,18 +1254,36 @@ class Diameter:
         return installRules, removeRules
 
     def rx_tfts(self, flow_descriptions):
-        """Gx TFTs from Rx Flow-Descriptions (hex). Open5GS has no 'permit in',
-        so an uplink description is turned round into 'permit out' with
-        direction 2."""
+        """Gx TFTs from Rx Flow-Descriptions (hex).
+
+        An Rx description is an IPFilterRule "permit in|out <proto> from <src>
+        [<port>] to <dst> [<port>]" (TS 29.214 5.3.8); the AF supplies no source
+        port for UDP and no port for the active end of a TCP flow (TS 29.213
+        6.2), so either port may be missing, and a one-way stream has only one
+        description. On Gx the rule is always "permit out", written from the
+        network towards the UE, with the direction in Flow-Direction (TS 29.212
+        5.3.8, 5.3.65): an uplink description is turned round, direction 2.
+        A description that is no such rule is left out."""
         tfts = []
-        for tftId, hexDescription in enumerate(flow_descriptions, start=1):
-            description = bytes.fromhex(hexDescription).decode('ascii')
-            direction = 1 if 'permit out' in description.lower() else None
-            if 'permit in' in description.lower():
-                parts = description.split(' ')
-                description = f"permit out {parts[2]} from {parts[7]} {parts[8]} to {parts[4]} {parts[5]}"
+        for hexDescription in flow_descriptions:
+            description = bytes.fromhex(hexDescription).decode('ascii', 'replace')
+            tokens = description.split()
+            lowered = [token.lower() for token in tokens]
+            try:
+                fromAt, toAt = lowered.index('from'), lowered.index('to')
+                if lowered[0] != 'permit' or lowered[1] not in ('in', 'out') or fromAt != 3 or toAt <= fromAt + 1 or toAt + 1 >= len(tokens):
+                    raise ValueError(description)
+            except (ValueError, IndexError):
+                self.logTool.log(service='HSS', level='warning', message=f"[diameter.py] [rx_tfts] Flow-Description not understood, left out: {description}", redisClient=self.redisMessaging)
+                continue
+            source, destination = ' '.join(tokens[fromAt + 1:toAt]), ' '.join(tokens[toAt + 1:])
+            if lowered[1] == 'in':
+                description = f"permit out {tokens[2]} from {destination} to {source}"
                 direction = 2
-            tfts.append({"tft_group_id": 1, "direction": direction, "tft_id": tftId, "tft_string": description})
+            else:
+                description = f"permit out {tokens[2]} from {source} to {destination}"
+                direction = 1
+            tfts.append({"tft_group_id": 1, "direction": direction, "tft_id": len(tfts) + 1, "tft_string": description})
         return tfts
 
     def rx_sdp_tfts(self, avps, ueIp):

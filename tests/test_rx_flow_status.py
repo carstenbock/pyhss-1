@@ -196,3 +196,49 @@ def test_held_video_is_gated_on_its_own(pcrf):
 
     status = {rule["qci"]: rule["flow_status"] for rule in pcrf.rars[-1]["chargingRules"]}
     assert status == {1: ENABLED, 2: DISABLED}
+
+
+def hex_flows(*descriptions):
+    return [description.encode().hex() for description in descriptions]
+
+
+def test_flow_descriptions_without_source_ports_become_gx_filters(pcrf):
+    # TS 29.213 6.2: the AF supplies no source port for a UDP flow. PyHSS took
+    # the fields of an uplink description by position, so such a description
+    # raised an IndexError and the call got no bearer (helm KI-293).
+    tfts = pcrf.rx_tfts(hex_flows(f"permit in 17 from {UE_IP} to {NET_IP} 60000",
+                                  f"permit out 17 from {NET_IP} to {UE_IP} 50000"))
+
+    # Gx: always "permit out", from the network towards the UE (TS 29.212 5.3.8).
+    assert [(tft["direction"], tft["tft_string"]) for tft in tfts] == [
+        (2, f"permit out 17 from {NET_IP} 60000 to {UE_IP}"),
+        (1, f"permit out 17 from {NET_IP} to {UE_IP} 50000")]
+    assert [tft["tft_id"] for tft in tfts] == [1, 2]
+
+
+def test_flow_descriptions_with_both_ports_still_work(pcrf):
+    # A P-CSCF chart before 1.17.8 sends both ports.
+    tfts = pcrf.rx_tfts(hex_flows(f"permit in 17 from {UE_IP} 50000 to {NET_IP} 60000",
+                                  f"permit out 17 from {NET_IP} 60000 to {UE_IP} 50000"))
+
+    assert [(tft["direction"], tft["tft_string"]) for tft in tfts] == [
+        (2, f"permit out 17 from {NET_IP} 60000 to {UE_IP} 50000"),
+        (1, f"permit out 17 from {NET_IP} 60000 to {UE_IP} 50000")]
+
+
+def test_one_way_stream_has_one_filter(pcrf):
+    # A stream that was only ever sendonly or recvonly has one description
+    # (TS 29.213 6.2 Table 6.2.2).
+    tfts = pcrf.rx_tfts(hex_flows(f"permit out 17 from {NET_IP} to {UE_IP} 50000"))
+
+    assert [(tft["direction"], tft["tft_string"]) for tft in tfts] == [
+        (1, f"permit out 17 from {NET_IP} to {UE_IP} 50000")]
+
+
+def test_ipv6_and_malformed_descriptions(pcrf):
+    tfts = pcrf.rx_tfts(hex_flows("permit in 17 from 2001:db8::5 to 2001:db8::9 60000",
+                                  "this is no filter rule",
+                                  "permit out 17 from 2001:db8::9 to"))
+
+    assert [(tft["tft_id"], tft["direction"], tft["tft_string"]) for tft in tfts] == [
+        (1, 2, "permit out 17 from 2001:db8::9 60000 to 2001:db8::5")]
